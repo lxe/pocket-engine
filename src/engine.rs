@@ -3,7 +3,7 @@
 
 use crate::gpu::{Gpu, Graph};
 use crate::model::{Act, BLOCK_SIZE, Config, Meta, Model, State};
-use crate::sched::{Load, Request, Sampling, Scheduler, Scored, Seq};
+use crate::sched::{Load, Pen, Request, Sampling, Scheduler, Scored, Seq};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -165,7 +165,11 @@ impl Engine {
             return Ok(Vec::new());
         };
         let (t, s) = (step.tokens, step.seqs());
-        self.sched.fill(&step, self.act.staging.as_mut_slice());
+        let pens = self.sched.fill(
+            &step,
+            self.act.staging.as_mut_slice(),
+            &mut Pen::split(self.act.pen_staging.as_mut_slice()),
+        );
         let bucket = if step.decode_only() && self.cfg.graphs {
             BUCKETS
                 .iter()
@@ -178,11 +182,13 @@ impl Engine {
         match bucket {
             Some(b) => {
                 self.sched.pad(self.act.staging.as_mut_slice(), s, b);
+                self.act.upload_pen(&self.gpu, pens)?;
                 self.act.upload_meta(&self.gpu)?;
                 self.gpu.replay(&self.graphs[&b])?;
                 self.stats.graph_steps += 1;
             }
             None => {
+                self.act.upload_pen(&self.gpu, pens)?;
                 self.act.upload_meta(&self.gpu)?;
                 self.model
                     .forward(&self.gpu, &self.state, &self.act, t, s)?;
@@ -229,8 +235,8 @@ impl Engine {
             let (tx, _) = tokio::sync::mpsc::unbounded_channel();
             txs.push(tx.clone());
             let sampling = Sampling {
-                temperature: 0.0,
                 seed: i as u64,
+                ..Sampling::default()
             };
             self.sched.submit_forced(
                 Request {

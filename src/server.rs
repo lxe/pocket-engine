@@ -140,11 +140,111 @@ struct ChatRequest {
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<i64>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
+    logit_bias: Option<serde_json::Map<String, Value>>,
+    #[serde(default)]
     seed: Option<u64>,
+    #[serde(default)]
+    stop: Option<Value>,
+    #[serde(default)]
+    n: Option<u32>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
     stream_options: Option<Value>,
+}
+
+impl ChatRequest {
+    /// Validates the sampling fields the way OpenAI and vLLM accept them.
+    fn sampling(&self, vocab: usize, default_seed: u64) -> std::result::Result<Sampling, String> {
+        let d = Sampling::default();
+        let in_range = |name: &str, v: Option<f32>, lo: f32, hi: f32, def: f32| match v {
+            None => Ok(def),
+            Some(x) if x.is_finite() && (lo..=hi).contains(&x) => Ok(x),
+            Some(x) => Err(format!("{name} must be in [{lo}, {hi}], got {x}")),
+        };
+        let top_p = in_range("top_p", self.top_p, 0.0, 1.0, d.top_p)?;
+        if top_p == 0.0 {
+            return Err("top_p must be greater than 0".into());
+        }
+        let top_k = match self.top_k {
+            None | Some(-1) | Some(0) => 0,
+            Some(k) if k > 0 => k.min(vocab as i64) as u32,
+            Some(k) => return Err(format!("top_k must be -1, 0 or positive, got {k}")),
+        };
+        let repetition_penalty = in_range(
+            "repetition_penalty",
+            self.repetition_penalty,
+            0.0,
+            10.0,
+            1.0,
+        )?;
+        if repetition_penalty == 0.0 {
+            return Err("repetition_penalty must be greater than 0".into());
+        }
+        let mut logit_bias = Vec::new();
+        for (k, v) in self.logit_bias.iter().flatten() {
+            let token: u32 = k
+                .parse()
+                .map_err(|_| format!("logit_bias key {k:?} is not a token id"))?;
+            let bias = v.as_f64().ok_or("logit_bias values must be numbers")? as f32;
+            if token as usize >= vocab || !(-100.0..=100.0).contains(&bias) {
+                return Err(format!("logit_bias {k}: {bias} is out of range"));
+            }
+            logit_bias.push((token, bias));
+        }
+        if logit_bias.len() > 1024 {
+            return Err("logit_bias holds at most 1,024 tokens".into());
+        }
+        Ok(Sampling {
+            temperature: in_range("temperature", self.temperature, 0.0, 100.0, 1.0)?,
+            top_k,
+            top_p,
+            min_p: in_range("min_p", self.min_p, 0.0, 1.0, d.min_p)?,
+            presence_penalty: in_range("presence_penalty", self.presence_penalty, -2.0, 2.0, 0.0)?,
+            frequency_penalty: in_range(
+                "frequency_penalty",
+                self.frequency_penalty,
+                -2.0,
+                2.0,
+                0.0,
+            )?,
+            repetition_penalty,
+            logit_bias,
+            seed: self.seed.unwrap_or(default_seed),
+        })
+    }
+
+    fn stops(&self) -> std::result::Result<Vec<String>, String> {
+        let stops: Vec<String> = match &self.stop {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(String::from)
+                        .ok_or("stop entries must be strings")
+                })
+                .collect::<std::result::Result<_, _>>()?,
+            Some(_) => return Err("stop must be a string or a list of strings".into()),
+        };
+        if stops.len() > 16 || stops.iter().any(String::is_empty) {
+            return Err("stop takes up to 16 non-empty strings".into());
+        }
+        Ok(stops)
+    }
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -170,24 +270,33 @@ fn now() -> u64 {
 }
 
 async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Response {
+    if req.n.is_some_and(|n| n != 1) {
+        return err(StatusCode::BAD_REQUEST, "only n = 1 is supported");
+    }
+    let n = app.next.fetch_add(1, Ordering::Relaxed);
+    let sampling = match req.sampling(app.info.cfg.vocab, n.wrapping_mul(0x2545_f491_4f6c_dd1d)) {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    let stops = match req.stops() {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
     let prompt = match app.tok.chat(&req.messages) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
-    let n = app.next.fetch_add(1, Ordering::Relaxed);
     let id = format!("chatcmpl-{n}");
     let max_new = req
         .max_completion_tokens
         .or(req.max_tokens)
         .unwrap_or(app.info.max_context);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let out = Output::new(stops, prompt.len());
     let request = Request {
         prompt,
         max_new,
-        sampling: Sampling {
-            temperature: req.temperature.unwrap_or(1.0),
-            seed: req.seed.unwrap_or(n.wrapping_mul(0x2545_f491_4f6c_dd1d)),
-        },
+        sampling,
         tx,
     };
     if app.engine.lock().unwrap().send(request).is_err() {
@@ -199,43 +308,146 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
             .as_ref()
             .and_then(|o| o["include_usage"].as_bool())
             .unwrap_or(false);
-        stream_response(app, rx, id, usage).into_response()
+        stream_response(app, rx, out, id, usage).into_response()
     } else {
-        whole_response(app, rx, id).await
+        whole_response(app, rx, out, id).await
     }
 }
 
-async fn whole_response(app: Arc<App>, mut rx: UnboundedReceiver<Event>, id: String) -> Response {
-    let mut ids = Vec::new();
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            Event::Token(t) => ids.push(t),
-            Event::Done {
+/// Text produced so far, released only once it cannot be the start of a stop
+/// string. Finding a stop string ends the response; dropping the event
+/// receiver then cancels the request in the engine.
+struct Output {
+    detok: Detok,
+    text: String,
+    sent: usize,
+    stops: Vec<String>,
+    tokens: usize,
+    prompt_tokens: usize,
+}
+
+impl Output {
+    fn new(stops: Vec<String>, prompt_tokens: usize) -> Self {
+        Self {
+            prompt_tokens,
+            detok: Detok {
+                ids: Vec::new(),
+                prefix: 0,
+                read: 0,
+            },
+            text: String::new(),
+            sent: 0,
+            stops,
+            tokens: 0,
+        }
+    }
+
+    /// Adds a token; returns the text now safe to send and whether a stop
+    /// string ended the output.
+    fn push(&mut self, tok: &ChatTokenizer, id: u32) -> (String, bool) {
+        self.tokens += 1;
+        if let Some(d) = self.detok.push(tok, id) {
+            self.text.push_str(&d);
+        }
+        self.release(false)
+    }
+
+    /// The remaining text when generation ends.
+    fn end(&mut self, tok: &ChatTokenizer) -> (String, bool) {
+        let tail = tok.decode(&self.detok.ids[self.detok.prefix..]);
+        let seen = tok.decode(&self.detok.ids[self.detok.prefix..self.detok.read]);
+        if let Some(rest) = tail.get(seen.len()..) {
+            self.text.push_str(rest);
+        }
+        self.detok.prefix = self.detok.ids.len();
+        self.detok.read = self.detok.ids.len();
+        self.release(true)
+    }
+
+    fn release(&mut self, all: bool) -> (String, bool) {
+        let longest = self.stops.iter().map(String::len).max().unwrap_or(0);
+        let from = self.sent.saturating_sub(longest);
+        let from = (0..=from)
+            .rev()
+            .find(|&i| self.text.is_char_boundary(i))
+            .unwrap_or(0);
+        let found = self
+            .stops
+            .iter()
+            .filter_map(|s| self.text[from..].find(s.as_str()).map(|i| from + i))
+            .min();
+        let (end, stopped) = match found {
+            Some(at) => (at.max(self.sent), true),
+            None if all => (self.text.len(), false),
+            None => {
+                // Hold back what could still grow into a stop string.
+                let mut end = self
+                    .text
+                    .len()
+                    .saturating_sub(longest.saturating_sub(1))
+                    .max(self.sent);
+                while !self.text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                (end.max(self.sent), false)
+            }
+        };
+        let out = self.text[self.sent..end].to_string();
+        self.sent = end;
+        (out, stopped)
+    }
+}
+
+async fn whole_response(
+    app: Arc<App>,
+    mut rx: UnboundedReceiver<Event>,
+    mut out: Output,
+    id: String,
+) -> Response {
+    let mut content = String::new();
+    let (finish, prompt_tokens, completion_tokens) = loop {
+        match rx.recv().await {
+            Some(Event::Token(t)) => {
+                let (text, stopped) = out.push(&app.tok, t);
+                content.push_str(&text);
+                if stopped {
+                    break ("stop", out.prompt_tokens, out.tokens);
+                }
+            }
+            Some(Event::Done {
                 finish,
                 prompt_tokens,
                 completion_tokens,
-            } => {
-                return Json(json!({
-                    "id": id, "object": "chat.completion", "created": now(), "model": app.model,
-                    "choices": [{ "index": 0, "finish_reason": finish_name(finish),
-                        "message": { "role": "assistant", "content": app.tok.decode(&ids) } }],
-                    "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                        "total_tokens": prompt_tokens + completion_tokens }
-                }))
-                .into_response();
+            }) => {
+                let (text, stopped) = out.end(&app.tok);
+                content.push_str(&text);
+                let finish = if stopped { "stop" } else { finish_name(finish) };
+                break (finish, prompt_tokens, completion_tokens);
             }
-            Event::Error(e) => return err(StatusCode::BAD_REQUEST, e),
+            Some(Event::Error(e)) => return err(StatusCode::BAD_REQUEST, e),
+            None => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "engine dropped the request",
+                );
+            }
         }
-    }
-    err(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "engine dropped the request",
-    )
+    };
+    drop(rx);
+    Json(json!({
+        "id": id, "object": "chat.completion", "created": now(), "model": app.model,
+        "choices": [{ "index": 0, "finish_reason": finish,
+            "message": { "role": "assistant", "content": content } }],
+        "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens }
+    }))
+    .into_response()
 }
 
 fn stream_response(
     app: Arc<App>,
     rx: UnboundedReceiver<Event>,
+    out: Output,
     id: String,
     usage: bool,
 ) -> axum::response::Sse<
@@ -249,24 +461,35 @@ fn stream_response(
             .to_string(),
         )
     };
+    let closing = move |app: &App, id: &str, finish: &str, prompt: usize, completion: usize| {
+        let mut events = vec![chunk(app, id, json!({}), Some(finish))];
+        if usage {
+            events.push(
+                Sse::default().data(
+                    json!({ "id": id, "object": "chat.completion.chunk", "created": created,
+                    "model": app.model, "choices": [],
+                    "usage": { "prompt_tokens": prompt, "completion_tokens": completion,
+                        "total_tokens": prompt + completion } })
+                    .to_string(),
+                ),
+            );
+        }
+        events.push(Sse::default().data("[DONE]"));
+        events
+    };
     enum Phase {
         Start,
         Run,
         End,
     }
-    let detok = Detok {
-        ids: Vec::new(),
-        prefix: 0,
-        read: 0,
-    };
     let s = stream::unfold(
-        (rx, detok, Phase::Start, app, id),
-        move |(mut rx, mut detok, phase, app, id)| async move {
-            let mut out: Vec<Sse> = Vec::new();
-            let next_phase = match phase {
+        (Some(rx), out, Phase::Start, app, id),
+        move |(mut rx, mut out, phase, app, id)| async move {
+            let mut events: Vec<Sse> = Vec::new();
+            let next = match phase {
                 Phase::End => return None,
                 Phase::Start => {
-                    out.push(chunk(
+                    events.push(chunk(
                         &app,
                         &id,
                         json!({ "role": "assistant", "content": "" }),
@@ -274,49 +497,52 @@ fn stream_response(
                     ));
                     Phase::Run
                 }
-                Phase::Run => match rx.recv().await {
+                Phase::Run => match rx.as_mut()?.recv().await {
                     Some(Event::Token(t)) => {
-                        if let Some(text) = detok.push(&app.tok, t) {
-                            out.push(chunk(&app, &id, json!({ "content": text }), None));
+                        let (text, stopped) = out.push(&app.tok, t);
+                        if !text.is_empty() {
+                            events.push(chunk(&app, &id, json!({ "content": text }), None));
                         }
-                        Phase::Run
+                        if stopped {
+                            rx = None; // cancels the request in the engine
+                            events.extend(closing(
+                                &app,
+                                &id,
+                                "stop",
+                                out.prompt_tokens,
+                                out.tokens,
+                            ));
+                            Phase::End
+                        } else {
+                            Phase::Run
+                        }
                     }
                     Some(Event::Done {
                         finish,
                         prompt_tokens,
                         completion_tokens,
                     }) => {
-                        let tail = app.tok.decode(&detok.ids[detok.prefix..]);
-                        let seen = app.tok.decode(&detok.ids[detok.prefix..detok.read]);
-                        if let Some(rest) = tail.get(seen.len()..).filter(|r| !r.is_empty()) {
-                            out.push(chunk(&app, &id, json!({ "content": rest }), None));
+                        let (text, stopped) = out.end(&app.tok);
+                        if !text.is_empty() {
+                            events.push(chunk(&app, &id, json!({ "content": text }), None));
                         }
-                        out.push(chunk(&app, &id, json!({}), Some(finish_name(finish))));
-                        if usage {
-                            out.push(Sse::default().data(
-                            json!({ "id": id, "object": "chat.completion.chunk", "created": created,
-                                "model": app.model, "choices": [],
-                                "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                                    "total_tokens": prompt_tokens + completion_tokens } })
-                            .to_string(),
-                        ));
-                        }
-                        out.push(Sse::default().data("[DONE]"));
+                        let finish = if stopped { "stop" } else { finish_name(finish) };
+                        events.extend(closing(&app, &id, finish, prompt_tokens, completion_tokens));
                         Phase::End
                     }
                     Some(Event::Error(e)) => {
-                        out.push(
+                        events.push(
                             Sse::default().data(json!({ "error": { "message": e } }).to_string()),
                         );
-                        out.push(Sse::default().data("[DONE]"));
+                        events.push(Sse::default().data("[DONE]"));
                         Phase::End
                     }
                     None => Phase::End,
                 },
             };
             Some((
-                stream::iter(out.into_iter().map(Ok)),
-                (rx, detok, next_phase, app, id),
+                stream::iter(events.into_iter().map(Ok)),
+                (rx, out, next, app, id),
             ))
         },
     );
@@ -371,4 +597,83 @@ pub async fn serve(
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(out: &mut Output, parts: &[&str]) -> (String, bool) {
+        let mut sent = String::new();
+        for p in parts {
+            out.text.push_str(p);
+            let (t, stopped) = out.release(false);
+            sent.push_str(&t);
+            if stopped {
+                return (sent, true);
+            }
+        }
+        let (t, stopped) = out.release(true);
+        sent.push_str(&t);
+        (sent, stopped)
+    }
+
+    #[test]
+    fn stop_strings_end_the_text_even_across_tokens() {
+        let mut out = Output::new(vec!["</a>".into(), "STOP".into()], 0);
+        assert_eq!(
+            feed(&mut out, &["one <", "/a", "> two"]),
+            ("one ".into(), true)
+        );
+        let mut out = Output::new(vec!["STOP".into()], 0);
+        assert_eq!(
+            feed(&mut out, &["no stop ", "here"]),
+            ("no stop here".into(), false)
+        );
+    }
+
+    #[test]
+    fn held_back_text_is_released_whole_and_on_char_boundaries() {
+        let mut out = Output::new(vec!["xyz".into()], 0);
+        out.text.push_str("caf\u{e9}s");
+        let (first, _) = out.release(false);
+        assert!(first.len() <= out.text.len() - 2 && out.text.starts_with(&first));
+        let (rest, stopped) = out.release(true);
+        assert_eq!(first + &rest, "caf\u{e9}s");
+        assert!(!stopped);
+    }
+
+    fn request(v: Value) -> ChatRequest {
+        serde_json::from_value(
+            json!({ "messages": [] })
+                .as_object()
+                .unwrap()
+                .clone()
+                .into_iter()
+                .chain(v.as_object().unwrap().clone())
+                .collect::<serde_json::Map<_, _>>()
+                .into(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sampling_fields_are_validated() {
+        let s = request(json!({ "top_k": -1, "top_p": 0.9, "logit_bias": { "5": -100 } }))
+            .sampling(10, 7)
+            .unwrap();
+        assert_eq!((s.top_k, s.top_p, s.seed, s.temperature), (0, 0.9, 7, 1.0));
+        assert_eq!(s.logit_bias, vec![(5, -100.0)]);
+        for bad in [
+            json!({ "top_p": 0 }),
+            json!({ "top_k": -2 }),
+            json!({ "presence_penalty": 3 }),
+            json!({ "logit_bias": { "10": 1 } }),
+            json!({ "repetition_penalty": 0 }),
+        ] {
+            assert!(request(bad.clone()).sampling(10, 0).is_err(), "{bad}");
+        }
+        assert!(request(json!({ "stop": ["a", ""] })).stops().is_err());
+        assert_eq!(request(json!({ "stop": "a" })).stops().unwrap(), vec!["a"]);
+    }
 }

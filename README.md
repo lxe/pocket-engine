@@ -11,7 +11,7 @@ An inference server for small Qwen3.5 models, written from scratch in Rust and C
 | Weights | Hugging Face safetensors checkpoints, one file or sharded, in bf16 (f32 tensors are converted) |
 | Quantization | None. Weights and activations run in bf16 with f32 accumulation; recurrent state is f32 |
 | Context | Up to `--max-context` tokens per request (default 4,096) |
-| Sampling | Greedy (`temperature: 0`) or temperature sampling with an optional `seed` |
+| Sampling | Greedy, or temperature with `top_k`, `top_p`, `min_p` and `seed`; `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`; `stop` strings |
 | GPUs | NVIDIA, built per architecture: `90a` (H100), `120a` (RTX 50-series); others via `CUDA_COMPUTE_CAP` |
 | Driver | CUDA 13 (driver 580 or newer); cuBLAS 13 at run time |
 
@@ -52,9 +52,25 @@ The server answers on three paths:
 
 | Path | What it does |
 |---|---|
-| `POST /v1/chat/completions` | Streamed (`"stream": true`, with `stream_options.include_usage`) or whole responses. Thinking is off. |
+| `POST /v1/chat/completions` | Streamed (`"stream": true`, with `stream_options.include_usage`) or whole responses. Thinking is off. Sampling fields are listed below. |
 | `GET /v1/models` | Lists the served model. |
 | `GET /health` | Reports running and waiting requests and free KV blocks. Returns 503 once the GPU has failed. |
+
+Sampling fields follow OpenAI, plus the vLLM extensions `top_k`, `min_p` and `repetition_penalty`. All of them run on the GPU. A request without `temperature` samples at 1.0.
+
+| Field | Range | Effect |
+|---|---|---|
+| `temperature` | 0 to 100 | 0 picks the most likely token |
+| `top_k` | -1, 0 or more | keep the k most likely tokens; -1 and 0 keep all |
+| `top_p` | (0, 1] | keep the smallest set of tokens holding this much probability |
+| `min_p` | 0 to 1 | keep tokens at least this fraction as likely as the top one |
+| `presence_penalty`, `frequency_penalty` | -2 to 2 | subtract from the logits of tokens already generated: once, and per occurrence |
+| `repetition_penalty` | above 0 | divide positive logits, and multiply negative ones, for tokens in the prompt or output |
+| `logit_bias` | -100 to 100 | add to chosen token ids' logits |
+| `stop` | up to 16 strings | end the response before the first occurrence |
+| `seed` | integer | makes sampling reproducible |
+
+Filters apply in order: min_p, then top_k, then top_p. Each one judges the tokens the previous one kept.
 
 `serve` takes these options:
 
@@ -75,10 +91,12 @@ POCKET_ENGINE_MODEL=models/qwen3.5-2b \
   CUDA_COMPUTE_CAP=120a cargo test --release --features cuda
 ```
 
-With a model directory set, `tests/gpu.rs` runs three checks against the model, which can be 0.8B, 2B or 4B:
+With a model directory set, `tests/gpu.rs` runs five checks against the model, which can be 0.8B, 2B or 4B:
 
 - its predictions match stored Transformers reference outputs;
 - batching does not change greedy output;
+- the samplers keep exactly the right tokens and draw them in proportion to the model's probabilities;
+- penalties cut repetition;
 - the HTTP API streams and reports usage correctly.
 
 To check a model or prompt that isn't in the fixtures, `scripts/accuracy.py` makes new reference data with Transformers:

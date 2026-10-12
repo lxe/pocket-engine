@@ -106,13 +106,21 @@ fn matches_transformers_teacher_forced() {
 }
 
 fn generate(e: &mut Engine, prompts: &[Vec<u32>], n: usize) -> Vec<Vec<u32>> {
+    let runs: Vec<_> = prompts
+        .iter()
+        .map(|p| (p.clone(), Sampling::default()))
+        .collect();
+    generate_with(e, &runs, n)
+}
+
+fn generate_with(e: &mut Engine, runs: &[(Vec<u32>, Sampling)], n: usize) -> Vec<Vec<u32>> {
     let mut rxs = Vec::new();
-    for p in prompts {
+    for (p, sampling) in runs {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         e.sched.submit(Request {
             prompt: p.clone(),
             max_new: n,
-            sampling: Sampling::default(),
+            sampling: sampling.clone(),
             tx,
         });
         rxs.push(rx);
@@ -145,6 +153,165 @@ fn batching_does_not_change_greedy_output() {
     let together = generate(&mut e, &prompts, 24);
     assert_eq!(alone[0], together[0]);
     assert!(together.iter().all(|t| !t.is_empty()));
+}
+
+/// Draws one token `n` times from the first position of a prompt.
+fn draws(e: &mut Engine, prompt: &[u32], sampling: Sampling, n: usize) -> Vec<u32> {
+    let runs: Vec<_> = (0..n)
+        .map(|i| {
+            let s = Sampling {
+                seed: 1000 + i as u64,
+                ..sampling.clone()
+            };
+            (prompt.to_vec(), s)
+        })
+        .collect();
+    generate_with(e, &runs, 1)
+        .into_iter()
+        .map(|t| t[0])
+        .collect()
+}
+
+/// Top-k, top-p and min-p keep exactly the tokens they should, and the kept
+/// tokens are drawn in proportion to the model's probabilities.
+#[test]
+fn samplers_follow_the_model_distribution() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let prompt = tok
+        .chat(&[serde_json::json!({ "role": "user", "content": "Name one color. One word." })])
+        .unwrap();
+    let mut e = Engine::new(config(dir)).unwrap();
+    // The model's top five at the first position, with log-probabilities.
+    let top = e.score(vec![(prompt.clone(), vec![0])]).unwrap()[0][0]
+        .top
+        .clone();
+    let p: Vec<f64> = top.iter().map(|t| (t.1 as f64).exp()).collect();
+    let n = 400;
+    let count = |d: &[u32], t: u32| d.iter().filter(|&&x| x == t).count();
+    let close = |got: usize, want: f64| {
+        let sd = (n as f64 * want * (1.0 - want)).sqrt().max(1.0);
+        (got as f64 - n as f64 * want).abs() < 4.0 * sd + 2.0
+    };
+    // top_k = 2: only the top two, in proportion.
+    let d = draws(
+        &mut e,
+        &prompt,
+        Sampling {
+            temperature: 1.0,
+            top_k: 2,
+            ..Sampling::default()
+        },
+        n,
+    );
+    assert_eq!(count(&d, top[0].0) + count(&d, top[1].0), n);
+    assert!(
+        close(count(&d, top[0].0), p[0] / (p[0] + p[1])),
+        "top_k split"
+    );
+    // top_p between the second and third cumulative mass: the top three.
+    let c: Vec<f64> = p
+        .iter()
+        .scan(0.0, |a, x| {
+            *a += x;
+            Some(*a)
+        })
+        .collect();
+    let top_p = ((c[1] + c[2]) / 2.0) as f32;
+    let d = draws(
+        &mut e,
+        &prompt,
+        Sampling {
+            temperature: 1.0,
+            top_p,
+            ..Sampling::default()
+        },
+        n,
+    );
+    assert_eq!(
+        (0..3).map(|i| count(&d, top[i].0)).sum::<usize>(),
+        n,
+        "top_p keeps three"
+    );
+    assert!(close(count(&d, top[0].0), p[0] / c[2]), "top_p split");
+    // min_p at the second token's ratio keeps the top two.
+    let min_p = ((p[1] / p[0] + p[2] / p[0]) / 2.0) as f32;
+    let d = draws(
+        &mut e,
+        &prompt,
+        Sampling {
+            temperature: 1.0,
+            min_p,
+            ..Sampling::default()
+        },
+        n,
+    );
+    assert_eq!(
+        count(&d, top[0].0) + count(&d, top[1].0),
+        n,
+        "min_p keeps two"
+    );
+    // Plain temperature sampling reaches beyond the top token, reproducibly.
+    let plain = Sampling {
+        temperature: 1.0,
+        ..Sampling::default()
+    };
+    let d = draws(&mut e, &prompt, plain.clone(), 64);
+    assert_eq!(
+        d,
+        draws(&mut e, &prompt, plain, 64),
+        "same seeds, same draws"
+    );
+    // A -100 bias removes the greedy pick; +100 forces any token.
+    let greedy = draws(&mut e, &prompt, Sampling::default(), 1)[0];
+    assert_eq!(greedy, top[0].0);
+    let banned = Sampling {
+        logit_bias: vec![(greedy, -100.0)],
+        ..Sampling::default()
+    };
+    assert_eq!(draws(&mut e, &prompt, banned, 1)[0], top[1].0);
+    let forced = Sampling {
+        logit_bias: vec![(12345, 100.0)],
+        ..Sampling::default()
+    };
+    assert_eq!(draws(&mut e, &prompt, forced, 1)[0], 12345);
+}
+
+/// Penalties discourage repeating generated tokens.
+#[test]
+fn penalties_reduce_repetition() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let prompt = tok
+        .chat(&[serde_json::json!({ "role": "user", "content": "Write the word yes 30 times, separated by spaces, nothing else." })])
+        .unwrap();
+    let mut e = Engine::new(config(dir)).unwrap();
+    // The most repeated token's count: penalties cut it, whether the model
+    // then varies its words or stops early.
+    let most = |t: &[u32]| {
+        let mut c = std::collections::HashMap::new();
+        t.iter().for_each(|x| *c.entry(x).or_insert(0) += 1);
+        c.into_values().max().unwrap_or(0)
+    };
+    let plain = generate_with(&mut e, &[(prompt.clone(), Sampling::default())], 48);
+    let penalized = Sampling {
+        frequency_penalty: 2.0,
+        presence_penalty: 2.0,
+        ..Sampling::default()
+    };
+    let varied = generate_with(&mut e, &[(prompt, penalized)], 48);
+    assert!(
+        most(&plain[0]) >= 20,
+        "the prompt repeats without penalties"
+    );
+    assert!(
+        most(&varied[0]) * 2 < most(&plain[0]),
+        "{:?} vs {:?}",
+        varied[0],
+        plain[0]
+    );
 }
 
 /// The OpenAI-compatible server streams text and reports usage.

@@ -4,7 +4,7 @@
 //! blocks for the whole request, so nothing is ever preempted.
 
 use crate::model::{BLOCK_SIZE, Meta};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -25,10 +25,20 @@ pub enum Event {
     Error(String),
 }
 
-/// How the next token is picked. Temperature 0 is greedy.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// How the next token is picked. Temperature 0 is greedy. Penalties and
+/// biases adjust the logits first, as OpenAI and vLLM define them: presence
+/// and frequency count generated tokens, repetition covers prompt and output.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Sampling {
     pub temperature: f32,
+    /// 0 keeps every token.
+    pub top_k: u32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub repetition_penalty: f32,
+    pub logit_bias: Vec<(u32, f32)>,
     pub seed: u64,
 }
 
@@ -36,8 +46,24 @@ impl Default for Sampling {
     fn default() -> Self {
         Self {
             temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repetition_penalty: 1.0,
+            logit_bias: Vec::new(),
             seed: 0,
         }
+    }
+}
+
+impl Sampling {
+    fn adjusts_logits(&self) -> bool {
+        self.presence_penalty != 0.0
+            || self.frequency_penalty != 0.0
+            || self.repetition_penalty != 1.0
+            || !self.logit_bias.is_empty()
     }
 }
 
@@ -67,6 +93,9 @@ pub struct Seq {
     pub forced: Option<Vec<u32>>,
     pub scored: Vec<Scored>,
     admitted: Instant,
+    /// Generated-token counts, kept only when the sampling adjusts logits.
+    counts: HashMap<u32, u32>,
+    prompt_tokens: HashSet<u32>,
 }
 
 impl Seq {
@@ -83,6 +112,57 @@ impl Seq {
     }
     fn in_prompt(&self) -> bool {
         self.fed < self.req.prompt.len()
+    }
+}
+
+/// Staged logit adjustments for a step: entry i sets
+/// logit[tok] = (logit > 0 ? logit / rep : logit * rep) + add.
+/// `add` and `rep` hold f32 bits.
+pub struct Pen<'a> {
+    pub tok: &'a mut [i32],
+    pub add: &'a mut [i32],
+    pub rep: &'a mut [i32],
+}
+
+impl<'a> Pen<'a> {
+    /// Splits a staging area of three equal regions.
+    pub fn split(words: &'a mut [i32]) -> Self {
+        let cap = words.len() / 3;
+        let (tok, rest) = words.split_at_mut(cap);
+        let (add, rep) = rest.split_at_mut(cap);
+        Self {
+            tok,
+            add,
+            rep: &mut rep[..cap],
+        }
+    }
+
+    /// Appends a sequence's adjustments from entry `e`; returns the new end.
+    fn push_seq(&mut self, mut e: usize, s: &Seq) -> usize {
+        let sp = &s.req.sampling;
+        let mut adj: HashMap<u32, (f32, f32)> = HashMap::new();
+        for (&t, &c) in &s.counts {
+            let a = adj.entry(t).or_insert((0.0, 1.0));
+            a.0 -= sp.presence_penalty + sp.frequency_penalty * c as f32;
+        }
+        if sp.repetition_penalty != 1.0 {
+            for &t in s.prompt_tokens.iter().chain(s.counts.keys()) {
+                adj.entry(t).or_insert((0.0, 1.0)).1 = sp.repetition_penalty;
+            }
+        }
+        for &(t, b) in &sp.logit_bias {
+            adj.entry(t).or_insert((0.0, 1.0)).0 += b;
+        }
+        for (t, (add, rep)) in adj {
+            if e == self.tok.len() {
+                break; // capacity covers a full context plus a bias list
+            }
+            self.tok[e] = t as i32;
+            self.add[e] = add.to_bits() as i32;
+            self.rep[e] = rep.to_bits() as i32;
+            e += 1;
+        }
+        e
     }
 }
 
@@ -196,6 +276,8 @@ impl Scheduler {
             forced,
             scored: Vec::new(),
             admitted: Instant::now(),
+            counts: HashMap::new(),
+            prompt_tokens: HashSet::new(),
         });
     }
 
@@ -212,6 +294,9 @@ impl Scheduler {
             seq.slot = self.free_slots.pop().expect("slot available");
             seq.blocks = self.free_blocks.split_off(self.free_blocks.len() - need);
             seq.admitted = Instant::now();
+            if seq.req.sampling.repetition_penalty != 1.0 {
+                seq.prompt_tokens = seq.req.prompt.iter().copied().collect();
+            }
             self.running.push(seq);
         }
     }
@@ -255,11 +340,14 @@ impl Scheduler {
         Some(step)
     }
 
-    /// Writes the step's batch metadata (see [`Meta`]) into `m`.
-    pub fn fill(&self, step: &Step, m: &mut [i32]) {
+    /// Writes the step's batch metadata (see [`Meta`]) into `m`, and the
+    /// rows' logit adjustments into `pen`. Returns the number of adjustments.
+    pub fn fill(&self, step: &Step, m: &mut [i32], pen: &mut Pen) -> usize {
         let me = &self.meta;
         let mut t = 0;
+        let mut e = 0;
         m[me.cu()] = 0;
+        m[me.pen_cu()] = 0;
         for (si, &(ri, n)) in step.rows.iter().enumerate() {
             let s = &self.running[ri];
             for k in 0..n {
@@ -279,11 +367,19 @@ impl Scheduler {
             m[me.temps() + si] = sp.temperature.max(0.0).to_bits() as i32;
             let seed = sp.seed ^ (s.generated.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
             m[me.seeds() + si] = (seed ^ (seed >> 32)) as i32;
+            m[me.top_ks() + si] = sp.top_k as i32;
+            m[me.top_ps() + si] = sp.top_p.to_bits() as i32;
+            m[me.min_ps() + si] = sp.min_p.to_bits() as i32;
+            if sp.adjusts_logits() && s.fed + n >= s.total() {
+                e = pen.push_seq(e, s);
+            }
+            m[me.pen_cu() + si + 1] = e as i32;
             let row = me.block_table() + si * me.max_blocks;
             for (dst, &b) in m[row..row + s.blocks.len()].iter_mut().zip(&s.blocks) {
                 *dst = b as i32;
             }
         }
+        e
     }
 
     /// Writes padding rows [from, to) for a graph replay: one-token sequences
@@ -293,6 +389,7 @@ impl Scheduler {
         let scratch = self.scratch_slot() as i32;
         if from == 0 {
             m[me.cu()] = 0;
+            m[me.pen_cu()] = 0;
         }
         for i in from..to {
             m[me.ids() + i] = 0;
@@ -305,6 +402,10 @@ impl Scheduler {
             m[me.last() + i] = i as i32;
             m[me.temps() + i] = 0;
             m[me.seeds() + i] = 0;
+            m[me.top_ks() + i] = 0;
+            m[me.top_ps() + i] = 1f32.to_bits() as i32;
+            m[me.min_ps() + i] = 0;
+            m[me.pen_cu() + i + 1] = m[me.pen_cu() + i];
             m[me.block_table() + i * me.max_blocks..me.block_table() + (i + 1) * me.max_blocks]
                 .fill(0);
         }
@@ -354,6 +455,9 @@ impl Scheduler {
             let stop = s.forced.is_none() && self.eos.contains(&tok);
             if !stop {
                 s.generated.push(tok);
+                if s.req.sampling.adjusts_logits() {
+                    *s.counts.entry(tok).or_default() += 1;
+                }
                 let _ = s.req.tx.send(Event::Token(tok));
             }
             if stop || s.generated.len() >= s.req.max_new {
@@ -425,7 +529,7 @@ mod tests {
     fn step(s: &mut Scheduler, pick: u32) -> (usize, usize, Vec<Seq>) {
         let step = s.plan().expect("work");
         let mut m = vec![0; s.meta.words()];
-        s.fill(&step, &mut m);
+        s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
         let (t, n) = (step.tokens, step.seqs());
         let done = s.finish(step, &vec![pick; n], Vec::new());
         (t, n, done)
@@ -455,7 +559,7 @@ mod tests {
         s.submit(a);
         let step = s.plan().unwrap();
         let mut m = vec![0; s.meta.words()];
-        s.fill(&step, &mut m);
+        s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
         let me = s.meta;
         assert_eq!(step.tokens, 16);
         assert_eq!(&m[me.pos()..me.pos() + 3], &[0, 1, 2]);
@@ -467,7 +571,7 @@ mod tests {
         assert_eq!(m[me.slot_map() + 15], first * BLOCK_SIZE as i32 + 15);
         s.finish(step, &[0], Vec::new());
         let step = s.plan().unwrap();
-        s.fill(&step, &mut m);
+        s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
         assert_eq!(m[me.fresh()], 0, "second chunk continues the state");
         assert_eq!(m[me.pos()], 16);
         assert_eq!(
@@ -532,11 +636,49 @@ mod tests {
         s.finish(step1, &[3], vec![Some(sc)]);
         let step2 = s.plan().unwrap();
         let mut m = vec![0; s.meta.words()];
-        s.fill(&step2, &mut m);
+        s.fill(&step2, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
         assert_eq!(m[s.meta.ids()], 11, "the forced token, not the pick");
         let done = s.finish(step2, &[4], vec![None]);
         assert_eq!(done[0].scored.len(), 1);
         assert_eq!(tokens(&mut ra), (vec![11, 12], Some(Finish::Length)));
+    }
+
+    #[test]
+    fn penalties_cover_generated_tokens_and_bias() {
+        let mut s = sched(2, 64, 64);
+        let (mut a, _ra) = request(3, 8);
+        a.sampling = Sampling {
+            presence_penalty: 0.5,
+            frequency_penalty: 0.25,
+            repetition_penalty: 2.0,
+            logit_bias: vec![(42, 3.0)],
+            ..Sampling::default()
+        };
+        s.submit(a);
+        let mut words = [0; 3 * 64];
+        for pick in [7, 7] {
+            let step = s.plan().unwrap();
+            let mut m = vec![0; s.meta.words()];
+            s.fill(&step, &mut m, &mut Pen::split(&mut words));
+            s.finish(step, &[pick], Vec::new());
+        }
+        let step = s.plan().unwrap();
+        let mut m = vec![0; s.meta.words()];
+        let n = s.fill(&step, &mut m, &mut Pen::split(&mut words));
+        // Prompt tokens 1..=3, generated 7 (twice) and the biased 42.
+        assert_eq!(n, 5);
+        assert_eq!(m[s.meta.pen_cu() + 1], 5);
+        let pen = Pen::split(&mut words);
+        let get = |t: i32| {
+            let i = pen.tok[..n].iter().position(|&x| x == t).unwrap();
+            (
+                f32::from_bits(pen.add[i] as u32),
+                f32::from_bits(pen.rep[i] as u32),
+            )
+        };
+        assert_eq!(get(7), (-(0.5 + 0.25 * 2.0), 2.0));
+        assert_eq!(get(1), (0.0, 2.0));
+        assert_eq!(get(42), (3.0, 1.0));
     }
 
     #[test]

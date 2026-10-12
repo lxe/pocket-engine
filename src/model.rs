@@ -171,6 +171,7 @@ struct Kernels {
     gdn_recurrent: Kernel,
     attn_prep: Kernel,
     attn: Kernel,
+    penalize: Kernel,
     sample: Kernel,
 }
 
@@ -383,6 +384,7 @@ impl Model {
             gdn_recurrent: gpu.kernel("gdn_recurrent")?,
             attn_prep: gpu.kernel("attn_prep")?,
             attn: gpu.kernel("attn_paged_g4")?,
+            penalize: gpu.kernel("penalize")?,
             sample: gpu.kernel("sample")?,
         };
         Ok(Self {
@@ -471,8 +473,21 @@ impl Meta {
     pub fn seeds(&self) -> usize {
         self.temps() + self.max_seqs
     }
-    pub fn block_table(&self) -> usize {
+    pub fn top_ks(&self) -> usize {
         self.seeds() + self.max_seqs
+    }
+    pub fn top_ps(&self) -> usize {
+        self.top_ks() + self.max_seqs
+    }
+    pub fn min_ps(&self) -> usize {
+        self.top_ps() + self.max_seqs
+    }
+    /// Offsets of each sequence's penalty entries (see [`Act::pen_capacity`]).
+    pub fn pen_cu(&self) -> usize {
+        self.min_ps() + self.max_seqs
+    }
+    pub fn block_table(&self) -> usize {
+        self.pen_cu() + self.max_seqs + 1
     }
     pub fn words(&self) -> usize {
         self.block_table() + self.max_seqs * self.max_blocks
@@ -498,12 +513,18 @@ pub struct Act {
     pub logits: Buf,
     ids_out: Buf,
     pub ids_host: Pinned,
+    /// Logit adjustments: [token i32 | add f32 | rep f32], each `pen_capacity` long.
+    pen_dev: Buf,
+    pub pen_staging: Pinned,
+    pub pen_capacity: usize,
 }
 
 impl Act {
     pub fn new(gpu: &Gpu, cfg: &Config, meta: Meta) -> Result<Self> {
         let (t, s) = (meta.max_tokens, meta.max_seqs);
         let b = |n: usize| gpu.alloc_zeroed(n * 2);
+        // Every token a sequence can hold, plus a logit_bias of up to 1,024.
+        let pen_capacity = s * (meta.max_blocks * BLOCK_SIZE + 1024);
         Ok(Self {
             meta_dev: gpu.alloc_zeroed(meta.words() * 4)?,
             staging: gpu.pinned(meta.words() * 4)?,
@@ -521,6 +542,9 @@ impl Act {
             logits: gpu.alloc_zeroed(s * cfg.vocab * 4)?,
             ids_out: gpu.alloc_zeroed(s * 4)?,
             ids_host: gpu.pinned(s * 4)?,
+            pen_dev: gpu.alloc_zeroed(3 * pen_capacity * 4)?,
+            pen_staging: gpu.pinned(3 * pen_capacity * 4)?,
+            pen_capacity,
             meta,
         })
     }
@@ -531,7 +555,17 @@ impl Act {
 
     /// Copies the staged metadata to the device.
     pub fn upload_meta(&self, gpu: &Gpu) -> Result<()> {
-        gpu.htod(self.meta_dev.ptr, &self.staging, self.meta.words() * 4)
+        gpu.htod(self.meta_dev.ptr, &self.staging, 0, self.meta.words() * 4)
+    }
+
+    /// Copies the first `n` staged penalty entries to the device.
+    pub fn upload_pen(&self, gpu: &Gpu, n: usize) -> Result<()> {
+        let cap = 4 * self.pen_capacity;
+        for region in 0..3 {
+            let at = region * cap;
+            gpu.htod(self.pen_dev.ptr + at as u64, &self.pen_staging, at, 4 * n)?;
+        }
+        Ok(())
     }
 
     /// Queues the copy of the picked tokens of the first `s` sequences.
@@ -723,6 +757,21 @@ impl Model {
             ],
         )?;
         gpu.gemm(a.fin.ptr, self.embed.ptr, a.logits.ptr, s, h, c.vocab, true)?;
+        let cap = (4 * a.pen_capacity) as u64;
+        gpu.launch(
+            k.penalize,
+            (si, 1, 1),
+            256,
+            0,
+            &[
+                P(a.logits.ptr),
+                I(c.vocab as i32),
+                P(a.m(me.pen_cu())),
+                P(a.pen_dev.ptr),
+                P(a.pen_dev.ptr + cap),
+                P(a.pen_dev.ptr + 2 * cap),
+            ],
+        )?;
         gpu.launch(
             k.sample,
             (si, 1, 1),
@@ -732,6 +781,9 @@ impl Model {
                 P(a.logits.ptr),
                 I(c.vocab as i32),
                 P(a.m(me.temps())),
+                P(a.m(me.top_ks())),
+                P(a.m(me.top_ps())),
+                P(a.m(me.min_ps())),
                 P(a.m(me.seeds())),
                 P(a.ids_out.ptr),
             ],
@@ -804,6 +856,10 @@ mod tests {
             m.last(),
             m.temps(),
             m.seeds(),
+            m.top_ks(),
+            m.top_ps(),
+            m.min_ps(),
+            m.pen_cu(),
             m.block_table(),
             m.words(),
         ];

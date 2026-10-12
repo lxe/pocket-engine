@@ -401,25 +401,145 @@ __device__ __forceinline__ uint32_t mix32(uint32_t x) {
     return x;
 }
 
+// Adjusts logits before sampling: for each (token, add, rep) entry of a row,
+// logit = (logit > 0 ? logit / rep : logit * rep) + add. Entries of a row name
+// distinct tokens. pen_cu[r]..pen_cu[r + 1] are row r's entries.
+extern "C" __global__ void penalize(float* __restrict__ logits, int V, const int* __restrict__ pen_cu,
+                                    const int* __restrict__ pen_tok, const float* __restrict__ pen_add,
+                                    const float* __restrict__ pen_rep) {
+    float* row = logits + (size_t)blockIdx.x * V;
+    for (int e = pen_cu[blockIdx.x] + threadIdx.x; e < pen_cu[blockIdx.x + 1]; e += blockDim.x) {
+        const int t = pen_tok[e];
+        float l = row[t];
+        const float rep = pen_rep[e];
+        if (rep != 1.f) l = l > 0.f ? l / rep : l * rep;
+        row[t] = l + pen_add[e];
+    }
+}
+
+// Order-preserving map of a float to an unsigned key.
+__device__ __forceinline__ uint32_t fkey(float x) {
+    const uint32_t u = __float_as_uint(x);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+#define SAMPLE_THREADS 1024
+#define SAMPLE_WARPS (SAMPLE_THREADS / 32)
+
+__device__ __forceinline__ float block_max(float v, float* sh) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float t = (threadIdx.x & 31) < SAMPLE_WARPS ? sh[threadIdx.x & 31] : -INFINITY;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) t = fmaxf(t, __shfl_xor_sync(0xffffffffu, t, o));
+    __syncthreads();
+    return t;
+}
+
+// Radix selection over the keys of x = logit / T among elements with key >=
+// floor. By count (mass == false): the largest key K with at least `target`
+// elements >= K. By mass (mass == true): the largest K whose elements >= K
+// hold at least `target` of the probability exp(x - m) summed over the
+// survivors (target is a fraction). Returns floor when every survivor is
+// needed. Four 8-bit rounds, each one pass over the row with per-warp
+// histograms in shared memory.
+__device__ uint32_t radix_select(const float* __restrict__ row, int V, float inv_t, float m,
+                                 uint32_t floor, float target, bool mass, float* hist,
+                                 float* bins, uint32_t* shared) {
+    uint32_t prefix = 0, mask = 0;
+    float need = target;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        float* mine = hist + (threadIdx.x >> 5) * 256;
+        for (int b = threadIdx.x; b < SAMPLE_WARPS * 256; b += SAMPLE_THREADS) hist[b] = 0.f;
+        __syncthreads();
+        for (int i = threadIdx.x; i < V; i += SAMPLE_THREADS) {
+            const float x = row[i] * inv_t;
+            const uint32_t k = fkey(x);
+            if (k >= floor && (k & mask) == prefix)
+                atomicAdd(&mine[(k >> shift) & 255], mass ? expf(x - m) : 1.f);
+        }
+        __syncthreads();
+        if (threadIdx.x < 256) {
+            float t = 0.f;
+            for (int w = 0; w < SAMPLE_WARPS; w++) t += hist[w * 256 + threadIdx.x];
+            bins[threadIdx.x] = t;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            if (mass && shift == 24) {
+                float total = 0.f;
+                for (int b = 0; b < 256; b++) total += bins[b];
+                need = target * total;
+            }
+            float cum = 0.f;
+            int chosen = -1;
+            for (int b = 255; b >= 0; b--) {
+                if (cum + bins[b] >= need) {
+                    chosen = b;
+                    break;
+                }
+                cum += bins[b];
+            }
+            shared[0] = chosen < 0 ? 0xffffffffu : (uint32_t)chosen;
+            shared[1] = __float_as_uint(need - cum);
+        }
+        __syncthreads();
+        const uint32_t chosen = shared[0];
+        need = __uint_as_float(shared[1]);
+        __syncthreads();
+        if (chosen == 0xffffffffu) return floor;  // fewer survivors than needed
+        prefix |= chosen << shift;
+        mask |= 255u << shift;
+    }
+    return prefix > floor ? prefix : floor;
+}
+
 // Picks one token per row of f32 logits. temps[r] <= 0 is greedy (ties go to
-// the lowest index); otherwise Gumbel-max sampling from softmax(logits / T),
-// with noise drawn from a hash of (seeds[r], index).
-extern "C" __global__ void __launch_bounds__(1024)
+// the lowest index). Otherwise it samples from softmax(logits / T) restricted,
+// in order, by min_p (probability at least min_p times the top one), top_k and
+// top_p (the smallest set holding top_p of the remaining probability), using
+// Gumbel-max with noise hashed from (seeds[r], index).
+extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS)
     sample(const float* __restrict__ logits, int V, const float* __restrict__ temps,
-           const int* __restrict__ seeds, int* __restrict__ out) {
+           const int* __restrict__ top_ks, const float* __restrict__ top_ps,
+           const float* __restrict__ min_ps, const int* __restrict__ seeds, int* __restrict__ out) {
     __shared__ float sv[32];
     __shared__ int si[32];
+    __shared__ float hist[SAMPLE_WARPS * 256];
+    __shared__ float bins[256];
+    __shared__ uint32_t shared[2];
     const float* row = logits + (size_t)blockIdx.x * V;
     const float temp = temps[blockIdx.x];
     const uint32_t seed = mix32((uint32_t)seeds[blockIdx.x] ^ 0x9e3779b9u);
+    uint32_t floor = 0;
+    float inv_t = 1.f;
+    if (temp > 0.f) {
+        inv_t = 1.f / temp;
+        const int top_k = top_ks[blockIdx.x];
+        const float top_p = top_ps[blockIdx.x], min_p = min_ps[blockIdx.x];
+        if (top_k > 0 || top_p < 1.f || min_p > 0.f) {
+            float m = -INFINITY;
+            for (int i = threadIdx.x; i < V; i += SAMPLE_THREADS) m = fmaxf(m, row[i] * inv_t);
+            m = block_max(m, sv);
+            if (min_p > 0.f) floor = fkey(m + logf(min_p));
+            if (top_k > 0 && top_k < V)
+                floor = radix_select(row, V, inv_t, m, floor, (float)top_k, false, hist, bins, shared);
+            if (top_p < 1.f)
+                floor = radix_select(row, V, inv_t, m, floor, top_p, true, hist, bins, shared);
+        }
+    }
     float best = -INFINITY;
     int bi = 0x7fffffff;
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    for (int i = threadIdx.x; i < V; i += SAMPLE_THREADS) {
         float x = row[i];
         if (temp > 0.f) {
+            x *= inv_t;
+            if (fkey(x) < floor) continue;
             const uint32_t h = mix32(seed ^ mix32((uint32_t)i));
             const float u = ((float)(h >> 8) + 0.5f) * (1.f / 16777216.f);
-            x = x / temp - logf(-logf(u));
+            x -= logf(-logf(u));
         }
         if (x > best) {
             best = x;

@@ -243,13 +243,15 @@ impl Gpu {
         )
     }
 
-    /// Stream-ordered copy from pinned memory; `src` must stay alive until the
-    /// stream reaches it (callers synchronize each step).
-    pub fn htod(&self, dst: u64, src: &Pinned, bytes: usize) -> Result<()> {
-        assert!(bytes <= src.bytes);
-        // SAFETY: the pinned buffer outlives the copy (synchronized per step).
+    /// Stream-ordered copy of `bytes` from pinned memory at `offset`; `src`
+    /// must stay alive until the stream reaches it (callers synchronize each step).
+    pub fn htod(&self, dst: u64, src: &Pinned, offset: usize, bytes: usize) -> Result<()> {
+        assert!(offset + bytes <= src.bytes);
+        // SAFETY: the range lies inside the pinned buffer, which outlives the copy.
         check(
-            unsafe { cu::cuMemcpyHtoDAsync_v2(dst, src.ptr.cast(), bytes, self.stream) },
+            unsafe {
+                cu::cuMemcpyHtoDAsync_v2(dst, src.ptr.add(offset).cast(), bytes, self.stream)
+            },
             "cuMemcpyHtoDAsync",
         )
     }

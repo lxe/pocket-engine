@@ -33,26 +33,39 @@ impl ChatTokenizer {
     }
 
     /// Renders messages with the model's chat template (thinking off) and
-    /// tokenizes the result.
-    pub fn chat(&self, messages: &[Value]) -> Result<Vec<u32>> {
+    /// tokenizes the result. Returns the token ids, with one image
+    /// placeholder per image, and the images' URLs in order.
+    pub fn chat(&self, messages: &[Value]) -> Result<(Vec<u32>, Vec<String>)> {
         let mut norm = Vec::with_capacity(messages.len());
+        let mut images = Vec::new();
         for m in messages {
             let role = m["role"].as_str().unwrap_or_default();
             if !matches!(role, "system" | "user" | "assistant") {
                 return Err(Error::Request(format!("unsupported role {role:?}")));
             }
             let content = match &m["content"] {
-                Value::String(s) => s.clone(),
-                Value::Array(parts) => parts
-                    .iter()
-                    .map(|p| match p["type"].as_str() {
-                        Some("text") => Ok(p["text"].as_str().unwrap_or_default().to_string()),
-                        _ => Err(Error::Request("only text content is supported".into())),
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .join(""),
-                Value::Null => String::new(),
-                _ => return Err(Error::Request("message content must be text".into())),
+                Value::String(s) => json!(s),
+                Value::Array(parts) => {
+                    let mut out = Vec::with_capacity(parts.len());
+                    for p in parts {
+                        match p["type"].as_str() {
+                            Some("text") => out.push(json!({ "type": "text", "text": p["text"].as_str().unwrap_or_default() })),
+                            Some("image_url") => {
+                                let url = p["image_url"]["url"].as_str().or(p["image_url"].as_str());
+                                images.push(url.ok_or_else(|| Error::Request("image_url needs a url".into()))?.to_string());
+                                out.push(json!({ "type": "image" }));
+                            }
+                            other => return Err(Error::Request(format!("unsupported content part {other:?}"))),
+                        }
+                    }
+                    Value::Array(out)
+                }
+                Value::Null => json!(""),
+                _ => {
+                    return Err(Error::Request(
+                        "message content must be text or parts".into(),
+                    ));
+                }
             };
             norm.push(json!({ "role": role, "content": content }));
         }
@@ -80,7 +93,7 @@ impl ChatTokenizer {
                 tools => false, add_vision_id => false
             })
             .map_err(|e| Error::Request(e.to_string()))?;
-        self.encode(&text)
+        Ok((self.encode(&text)?, images))
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -95,6 +108,42 @@ impl ChatTokenizer {
     pub fn decode(&self, ids: &[u32]) -> String {
         self.tok.decode(ids, true).unwrap_or_default()
     }
+}
+
+/// The bytes of a `data:` URL (base64 only), or None for other URLs.
+pub fn data_url(url: &str) -> Option<Result<Vec<u8>>> {
+    use base64::Engine as _;
+    let rest = url.strip_prefix("data:")?;
+    Some(match rest.split_once(";base64,") {
+        Some((_, data)) => base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .map_err(|e| Error::Request(format!("bad base64 image: {e}"))),
+        None => Err(Error::Request("image data URLs must be base64".into())),
+    })
+}
+
+/// Preprocesses encoded images and completes a prompt that refers to them:
+/// placeholders expanded per embedding, and rotary positions for every token.
+pub fn with_images(
+    ids: Vec<u32>,
+    encoded: &[Vec<u8>],
+    spec: &crate::image::Spec,
+    placeholder: u32,
+) -> Result<(
+    Vec<u32>,
+    Vec<crate::image::Image>,
+    Option<crate::image::Rope>,
+)> {
+    if encoded.is_empty() {
+        return Ok((ids, Vec::new(), None));
+    }
+    let images = encoded
+        .iter()
+        .map(|b| crate::image::prepare(b, spec))
+        .collect::<Result<Vec<_>>>()?;
+    let ids = crate::image::expand_placeholders(&ids, &images, placeholder)?;
+    let rope = crate::image::rope_positions(&ids, &images, placeholder);
+    Ok((ids, images, Some(rope)))
 }
 
 /// Incremental detokenization: emits text once it no longer ends inside a
@@ -123,6 +172,9 @@ impl Detok {
 
 struct App {
     tok: ChatTokenizer,
+    /// Image preprocessing, when the engine accepts images.
+    spec: Option<crate::image::Spec>,
+    http: reqwest::Client,
     engine: Mutex<mpsc::Sender<Request>>,
     model: String,
     info: Info,
@@ -247,6 +299,26 @@ impl ChatRequest {
     }
 }
 
+/// Downloads an image, up to 32 MB.
+async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let fail = |e: reqwest::Error| Error::Request(format!("cannot fetch image: {e}"));
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(fail)?
+        .error_for_status()
+        .map_err(fail)?;
+    if resp.content_length().is_some_and(|n| n > 32 << 20) {
+        return Err(Error::Request("image is larger than 32 MB".into()));
+    }
+    let bytes = resp.bytes().await.map_err(fail)?;
+    if bytes.len() > 32 << 20 {
+        return Err(Error::Request("image is larger than 32 MB".into()));
+    }
+    Ok(bytes.to_vec())
+}
+
 fn err(status: StatusCode, msg: impl Into<String>) -> Response {
     (
         status,
@@ -282,9 +354,45 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         Ok(s) => s,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
-    let prompt = match app.tok.chat(&req.messages) {
+    let (ids, urls) = match app.tok.chat(&req.messages) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    let mut encoded = Vec::with_capacity(urls.len());
+    if !urls.is_empty() && app.spec.is_none() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "this model is served without images",
+        );
+    }
+    for url in &urls {
+        let bytes = match data_url(url) {
+            Some(b) => b,
+            None if url.starts_with("http://") || url.starts_with("https://") => {
+                fetch(&app.http, url).await
+            }
+            None => Err(Error::Request(
+                "images must be data: or http(s) URLs".into(),
+            )),
+        };
+        match bytes {
+            Ok(b) => encoded.push(b),
+            Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+        }
+    }
+    let spec = app.spec.clone().unwrap_or_default();
+    let placeholder = app.info.cfg.image_token;
+    let built =
+        tokio::task::spawn_blocking(move || with_images(ids, &encoded, &spec, placeholder)).await;
+    let (prompt, images, rope) = match built {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "image preprocessing failed",
+            );
+        }
     };
     let id = format!("chatcmpl-{n}");
     let max_new = req
@@ -298,6 +406,8 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         max_new,
         sampling,
         tx,
+        images,
+        rope,
     };
     if app.engine.lock().unwrap().send(request).is_err() {
         return err(StatusCode::SERVICE_UNAVAILABLE, "engine stopped");
@@ -568,16 +678,24 @@ async fn health_report(State(app): State<Arc<App>>) -> Response {
     (status, Json(body)).into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     tok: ChatTokenizer,
+    spec: Option<crate::image::Spec>,
     engine: mpsc::Sender<Request>,
     info: Info,
     health: Arc<Mutex<Health>>,
     model: String,
     bind: &str,
 ) -> Result<()> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Config(e.to_string()))?;
     let app = Arc::new(App {
         tok,
+        spec,
+        http,
         engine: Mutex::new(engine),
         model,
         info,

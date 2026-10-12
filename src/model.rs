@@ -27,6 +27,10 @@ pub struct Config {
     pub rope_theta: f64,
     pub attn_layers: Vec<bool>,
     pub eos: Vec<u32>,
+    /// The image placeholder token.
+    pub image_token: u32,
+    /// Rotary frequencies per axis (time, height, width), interleaved.
+    pub mrope_section: [usize; 3],
 }
 
 impl Config {
@@ -72,6 +76,15 @@ impl Config {
             attn_layers,
             // <|endoftext|> and <|im_end|>: chat turns end with the latter.
             eos: vec![t["eos_token_id"].as_u64().unwrap_or(248044) as u32, 248046],
+            image_token: raw["image_token_id"].as_u64().unwrap_or(248056) as u32,
+            mrope_section: match rope["mrope_section"].as_array() {
+                Some(a) if a.len() == 3 => {
+                    let v: Vec<usize> =
+                        a.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect();
+                    [v[0], v[1], v[2]]
+                }
+                _ => [11, 11, 10],
+            },
         };
         let check = |ok: bool, what: &str| {
             if ok {
@@ -184,14 +197,14 @@ pub struct Model {
     k: Kernels,
 }
 
-struct Checkpoint {
+pub(crate) struct Checkpoint {
     maps: Vec<memmap2::Mmap>,
     index: HashMap<String, usize>,
     prefix: String,
 }
 
 impl Checkpoint {
-    fn open(dir: &Path) -> Result<Self> {
+    pub(crate) fn open(dir: &Path) -> Result<Self> {
         let mut files: Vec<String> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .filter(|n| n.ends_with(".safetensors"))
@@ -232,8 +245,16 @@ impl Checkpoint {
         })
     }
 
+    /// Whether a tensor exists, by its full name.
+    pub(crate) fn has(&self, full: &str) -> bool {
+        self.index.contains_key(full)
+    }
+
     fn view(&self, name: &str) -> Result<(Dtype, Vec<usize>, &[u8])> {
-        let full = format!("{}{name}", self.prefix);
+        let full = match name.strip_prefix('/') {
+            Some(full) => full.to_string(),
+            None => format!("{}{name}", self.prefix),
+        };
         let i = *self
             .index
             .get(&full)
@@ -245,7 +266,9 @@ impl Checkpoint {
         Ok((dtype, shape, &self.maps[i][offset..offset + v.data().len()]))
     }
 
-    fn bf16(&self, name: &str, numel: usize) -> Result<Vec<u8>> {
+    /// A tensor as bf16 bytes. Names are relative to the text model; a leading
+    /// '/' names a tensor in full.
+    pub(crate) fn bf16(&self, name: &str, numel: usize) -> Result<Vec<u8>> {
         let (dtype, shape, data) = self.view(name)?;
         if shape.iter().product::<usize>() != numel {
             return Err(Error::Config(format!(
@@ -264,7 +287,7 @@ impl Checkpoint {
         }
     }
 
-    fn f32(&self, name: &str, numel: usize) -> Result<Vec<f32>> {
+    pub(crate) fn f32(&self, name: &str, numel: usize) -> Result<Vec<f32>> {
         let (dtype, shape, data) = self.view(name)?;
         if shape.iter().product::<usize>() != numel {
             return Err(Error::Config(format!(
@@ -295,7 +318,7 @@ fn map_file(file: &std::fs::File) -> Result<memmap2::Mmap> {
     Ok(unsafe { memmap2::Mmap::map(file)? })
 }
 
-fn f32_bytes(v: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
@@ -455,8 +478,16 @@ impl Meta {
     pub fn tok_seq(&self) -> usize {
         3 * self.max_tokens
     }
-    pub fn cu(&self) -> usize {
+    /// Image embedding pool row per token, or -1.
+    pub fn emb_src(&self) -> usize {
         4 * self.max_tokens
+    }
+    /// Rotary positions: time, height, width rows of max_tokens each.
+    pub fn rope(&self) -> usize {
+        5 * self.max_tokens
+    }
+    pub fn cu(&self) -> usize {
+        8 * self.max_tokens
     }
     pub fn slots(&self) -> usize {
         self.cu() + self.max_seqs + 1
@@ -511,6 +542,8 @@ pub struct Act {
     act: Buf,
     fin: Buf,
     pub logits: Buf,
+    /// Image embeddings awaiting their prompt step, `hidden` bf16 per row.
+    pub pool: Buf,
     ids_out: Buf,
     pub ids_host: Pinned,
     /// Logit adjustments: [token i32 | add f32 | rep f32], each `pen_capacity` long.
@@ -520,7 +553,9 @@ pub struct Act {
 }
 
 impl Act {
-    pub fn new(gpu: &Gpu, cfg: &Config, meta: Meta) -> Result<Self> {
+    /// `pool_rows` image embeddings can wait between the vision encoder and
+    /// the prompt step that reads them.
+    pub fn new(gpu: &Gpu, cfg: &Config, meta: Meta, pool_rows: usize) -> Result<Self> {
         let (t, s) = (meta.max_tokens, meta.max_seqs);
         let b = |n: usize| gpu.alloc_zeroed(n * 2);
         // Every token a sequence can hold, plus a logit_bias of up to 1,024.
@@ -540,6 +575,7 @@ impl Act {
             act: b(t * cfg.inter)?,
             fin: b(s * cfg.hidden)?,
             logits: gpu.alloc_zeroed(s * cfg.vocab * 4)?,
+            pool: gpu.alloc_zeroed(pool_rows.max(1) * cfg.hidden * 2)?,
             ids_out: gpu.alloc_zeroed(s * 4)?,
             ids_host: gpu.pinned(s * 4)?,
             pen_dev: gpu.alloc_zeroed(3 * pen_capacity * 4)?,
@@ -593,6 +629,8 @@ impl Model {
             &[
                 P(a.m(me.ids())),
                 P(self.embed.ptr),
+                P(a.m(me.emb_src())),
+                P(a.pool.ptr),
                 P(a.res.ptr),
                 I(h as i32),
             ],
@@ -693,7 +731,10 @@ impl Model {
                             I(c.hkv as i32),
                             P(q_norm.ptr),
                             P(k_norm.ptr),
-                            P(a.m(me.pos())),
+                            P(a.m(me.rope())),
+                            I(me.max_tokens as i32),
+                            I(c.mrope_section[1] as i32),
+                            I(c.mrope_section[2] as i32),
                             P(a.m(me.slot_map())),
                             P(self.inv_freq.ptr),
                             P(a.q.ptr),
@@ -850,6 +891,8 @@ mod tests {
             m.pos(),
             m.slot_map(),
             m.tok_seq(),
+            m.emb_src(),
+            m.rope(),
             m.cu(),
             m.slots(),
             m.fresh(),

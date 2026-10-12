@@ -3,6 +3,7 @@
 //! chunks, so new requests start while others decode. Admission reserves KV
 //! blocks for the whole request, so nothing is ever preempted.
 
+use crate::image::Image;
 use crate::model::{BLOCK_SIZE, Meta};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
@@ -72,6 +73,35 @@ pub struct Request {
     pub max_new: usize,
     pub sampling: Sampling,
     pub tx: UnboundedSender<Event>,
+    /// Images whose placeholders the prompt holds, one per embedding.
+    pub images: Vec<Image>,
+    /// Rotary positions of the prompt's tokens and the offset after it, when
+    /// they differ from the token index (prompts with images).
+    pub rope: Option<crate::image::Rope>,
+}
+
+impl Request {
+    pub fn text(
+        prompt: Vec<u32>,
+        max_new: usize,
+        sampling: Sampling,
+        tx: UnboundedSender<Event>,
+    ) -> Self {
+        Self {
+            prompt,
+            max_new,
+            sampling,
+            tx,
+            images: Vec::new(),
+            rope: None,
+        }
+    }
+}
+
+/// Images to encode into pool rows `row..` before this step runs.
+pub struct VisionJob {
+    pub images: Vec<Image>,
+    pub row: usize,
 }
 
 /// One teacher-forced position for accuracy checks: the model's pick and its
@@ -96,6 +126,11 @@ pub struct Seq {
     /// Generated-token counts, kept only when the sampling adjusts logits.
     counts: HashMap<u32, u32>,
     prompt_tokens: HashSet<u32>,
+    /// Rows of the image embedding pool this sequence holds until its prompt
+    /// is fed, and each prompt position's row offset (-1 for text).
+    pool: Option<(usize, usize)>,
+    image_rows: Vec<i32>,
+    vision_pending: bool,
 }
 
 impl Seq {
@@ -192,6 +227,9 @@ pub struct Counters {
 
 pub struct Scheduler {
     meta: Meta,
+    image_token: u32,
+    pool_free: Vec<(usize, usize)>,
+    pool_rows: usize,
     max_context: usize,
     free_slots: Vec<usize>,
     free_blocks: Vec<u32>,
@@ -214,8 +252,28 @@ pub struct Load {
 
 impl Scheduler {
     pub fn new(meta: Meta, max_context: usize, blocks: usize, eos: Vec<u32>) -> Self {
+        Self::with_images(meta, max_context, blocks, eos, 0, 0)
+    }
+
+    /// A scheduler whose requests may carry images: `pool_rows` image
+    /// embeddings can wait at once for their prompt steps.
+    pub fn with_images(
+        meta: Meta,
+        max_context: usize,
+        blocks: usize,
+        eos: Vec<u32>,
+        image_token: u32,
+        pool_rows: usize,
+    ) -> Self {
         Self {
             meta,
+            image_token,
+            pool_free: if pool_rows > 0 {
+                vec![(0, pool_rows)]
+            } else {
+                Vec::new()
+            },
+            pool_rows,
             max_context,
             free_slots: (0..meta.max_seqs).rev().collect(),
             free_blocks: (0..blocks as u32).rev().collect(),
@@ -263,6 +321,18 @@ impl Scheduler {
             )));
             return;
         }
+        let image_tokens: usize = req.images.iter().map(Image::tokens).sum();
+        if image_tokens > self.pool_rows {
+            let _ = req.tx.send(Event::Error(if self.pool_rows == 0 {
+                "this server does not accept images".into()
+            } else {
+                format!(
+                    "images need {image_tokens} embeddings; the server holds {}",
+                    self.pool_rows
+                )
+            }));
+            return;
+        }
         req.max_new = match &forced {
             Some(f) => f.len().min(limit - req.prompt.len()),
             None => req.max_new.clamp(1, limit - req.prompt.len()),
@@ -278,6 +348,9 @@ impl Scheduler {
             admitted: Instant::now(),
             counts: HashMap::new(),
             prompt_tokens: HashSet::new(),
+            pool: None,
+            image_rows: Vec::new(),
+            vision_pending: false,
         });
     }
 
@@ -287,10 +360,43 @@ impl Scheduler {
                 break;
             };
             let need = (seq.req.prompt.len() + seq.req.max_new).div_ceil(BLOCK_SIZE);
-            if self.free_slots.is_empty() || self.free_blocks.len() < need {
+            let rows: usize = seq.req.images.iter().map(Image::tokens).sum();
+            let pool_at = if rows > 0 {
+                self.pool_free.iter().position(|r| r.1 >= rows)
+            } else {
+                None
+            };
+            if self.free_slots.is_empty()
+                || self.free_blocks.len() < need
+                || (rows > 0 && pool_at.is_none())
+            {
                 break;
             }
             let mut seq = self.waiting.pop_front().expect("front exists");
+            if let Some(i) = pool_at {
+                let (start, len) = self.pool_free[i];
+                if len == rows {
+                    self.pool_free.remove(i);
+                } else {
+                    self.pool_free[i] = (start + rows, len - rows);
+                }
+                seq.pool = Some((start, rows));
+                seq.vision_pending = true;
+                let mut k = 0;
+                seq.image_rows = seq
+                    .req
+                    .prompt
+                    .iter()
+                    .map(|&t| {
+                        if t == self.image_token {
+                            k += 1;
+                            k - 1
+                        } else {
+                            -1
+                        }
+                    })
+                    .collect();
+            }
             seq.slot = self.free_slots.pop().expect("slot available");
             seq.blocks = self.free_blocks.split_off(self.free_blocks.len() - need);
             seq.admitted = Instant::now();
@@ -301,10 +407,48 @@ impl Scheduler {
         }
     }
 
-    fn release(&mut self, seq: Seq) -> Seq {
+    fn release(&mut self, mut seq: Seq) -> Seq {
         self.free_slots.push(seq.slot);
         self.free_blocks.extend_from_slice(&seq.blocks);
+        self.release_pool(&mut seq);
         seq
+    }
+
+    fn release_pool(&mut self, seq: &mut Seq) {
+        if let Some(range) = seq.pool.take() {
+            seq.image_rows = Vec::new();
+            self.free_pool(range);
+        }
+    }
+
+    fn free_pool(&mut self, range: (usize, usize)) {
+        self.pool_free.push(range);
+        self.pool_free.sort_unstable();
+        // Merge adjacent free ranges.
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.pool_free.len());
+        for &(s, l) in &self.pool_free {
+            match merged.last_mut() {
+                Some(last) if last.0 + last.1 == s => last.1 += l,
+                _ => merged.push((s, l)),
+            }
+        }
+        self.pool_free = merged;
+    }
+
+    /// Images of newly admitted sequences, to encode before the next step.
+    pub fn take_vision(&mut self) -> Vec<VisionJob> {
+        let mut jobs = Vec::new();
+        for s in &mut self.running {
+            if s.vision_pending {
+                s.vision_pending = false;
+                let row = s.pool.map_or(0, |p| p.0);
+                jobs.push(VisionJob {
+                    images: std::mem::take(&mut s.req.images),
+                    row,
+                });
+            }
+        }
+        jobs
     }
 
     /// Drops requests whose clients left, admits waiting ones and plans the
@@ -357,6 +501,18 @@ impl Scheduler {
                 m[me.slot_map() + t] =
                     (s.blocks[p / BLOCK_SIZE] as usize * BLOCK_SIZE + p % BLOCK_SIZE) as i32;
                 m[me.tok_seq() + t] = si as i32;
+                m[me.emb_src() + t] = match (s.pool, s.image_rows.get(p)) {
+                    (Some((start, _)), Some(&r)) if r >= 0 => start as i32 + r,
+                    _ => -1,
+                };
+                let rope = match &s.req.rope {
+                    Some((pos, _)) if p < pos.len() => pos[p],
+                    Some((_, delta)) => [p as i32 + delta; 3],
+                    None => [p as i32; 3],
+                };
+                for (axis, r) in rope.into_iter().enumerate() {
+                    m[me.rope() + axis * me.max_tokens + t] = r;
+                }
                 t += 1;
             }
             m[me.cu() + si + 1] = t as i32;
@@ -396,6 +552,10 @@ impl Scheduler {
             m[me.pos() + i] = 0;
             m[me.slot_map() + i] = -1;
             m[me.tok_seq() + i] = i as i32;
+            m[me.emb_src() + i] = -1;
+            for axis in 0..3 {
+                m[me.rope() + axis * me.max_tokens + i] = 0;
+            }
             m[me.cu() + i + 1] = i as i32 + 1;
             m[me.slots() + i] = scratch;
             m[me.fresh() + i] = 1;
@@ -440,6 +600,14 @@ impl Scheduler {
                 self.counters.decode_tokens += n as u64;
             }
             s.fed += n;
+            // Image embeddings are read only by the prompt's own steps.
+            if s.fed >= s.req.prompt.len()
+                && let Some(range) = s.pool.take()
+            {
+                s.image_rows = Vec::new();
+                self.free_pool(range);
+            }
+            let s = &mut self.running[ri];
             if s.fed < s.total() {
                 continue; // mid-prompt chunk: its pick is not a token yet
             }
@@ -504,12 +672,12 @@ mod tests {
 
     fn request(prompt: usize, max_new: usize) -> (Request, UnboundedReceiver<Event>) {
         let (tx, rx) = unbounded_channel();
-        let req = Request {
-            prompt: (1..=prompt as u32).collect(),
+        let req = Request::text(
+            (1..=prompt as u32).collect(),
             max_new,
-            sampling: Sampling::default(),
+            Sampling::default(),
             tx,
-        };
+        );
         (req, rx)
     }
 

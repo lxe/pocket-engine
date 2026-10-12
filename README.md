@@ -6,9 +6,10 @@ An inference server for small Qwen3.5 models, written from scratch in Rust and C
 
 | | |
 |---|---|
-| Models | Qwen3.5 0.8B, 2B and 4B, text only (the vision tower is not loaded) |
+| Models | Qwen3.5 0.8B, 2B and 4B, with images |
 | Architecture | Dense. Mixture-of-experts Qwen3.5 models are not supported |
 | Weights | Hugging Face safetensors checkpoints, one file or sharded, in bf16 (f32 tensors are converted) |
+| Images | JPEG, PNG, WebP, GIF or BMP, as `data:` or `http(s)` URLs. Images are resized so each side is a multiple of 32 pixels, and every 32×32 block becomes one prompt token. The area is held between 65,536 and `--max-image-pixels` (default 4,194,304). |
 | Quantization | None. Weights and activations run in bf16 with f32 accumulation; recurrent state is f32 |
 | Context | Up to `--max-context` tokens per request (default 4,096) |
 | Sampling | Greedy, or temperature with `top_k`, `top_p`, `min_p` and `seed`; `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`; `stop` strings |
@@ -34,6 +35,8 @@ Download a model:
 hf download Qwen/Qwen3.5-2B --local-dir models/qwen3.5-2b
 ```
 
+The model directory needs `config.json`, the safetensors files, `tokenizer.json` and `chat_template.jinja`. `preprocessor_config.json` is optional: without it, Qwen's image defaults apply.
+
 Serve it:
 
 ```sh
@@ -52,7 +55,7 @@ The server answers on three paths:
 
 | Path | What it does |
 |---|---|
-| `POST /v1/chat/completions` | Streamed (`"stream": true`, with `stream_options.include_usage`) or whole responses. Thinking is off. Sampling fields are listed below. |
+| `POST /v1/chat/completions` | Streamed (`"stream": true`, with `stream_options.include_usage`) or whole responses. Thinking is off. Sampling fields are listed below. Images go in content parts: `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`. |
 | `GET /v1/models` | Lists the served model. |
 | `GET /health` | Reports running and waiting requests and free KV blocks. Returns 503 once the GPU has failed. |
 
@@ -82,6 +85,9 @@ Filters apply in order: min_p, then top_k, then top_p. Each one judges the token
 | `--memory-fraction` | 0.9 | Share of GPU memory to use; the KV cache gets what is left after the weights |
 | `--wait-for PATH` | none | Initialize the GPU, then wait for `PATH` to exist before reading the model. A downloader can create the file when it finishes, so device setup overlaps the download |
 | `--no-graphs` | off | Run every step without CUDA graphs |
+| `--no-vision` | off | Serve text only; the vision encoder is not loaded |
+| `--max-image-pixels` | 4194304 | Largest image after resizing |
+| `--image-pool` | 16384 | Image embeddings that can wait at once for their prompt steps; also the most one request can carry |
 
 ## Test
 
@@ -91,9 +97,10 @@ POCKET_ENGINE_MODEL=models/qwen3.5-2b \
   CUDA_COMPUTE_CAP=120a cargo test --release --features cuda
 ```
 
-With a model directory set, `tests/gpu.rs` runs five checks against the model, which can be 0.8B, 2B or 4B:
+With a model directory set, `tests/gpu.rs` runs six checks against the model, which can be 0.8B, 2B or 4B:
 
 - its predictions match stored Transformers reference outputs;
+- image prompts tokenize exactly as Transformers' processor does, and their predictions match too;
 - batching does not change greedy output;
 - the samplers keep exactly the right tokens and draw them in proportion to the model's probabilities;
 - penalties cut repetition;
@@ -107,6 +114,8 @@ uv venv && uv pip install torch transformers
 pocket-engine score --model models/qwen3.5-2b out.pairs.json out.ours.json
 python scripts/accuracy.py compare out.ref.json out.ours.json
 ```
+
+`scripts/image_reference.py` does the same for image prompts.
 
 `scripts/load.py URL MODEL OUT.json` is the load test behind the throughput numbers.
 

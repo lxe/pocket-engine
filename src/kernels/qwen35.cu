@@ -59,11 +59,15 @@ __device__ __forceinline__ uint4 pack8(const float* f) {
     return u;
 }
 
-// out[t] = table[ids[t]]
+// out[t] = table[ids[t]], or row emb_src[t] of the image embedding pool when
+// that is not negative.
 extern "C" __global__ void embed(const int* __restrict__ ids, const bf16* __restrict__ table,
+                                 const int* __restrict__ emb_src, const bf16* __restrict__ pool,
                                  bf16* __restrict__ out, int hidden) {
     const int t = blockIdx.x;
-    const uint4* src = reinterpret_cast<const uint4*>(table + (size_t)ids[t] * hidden);
+    const int e = emb_src[t];
+    const uint4* src = reinterpret_cast<const uint4*>(
+        e >= 0 ? pool + (size_t)e * hidden : table + (size_t)ids[t] * hidden);
     uint4* dst = reinterpret_cast<uint4*>(out + (size_t)t * hidden);
     for (int i = threadIdx.x; i < hidden / 8; i += blockDim.x) dst[i] = src[i];
 }
@@ -256,13 +260,17 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
 // q heads: RMSNorm, rotary -> qout [t][Hq][256]. k heads: RMSNorm, rotary ->
 // kcache[slot]. v heads: copied to vcache[slot]. Slots below zero are skipped.
 // Rotary covers dims 0..63 as pairs (d, d + 32) with bf16 cos/sin, rounding as
-// the bf16 reference does.
+// the bf16 reference does. Frequency d takes its position from one of three
+// axes (time, height, width; interleaved multimodal rotary): height for
+// d % 3 == 1 below 3 * sec_h, width for d % 3 == 2 below 3 * sec_w, else time.
+// Text tokens carry the same position on all three.
 extern "C" __global__ void __launch_bounds__(128)
     attn_prep(const bf16* __restrict__ qkv, int qstride, int Hq, int Hkv,
               const float* __restrict__ q_norm, const float* __restrict__ k_norm,
-              const int* __restrict__ pos, const int* __restrict__ slot_map,
-              const float* __restrict__ inv_freq, bf16* __restrict__ qout,
-              bf16* __restrict__ kcache, bf16* __restrict__ vcache, float eps) {
+              const int* __restrict__ rope, int rope_stride, int sec_h, int sec_w,
+              const int* __restrict__ slot_map, const float* __restrict__ inv_freq,
+              bf16* __restrict__ qout, bf16* __restrict__ kcache, bf16* __restrict__ vcache,
+              float eps) {
     __shared__ float sh[32], rot[ROPE_DIM];
     const int t = blockIdx.x, hh = blockIdx.y, i = threadIdx.x;
     const bf16* row = qkv + (size_t)t * qstride;
@@ -289,7 +297,8 @@ extern "C" __global__ void __launch_bounds__(128)
     __syncthreads();
     if (i < ROPE_DIM) {
         const int d = i & (ROPE_DIM / 2 - 1);
-        const float f = (float)pos[t] * inv_freq[d];
+        const int axis = (d % 3 == 1 && d < 3 * sec_h) ? 1 : (d % 3 == 2 && d < 3 * sec_w) ? 2 : 0;
+        const float f = (float)rope[axis * rope_stride + t] * inv_freq[d];
         const float c = rbf(cosf(f)), s = rbf(sinf(f));
         const float lo = rot[d], hi = rot[d + ROPE_DIM / 2];
         y0 = i < ROPE_DIM / 2 ? rbf(rbf(lo * c) - rbf(hi * s)) : rbf(rbf(hi * c) + rbf(lo * s));
@@ -574,5 +583,143 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS)
             }
         }
         if (l == 0) out[blockIdx.x] = bi;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vision encoder. Linear layers run as cuBLAS GEMMs with f32 output; these
+// kernels add the bias, round once to bf16 as the reference linear does, and
+// fuse what follows. Patches of all images in a batch are concatenated.
+
+#define VIT_HEAD 64
+
+__device__ __forceinline__ float gelu_tanh(float x) {
+    const float k = 0.7978845608028654f;  // sqrt(2 / pi)
+    return 0.5f * x * (1.f + tanhf(k * (x + 0.044715f * x * x * x)));
+}
+__device__ __forceinline__ float gelu_erf(float x) { return 0.5f * x * (1.f + erff(x * 0.7071067811865476f)); }
+
+// out[p] = bf16(bf16(y[p] + bias) + bf16(sum_k w[p,k] * table[idx[p,k]])): the
+// patch embedding plus its bilinearly interpolated learned position.
+extern "C" __global__ void vit_embed(const float* __restrict__ y, const float* __restrict__ bias,
+                                     const bf16* __restrict__ table, const int* __restrict__ idx,
+                                     const float* __restrict__ w, bf16* __restrict__ out, int D) {
+    const int p = blockIdx.x;
+    const int* ix = idx + 4 * p;
+    const float* wx = w + 4 * p;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float pos = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; k++) pos += wx[k] * b2f(table[(size_t)ix[k] * D + d]);
+        out[(size_t)p * D + d] = f2b(rbf(y[(size_t)p * D + d] + bias[d]) + rbf(pos));
+    }
+}
+
+// LayerNorm over rows of width D (<= 4 * 8 * blockDim.x), f32 statistics.
+extern "C" __global__ void layernorm(const bf16* __restrict__ x, const float* __restrict__ w,
+                                     const float* __restrict__ b, bf16* __restrict__ out, int D,
+                                     float eps) {
+    __shared__ float sh[32];
+    const bf16* row = x + (size_t)blockIdx.x * D;
+    float v[4][8];
+    float s = 0.f;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int i = (c * blockDim.x + threadIdx.x) * 8;
+        if (i < D) {
+            unpack8(*reinterpret_cast<const uint4*>(row + i), v[c]);
+#pragma unroll
+            for (int e = 0; e < 8; e++) s += v[c][e];
+        }
+    }
+    const float mean = block_sum(s, sh) / D;
+    float q = 0.f;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int i = (c * blockDim.x + threadIdx.x) * 8;
+        if (i < D) {
+#pragma unroll
+            for (int e = 0; e < 8; e++) q += (v[c][e] - mean) * (v[c][e] - mean);
+        }
+    }
+    const float inv = rsqrtf(block_sum(q, sh) / D + eps);
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int i = (c * blockDim.x + threadIdx.x) * 8;
+        if (i < D) {
+            float o[8];
+#pragma unroll
+            for (int e = 0; e < 8; e++) o[e] = (v[c][e] - mean) * inv * w[i + e] + b[i + e];
+            *reinterpret_cast<uint4*>(out + (size_t)blockIdx.x * D + i) = pack8(o);
+        }
+    }
+}
+
+// Splits the qkv projection into head-major q, k, v ([head][patch][64]),
+// adding the bias and applying 2D rotary embedding to q and k in f32: dims
+// d and d + 32 rotate together with frequency d % 16 of the patch's row
+// (d % 32 < 16) or column position. One block of 64 threads per (patch, head).
+extern "C" __global__ void __launch_bounds__(VIT_HEAD)
+    vit_qkv_rope(const float* __restrict__ y, const float* __restrict__ bias,
+                 const int* __restrict__ pos_hw, const float* __restrict__ inv_freq,
+                 bf16* __restrict__ q, bf16* __restrict__ k, bf16* __restrict__ v, int P, int H) {
+    __shared__ float qs[VIT_HEAD], ks[VIT_HEAD];
+    const int p = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const int D = H * VIT_HEAD;
+    const float* row = y + (size_t)p * 3 * D;
+    const float qv = rbf(row[h * VIT_HEAD + d] + bias[h * VIT_HEAD + d]);
+    const float kv = rbf(row[D + h * VIT_HEAD + d] + bias[D + h * VIT_HEAD + d]);
+    const float vv = rbf(row[2 * D + h * VIT_HEAD + d] + bias[2 * D + h * VIT_HEAD + d]);
+    qs[d] = qv;
+    ks[d] = kv;
+    __syncthreads();
+    const int f = d % 32;
+    const float angle = (float)(f < 16 ? pos_hw[2 * p] : pos_hw[2 * p + 1]) * inv_freq[f % 16];
+    const float c = cosf(angle), s = sinf(angle);
+    const float qr = d < 32 ? -qs[d + 32] : qs[d - 32];
+    const float kr = d < 32 ? -ks[d + 32] : ks[d - 32];
+    const size_t o = ((size_t)h * P + p) * VIT_HEAD + d;
+    q[o] = f2b(qv * c + qr * s);
+    k[o] = f2b(kv * c + kr * s);
+    v[o] = f2b(vv);
+}
+
+// P[r] = bf16(softmax(S[r] * scale)) over rows of n f32 scores.
+extern "C" __global__ void softmax_rows(const float* __restrict__ S, bf16* __restrict__ out, int n,
+                                        float scale) {
+    __shared__ float sh[32];
+    const float* row = S + (size_t)blockIdx.x * n;
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, row[i] * scale);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = m;
+    __syncthreads();
+    m = sh[0];
+    for (int w = 1; w < (int)(blockDim.x >> 5); w++) m = fmaxf(m, sh[w]);
+    __syncthreads();
+    float z = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) z += expf(row[i] * scale - m);
+    z = block_sum(z, sh);
+    const float inv = 1.f / z;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        out[(size_t)blockIdx.x * n + i] = f2b(expf(row[i] * scale - m) * inv);
+}
+
+// mode 0: x = bf16(x + bf16(y + bias))   (residual add)
+// mode 1: out = bf16(gelu_tanh(bf16(y + bias)))
+// mode 2: out = bf16(gelu_erf(bf16(y + bias)))
+// mode 3: out = bf16(y + bias)
+extern "C" __global__ void vit_bias(const float* __restrict__ y, const float* __restrict__ bias,
+                                    bf16* __restrict__ out, int D, long long n, int mode) {
+    for (long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x; e < n;
+         e += (long long)gridDim.x * blockDim.x) {
+        const float t = rbf(y[e] + bias[e % D]);
+        float r;
+        if (mode == 0) r = b2f(out[e]) + t;
+        else if (mode == 1) r = gelu_tanh(t);
+        else if (mode == 2) r = gelu_erf(t);
+        else r = t;
+        out[e] = f2b(r);
     }
 }

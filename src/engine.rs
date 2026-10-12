@@ -2,8 +2,10 @@
 //! graph captured at startup for the padded batch size; others run eagerly.
 
 use crate::gpu::{Gpu, Graph};
+use crate::image::Image;
 use crate::model::{Act, BLOCK_SIZE, Config, Meta, Model, State};
 use crate::sched::{Load, Pen, Request, Sampling, Scheduler, Scored, Seq};
+use crate::vision::Vision;
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,11 +28,46 @@ pub struct EngineConfig {
     /// Initialize the GPU, then wait for this path to exist before reading
     /// the model, so device setup overlaps a download.
     pub wait_for: Option<PathBuf>,
+    /// Load the vision encoder when the checkpoint has one.
+    pub vision: bool,
+    /// Largest image, in pixels, after resizing.
+    pub max_image_pixels: usize,
+    /// Image embeddings that can wait at once for their prompt steps.
+    pub image_pool: usize,
+}
+
+impl EngineConfig {
+    pub fn new(model: PathBuf) -> Self {
+        Self {
+            model,
+            device: 0,
+            max_seqs: 256,
+            max_batch_tokens: 4096,
+            max_context: 4096,
+            memory_fraction: 0.9,
+            graphs: true,
+            wait_for: None,
+            vision: true,
+            max_image_pixels: 4 << 20,
+            image_pool: 16_384,
+        }
+    }
+}
+
+/// A teacher-forced scoring input: the prompt (with its images, if any) and
+/// the continuation to feed.
+pub struct Scoring {
+    pub prompt: Vec<u32>,
+    pub forced: Vec<u32>,
+    pub images: Vec<Image>,
+    pub rope: Option<crate::image::Rope>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Info {
     pub device: String,
+    /// Whether the engine accepts images.
+    pub vision: bool,
     pub cfg: Config,
     pub max_seqs: usize,
     pub kv_blocks: usize,
@@ -61,6 +98,7 @@ pub struct Engine {
     act: Act,
     cfg: EngineConfig,
     graphs: HashMap<usize, Graph>,
+    vision: Option<Vision>,
     pub sched: Scheduler,
     pub stats: Stats,
 }
@@ -85,13 +123,19 @@ impl Engine {
         }
         let model = Model::load(&gpu, &cfg.model)?;
         let mc = model.cfg.clone();
+        let vision = if cfg.vision {
+            Vision::load(&gpu, &cfg.model, cfg.max_image_pixels / 256)?
+        } else {
+            None
+        };
+        let pool_rows = if vision.is_some() { cfg.image_pool } else { 0 };
         let max_blocks = cfg.max_context.div_ceil(BLOCK_SIZE);
         let meta = Meta {
             max_tokens: cfg.max_batch_tokens.max(cfg.max_seqs),
             max_seqs: cfg.max_seqs,
             max_blocks,
         };
-        let act = Act::new(&gpu, &mc, meta)?;
+        let act = Act::new(&gpu, &mc, meta, pool_rows)?;
         // One extra slot absorbs the padding rows of graph replays.
         let slots = cfg.max_seqs + 1;
         let (free, total) = gpu.mem_info()?;
@@ -107,13 +151,21 @@ impl Engine {
         }
         let state = State::new(&gpu, &mc, slots, blocks)?;
         gpu.sync()?;
-        let sched = Scheduler::new(meta, cfg.max_context, blocks, mc.eos.clone());
+        let sched = Scheduler::with_images(
+            meta,
+            cfg.max_context,
+            blocks,
+            mc.eos.clone(),
+            mc.image_token,
+            pool_rows,
+        );
         let mut e = Self {
             gpu,
             model,
             state,
             act,
             graphs: HashMap::new(),
+            vision,
             sched,
             stats: Stats::default(),
             cfg,
@@ -127,6 +179,7 @@ impl Engine {
     pub fn info(&self) -> Info {
         Info {
             device: self.gpu.name.clone(),
+            vision: self.vision.is_some(),
             cfg: self.model.cfg.clone(),
             max_seqs: self.cfg.max_seqs,
             kv_blocks: self.state.blocks,
@@ -164,6 +217,7 @@ impl Engine {
         let Some(step) = self.sched.plan() else {
             return Ok(Vec::new());
         };
+        self.encode_images()?;
         let (t, s) = (step.tokens, step.seqs());
         let pens = self.sched.fill(
             &step,
@@ -214,6 +268,45 @@ impl Engine {
         Ok(self.sched.finish(step, &picked, scored))
     }
 
+    /// Runs the vision encoder for newly admitted requests, in batches the
+    /// encoder's scratch holds, writing into their pool rows.
+    fn encode_images(&mut self) -> Result<()> {
+        let jobs = self.sched.take_vision();
+        let Some(vision) = self.vision.as_mut() else {
+            return Ok(());
+        };
+        let row_bytes = (self.model.cfg.hidden * 2) as u64;
+        for job in jobs {
+            let mut row = job.row;
+            let mut batch: Vec<&Image> = Vec::new();
+            let mut patches = 0;
+            let mut batch_row = row;
+            for img in &job.images {
+                if patches + img.patches() > vision.max_patches() && !batch.is_empty() {
+                    vision.encode(
+                        &self.gpu,
+                        &batch,
+                        self.act.pool.ptr + batch_row as u64 * row_bytes,
+                    )?;
+                    batch.clear();
+                    patches = 0;
+                    batch_row = row;
+                }
+                batch.push(img);
+                patches += img.patches();
+                row += img.tokens();
+            }
+            if !batch.is_empty() {
+                vision.encode(
+                    &self.gpu,
+                    &batch,
+                    self.act.pool.ptr + batch_row as u64 * row_bytes,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn logits_row(&self, row: usize) -> Result<Vec<f32>> {
         let vocab = self.model.cfg.vocab;
         let mut host = self.gpu.pinned(vocab * 4)?;
@@ -226,27 +319,22 @@ impl Engine {
         Ok(host.as_slice::<f32>().to_vec())
     }
 
-    /// Teacher-forced scoring of several (prompt, continuation) pairs, batched
+    /// Teacher-forced scoring of several prompts and continuations, batched
     /// together as a server would run them.
-    pub fn score(&mut self, pairs: Vec<(Vec<u32>, Vec<u32>)>) -> Result<Vec<Vec<Scored>>> {
-        let n = pairs.len();
+    pub fn score(&mut self, items: Vec<Scoring>) -> Result<Vec<Vec<Scored>>> {
+        let n = items.len();
         let mut txs = Vec::new();
-        for (i, (prompt, forced)) in pairs.into_iter().enumerate() {
+        for (i, item) in items.into_iter().enumerate() {
             let (tx, _) = tokio::sync::mpsc::unbounded_channel();
             txs.push(tx.clone());
             let sampling = Sampling {
                 seed: i as u64,
                 ..Sampling::default()
             };
-            self.sched.submit_forced(
-                Request {
-                    prompt,
-                    max_new: forced.len(),
-                    sampling,
-                    tx,
-                },
-                forced,
-            );
+            let mut req = Request::text(item.prompt, item.forced.len(), sampling, tx);
+            req.images = item.images;
+            req.rope = item.rope;
+            self.sched.submit_forced(req, item.forced);
         }
         let mut out: Vec<Vec<Scored>> = vec![Vec::new(); n];
         // Sequences carry no id; match them back by their channel.

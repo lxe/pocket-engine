@@ -88,6 +88,18 @@ pub enum Arg {
     F(f32),
 }
 
+/// A matrix operand of [`Gpu::gemm_batched`]: column-major with leading
+/// dimension `ld`, `stride` elements between batch members, optionally
+/// transposed, bf16 unless `f32`.
+#[derive(Clone, Copy)]
+pub struct Mat {
+    pub ptr: u64,
+    pub ld: usize,
+    pub stride: usize,
+    pub trans: bool,
+    pub f32: bool,
+}
+
 pub struct Graph {
     graph: cu::CUgraph,
     exec: cu::CUgraphExec,
@@ -380,6 +392,67 @@ impl Gpu {
                 )
             },
             "cublasGemmEx",
+        )
+    }
+
+    /// Column-major strided batched GEMM, C = op(A) . op(B), with f32
+    /// accumulation: C is m x n, op(A) m x k, op(B) k x n.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batched(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: Mat,
+        b: Mat,
+        c: Mat,
+        batch: usize,
+    ) -> Result<()> {
+        let (alpha, beta) = (1f32, 0f32);
+        let op = |t: bool| {
+            if t {
+                cb::cublasOperation_t::CUBLAS_OP_T
+            } else {
+                cb::cublasOperation_t::CUBLAS_OP_N
+            }
+        };
+        let ty = |f: bool| {
+            if f {
+                cb::cudaDataType_t::CUDA_R_32F
+            } else {
+                cb::cudaDataType_t::CUDA_R_16BF
+            }
+        };
+        // SAFETY: the caller passes device matrices of the stated shapes.
+        check_blas(
+            unsafe {
+                cb::cublasGemmStridedBatchedEx(
+                    self.blas,
+                    op(a.trans),
+                    op(b.trans),
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    (&alpha as *const f32).cast(),
+                    a.ptr as *const c_void,
+                    ty(a.f32),
+                    a.ld as i32,
+                    a.stride as i64,
+                    b.ptr as *const c_void,
+                    ty(b.f32),
+                    b.ld as i32,
+                    b.stride as i64,
+                    (&beta as *const f32).cast(),
+                    c.ptr as *mut c_void,
+                    ty(c.f32),
+                    c.ld as i32,
+                    c.stride as i64,
+                    batch as i32,
+                    cb::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cb::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+            },
+            "cublasGemmStridedBatchedEx",
         )
     }
 

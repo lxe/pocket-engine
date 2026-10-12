@@ -23,6 +23,9 @@ futures-util = "0.3"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 minijinja = { version = "2", features = ["json", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+base64 = "0.22"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [features]
 default = []
@@ -40,4 +43,4 @@ unsafe_code = "deny"
 all = "warn"
 
 [dev-dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

@@ -4,9 +4,11 @@
 
 pub mod engine;
 pub mod gpu;
+pub mod image;
 pub mod model;
 pub mod sched;
 pub mod server;
+pub mod vision;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

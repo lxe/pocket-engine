@@ -20,6 +20,15 @@ Each layer runs three or four cuBLAS GEMMs over all of the step's tokens, plus a
 - **Full attention, two kernels.** One applies the q/k norms and rotary embedding and writes keys and values into a paged cache of 16-token blocks. The other is paged attention with the output gate fused in.
 - **Norms and activation.** The residual add is folded into the next RMSNorm, and SiLU-and-multiply is one kernel.
 
+## Images
+
+The vision encoder (`src/vision.rs`) runs for a request when the scheduler admits it, just before the step that holds the request's first prompt tokens.
+
+1. **Preprocessing (CPU, `src/image.rs`).** Each image is resized so its sides are multiples of 32 pixels, normalized and split into 16-pixel patches. The patches are ordered in 2×2 blocks.
+2. **Encoder.** A GEMM embeds the patches; interpolated learned positions and 2D rotary attention follow. Attention runs per image as batched cuBLAS GEMMs with a softmax kernel in between, in query chunks sized to a fixed scratch buffer. The merger turns each 2×2 block into one text embedding.
+3. **Embedding pool.** The embeddings wait in a pool of rows, reserved at admission, until the prompt steps that read them have run. Prompt steps take image rows from the pool in place of the token embedding.
+4. **Positions.** Rotary positions in the text model become three-dimensional (time, height, width). Image tokens spread over their grid, and the text after an image resumes past the grid's longer side, as Transformers computes them.
+
 ## Numerics
 
 Activations are bf16 with f32 accumulation, rounded where the bf16 reference rounds them. Recurrent states are f32. Logits are f32. Sampling runs on the GPU, so only one token id per sequence returns to the host each step.
@@ -35,6 +44,14 @@ Activations are bf16 with f32 accumulation, rounded where the bf16 reference rou
 | Qwen3.5-4B | 210 | 209 | 1 of 1 | 0.0004, 0.032 |
 
 These ran on an RTX 5090. An H100 build of the 2B model agreed on 215 of 217.
+
+The same comparison with image prompts covers three images. Two keep their sides; the third (300×211) is resized. Prompt tokens match Transformers' processor exactly for all three models:
+
+| Model | Positions | Top-1 agreement | Misses within one bf16 step | Median, p95 log-prob difference |
+|---|---|---|---|---|
+| Qwen3.5-0.8B | 87 | 85 | 2 of 2 | 0.0007, 0.054 |
+| Qwen3.5-2B | 87 | 87 | none | 0.0003, 0.088 |
+| Qwen3.5-4B | 62 | 62 | none | 0.0005, 0.043 |
 
 ## Throughput
 

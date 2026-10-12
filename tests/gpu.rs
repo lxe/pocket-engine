@@ -2,7 +2,7 @@
 //! Qwen3.5 0.8B, 2B or 4B directory and the crate is built with `--features cuda`;
 //! otherwise they pass without doing anything.
 
-use pocket_engine::engine::{self, Engine, EngineConfig};
+use pocket_engine::engine::{self, Engine, EngineConfig, Scoring};
 use pocket_engine::sched::{Event, Request, Sampling};
 use pocket_engine::server::{self, ChatTokenizer};
 use std::path::PathBuf;
@@ -20,16 +20,14 @@ fn model() -> Option<PathBuf> {
 
 fn config(model: PathBuf) -> EngineConfig {
     EngineConfig {
-        model,
-        device: 0,
         max_seqs: 16,
         max_batch_tokens: 64,
         max_context: 1024,
-        // KV is capped by max_seqs x max_context, so tests stay small and can
-        // share the device.
+        // KV is capped by max_seqs x max_context, so tests stay small.
         memory_fraction: 0.95,
-        graphs: true,
-        wait_for: None,
+        image_pool: 4096,
+        max_image_pixels: 1 << 20,
+        ..EngineConfig::new(model)
     }
 }
 
@@ -73,7 +71,17 @@ fn matches_transformers_teacher_forced() {
     let reference: Vec<Vec<Reference>> = fixture(&format!("{name}.ref.json"));
     let mut e = Engine::new(config(dir)).unwrap();
     let got = e
-        .score(pairs.into_iter().map(|p| (p.prompt, p.forced)).collect())
+        .score(
+            pairs
+                .into_iter()
+                .map(|p| Scoring {
+                    prompt: p.prompt,
+                    forced: p.forced,
+                    images: vec![],
+                    rope: None,
+                })
+                .collect(),
+        )
         .unwrap();
     let (mut positions, mut diffs) = (0, Vec::new());
     for (r_seq, g_seq) in reference.iter().zip(&got) {
@@ -105,6 +113,75 @@ fn matches_transformers_teacher_forced() {
     assert!(diffs[diffs.len() * 95 / 100] < 0.1);
 }
 
+#[derive(serde::Deserialize)]
+struct ImagePair {
+    messages: Vec<serde_json::Value>,
+    forced: Vec<u32>,
+}
+
+/// Checks teacher-forced picks against the reference, allowing ties within
+/// one bf16 step; returns the median log-probability difference.
+fn agree(reference: &[Vec<Reference>], got: &[Vec<pocket_engine::sched::Scored>]) -> f32 {
+    let mut diffs = Vec::new();
+    for (r_seq, g_seq) in reference.iter().zip(got) {
+        assert_eq!(r_seq.len(), g_seq.len());
+        for (r, g) in r_seq.iter().zip(g_seq) {
+            let tied = r.top[0].1 - r.top[1].1 <= 0.125;
+            assert!(
+                tied || r.argmax == g.argmax,
+                "pick {} vs reference {}",
+                g.argmax,
+                r.argmax
+            );
+            let lp = g
+                .top
+                .iter()
+                .find(|t| t.0 == r.argmax)
+                .map_or(-99.0, |t| t.1);
+            diffs.push((lp - r.top[0].1).abs());
+        }
+    }
+    diffs.sort_by(f32::total_cmp);
+    diffs[diffs.len() / 2]
+}
+
+/// Image prompts: the same prompt tokens as Transformers' processor, and the
+/// same picks. Two images keep their sides; one is resized.
+#[test]
+fn images_match_transformers() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let name = size(&dir);
+    let pairs: Vec<ImagePair> = fixture(&format!("{name}.images.pairs.json"));
+    let reference: Vec<Vec<Reference>> = fixture(&format!("{name}.images.ref.json"));
+    let prompts: Vec<Vec<u32>> = fixture(&format!("{name}.images.prompts.json"));
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let spec = pocket_engine::image::Spec::load(&dir, 1 << 20).unwrap();
+    let placeholder = pocket_engine::model::Config::load(&dir)
+        .unwrap()
+        .image_token;
+    let mut items = Vec::new();
+    for (p, want) in pairs.into_iter().zip(&prompts) {
+        let (ids, urls) = tok.chat(&p.messages).unwrap();
+        let encoded: Vec<Vec<u8>> = urls
+            .iter()
+            .map(|u| server::data_url(u).unwrap().unwrap())
+            .collect();
+        let (prompt, images, rope) =
+            server::with_images(ids, &encoded, &spec, placeholder).unwrap();
+        assert_eq!(&prompt, want, "prompt tokens");
+        items.push(Scoring {
+            prompt,
+            forced: p.forced,
+            images,
+            rope,
+        });
+    }
+    let mut e = Engine::new(config(dir)).unwrap();
+    let got = e.score(items).unwrap();
+    assert!(agree(&reference, &got) < 0.01);
+}
+
 fn generate(e: &mut Engine, prompts: &[Vec<u32>], n: usize) -> Vec<Vec<u32>> {
     let runs: Vec<_> = prompts
         .iter()
@@ -117,12 +194,8 @@ fn generate_with(e: &mut Engine, runs: &[(Vec<u32>, Sampling)], n: usize) -> Vec
     let mut rxs = Vec::new();
     for (p, sampling) in runs {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        e.sched.submit(Request {
-            prompt: p.clone(),
-            max_new: n,
-            sampling: sampling.clone(),
-            tx,
-        });
+        e.sched
+            .submit(Request::text(p.clone(), n, sampling.clone(), tx));
         rxs.push(rx);
     }
     while !e.sched.idle() {
@@ -181,10 +254,18 @@ fn samplers_follow_the_model_distribution() {
     let tok = ChatTokenizer::load(&dir).unwrap();
     let prompt = tok
         .chat(&[serde_json::json!({ "role": "user", "content": "Name one color. One word." })])
-        .unwrap();
+        .unwrap()
+        .0;
     let mut e = Engine::new(config(dir)).unwrap();
     // The model's top five at the first position, with log-probabilities.
-    let top = e.score(vec![(prompt.clone(), vec![0])]).unwrap()[0][0]
+    let top = e
+        .score(vec![Scoring {
+            prompt: prompt.clone(),
+            forced: vec![0],
+            images: vec![],
+            rope: None,
+        }])
+        .unwrap()[0][0]
         .top
         .clone();
     let p: Vec<f64> = top.iter().map(|t| (t.1 as f64).exp()).collect();
@@ -286,7 +367,8 @@ fn penalties_reduce_repetition() {
     let tok = ChatTokenizer::load(&dir).unwrap();
     let prompt = tok
         .chat(&[serde_json::json!({ "role": "user", "content": "Write the word yes 30 times, separated by spaces, nothing else." })])
-        .unwrap();
+        .unwrap()
+        .0;
     let mut e = Engine::new(config(dir)).unwrap();
     // The most repeated token's count: penalties cut it, whether the model
     // then varies its words or stops early.
@@ -324,7 +406,15 @@ fn serves_chat_completions() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let bind = "127.0.0.1:18197";
-        tokio::spawn(server::serve(tok, tx, info, health, "test".into(), bind));
+        tokio::spawn(server::serve(
+            tok,
+            None,
+            tx,
+            info,
+            health,
+            "test".into(),
+            bind,
+        ));
         let client = reqwest::Client::new();
         let url = format!("http://{bind}");
         for _ in 0..100 {

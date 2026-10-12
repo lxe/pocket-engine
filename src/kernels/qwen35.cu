@@ -1,0 +1,458 @@
+// Qwen3.5 text decoder kernels. One step processes a flat batch of tokens drawn
+// from several sequences: decode rows contribute one token each, prefill rows a
+// chunk of their prompt. Per-token work (norms, projections, attention) runs
+// over every token; the convolution and the gated delta rule walk each
+// sequence's tokens in order.
+//
+// Activations are row-major bf16 [tokens, width]. Reductions run in f32, and
+// values are rounded to bf16 where the reference model rounds them.
+
+#include <cuda_bf16.h>
+#include <stdint.h>
+
+typedef __nv_bfloat16 bf16;
+
+#define GDN_DIM 128   // linear-attention key and value head width
+#define HEAD_DIM 256  // full-attention head width
+#define ROPE_DIM 64   // rotated leading dimensions of each attention head
+#define ATTN_WARPS 8
+
+__device__ __forceinline__ float b2f(bf16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ bf16 f2b(float x) { return __float2bfloat16_rn(x); }
+__device__ __forceinline__ float rbf(float x) { return b2f(f2b(x)); }
+__device__ __forceinline__ float silu(float x) { return x / (1.f + expf(-x)); }
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// Sum across the block; every thread receives the total. `sh` holds one float
+// per warp.
+__device__ __forceinline__ float block_sum(float v, float* sh) {
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31, nw = blockDim.x >> 5;
+    v = warp_sum(v);
+    if (l == 0) sh[w] = v;
+    __syncthreads();
+    float t = l < nw ? sh[l] : 0.f;
+    t = warp_sum(t);
+    __syncthreads();
+    return t;
+}
+
+__device__ __forceinline__ void unpack8(uint4 u, float* f) {
+    const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        float2 x = __bfloat1622float2(p[i]);
+        f[2 * i] = x.x;
+        f[2 * i + 1] = x.y;
+    }
+}
+
+__device__ __forceinline__ uint4 pack8(const float* f) {
+    uint4 u;
+    __nv_bfloat162* p = reinterpret_cast<__nv_bfloat162*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; i++) p[i] = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
+    return u;
+}
+
+// out[t] = table[ids[t]]
+extern "C" __global__ void embed(const int* __restrict__ ids, const bf16* __restrict__ table,
+                                 bf16* __restrict__ out, int hidden) {
+    const int t = blockIdx.x;
+    const uint4* src = reinterpret_cast<const uint4*>(table + (size_t)ids[t] * hidden);
+    uint4* dst = reinterpret_cast<uint4*>(out + (size_t)t * hidden);
+    for (int i = threadIdx.x; i < hidden / 8; i += blockDim.x) dst[i] = src[i];
+}
+
+// RMSNorm with an f32 weight (zero-centred weights already offset by one).
+//   add == 0: out[r] = norm(res[src])
+//   add == 1: sum = x[src] + res[src]; out[r] = norm(sum); res[src] = bf16(sum)
+//             unless write_res == 0.
+// The norm uses the unrounded f32 sum. `gather` (nullable) maps output rows to
+// source rows. Up to 4 * 8 * blockDim.x elements per row.
+extern "C" __global__ void rmsnorm(const bf16* __restrict__ x, bf16* __restrict__ res,
+                                   const float* __restrict__ w, bf16* __restrict__ out,
+                                   const int* __restrict__ gather, int hidden, float eps, int add,
+                                   int write_res) {
+    __shared__ float sh[32];
+    const int r = blockIdx.x;
+    const size_t src = gather ? (size_t)gather[r] : (size_t)r;
+    float v[4][8];
+    float ss = 0.f;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int i = (c * blockDim.x + threadIdx.x) * 8;
+        if (i < hidden) {
+            unpack8(*reinterpret_cast<const uint4*>(res + src * hidden + i), v[c]);
+            if (add) {
+                float a[8];
+                unpack8(*reinterpret_cast<const uint4*>(x + src * hidden + i), a);
+#pragma unroll
+                for (int e = 0; e < 8; e++) v[c][e] += a[e];
+                if (write_res) *reinterpret_cast<uint4*>(res + src * hidden + i) = pack8(v[c]);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; e++) ss += v[c][e] * v[c][e];
+        }
+    }
+    ss = block_sum(ss, sh);
+    const float scale = 1.f / sqrtf(ss / hidden + eps);
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int i = (c * blockDim.x + threadIdx.x) * 8;
+        if (i < hidden) {
+            float o[8];
+#pragma unroll
+            for (int e = 0; e < 8; e++) o[e] = v[c][e] * scale * w[i + e];
+            *reinterpret_cast<uint4*>(out + (size_t)r * hidden + i) = pack8(o);
+        }
+    }
+}
+
+// out[t, c] = bf16(silu(gate) * up) where gu[t] = [gate(inter) | up(inter)].
+extern "C" __global__ void silu_mul(const bf16* __restrict__ gu, bf16* __restrict__ out, int inter,
+                                    int tokens) {
+    const int per_row = inter / 8;
+    const int n = tokens * per_row;
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += gridDim.x * blockDim.x) {
+        const int t = e / per_row, c = (e - t * per_row) * 8;
+        float g[8], u[8], o[8];
+        unpack8(*reinterpret_cast<const uint4*>(gu + (size_t)t * 2 * inter + c), g);
+        unpack8(*reinterpret_cast<const uint4*>(gu + (size_t)t * 2 * inter + inter + c), u);
+#pragma unroll
+        for (int i = 0; i < 8; i++) o[i] = silu(g[i]) * u[i];
+        *reinterpret_cast<uint4*>(out + (size_t)t * inter + c) = pack8(o);
+    }
+}
+
+// Depthwise causal convolution (kernel 4) over each sequence's tokens, then
+// SiLU. The state holds the last three inputs of each sequence: [slot][3][C].
+// proj rows hold the convolution inputs in their first C columns.
+extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
+                                    const float* __restrict__ w, bf16* __restrict__ state,
+                                    bf16* __restrict__ out, const int* __restrict__ cu,
+                                    const int* __restrict__ slots, const int* __restrict__ fresh,
+                                    int C) {
+    const int s = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int t0 = cu[s], t1 = cu[s + 1];
+    if (t0 == t1) return;
+    bf16* st = state + (size_t)slots[s] * 3 * C;
+    float x0 = 0.f, x1 = 0.f, x2 = 0.f;
+    if (!fresh[s]) {
+        x0 = b2f(st[c]);
+        x1 = b2f(st[C + c]);
+        x2 = b2f(st[2 * C + c]);
+    }
+    const float4 k = *reinterpret_cast<const float4*>(w + 4 * c);
+    for (int t = t0; t < t1; t++) {
+        const float x3 = b2f(proj[(size_t)t * pstride + c]);
+        float acc = 0.f;
+        acc += x0 * k.x;
+        acc += x1 * k.y;
+        acc += x2 * k.z;
+        acc += x3 * k.w;
+        out[(size_t)t * C + c] = f2b(silu(acc));
+        x0 = x1;
+        x1 = x2;
+        x2 = x3;
+    }
+    st[c] = f2b(x0);
+    st[C + c] = f2b(x1);
+    st[2 * C + c] = f2b(x2);
+}
+
+// Gated delta rule, one block of 256 threads per (sequence, value head). The
+// head's [k, v] state lives in registers: threads 2j and 2j+1 hold rows 0..63
+// and 64..127 of column j. Per token:
+//   S *= exp(g); delta = (v - k^T S) * beta; S += k delta^T; o = q^T S
+// then a gated RMSNorm of o with silu(z). The state is f32: [slot][Hv][128][128].
+// conv rows: [q (Hk*128) | k (Hk*128) | v (Hv*128)]; proj rows after the
+// convolution inputs: [z (Hv*128) | b (Hv) | a (Hv)].
+#define GDN_HALF (GDN_DIM / 2)
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
+    gdn_recurrent(const bf16* __restrict__ conv, const bf16* __restrict__ proj, int pstride, int C,
+                  int Hk, int Hv, const float* __restrict__ neg_a, const float* __restrict__ dt_bias,
+                  const float* __restrict__ norm_w, float* __restrict__ state,
+                  const int* __restrict__ cu, const int* __restrict__ slots,
+                  const int* __restrict__ fresh, bf16* __restrict__ out, float eps) {
+    __shared__ float qs[GDN_DIM], ks[GDN_DIM], sh[32];
+    const int s = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    const int j = tid >> 1, half = tid & 1, i0 = half * GDN_HALF;
+    const int t0 = cu[s], t1 = cu[s + 1];
+    if (t0 == t1) return;
+    const int kh = h / (Hv / Hk);
+    float* S = state + ((size_t)slots[s] * Hv + h) * GDN_DIM * GDN_DIM;
+    float r[GDN_HALF];
+    const bool is_fresh = fresh[s] != 0;
+#pragma unroll
+    for (int i = 0; i < GDN_HALF; i++) r[i] = is_fresh ? 0.f : S[(i0 + i) * GDN_DIM + j];
+    // Prefill rounds the normalized q and k to bf16; single-token decode keeps f32.
+    const bool round_qk = (t1 - t0) > 1 || is_fresh;
+    const float na = neg_a[h], db = dt_bias[h], nw = norm_w[j];
+    const float qscale = rsqrtf((float)GDN_DIM);
+    for (int t = t0; t < t1; t++) {
+        const bf16* row = conv + (size_t)t * C;
+        const bf16* prow = proj + (size_t)t * pstride + C;
+        float q = 0.f, k = 0.f;
+        if (tid < GDN_DIM) {
+            q = b2f(row[kh * GDN_DIM + tid]);
+            k = b2f(row[Hk * GDN_DIM + kh * GDN_DIM + tid]);
+        }
+        const float v = b2f(row[2 * Hk * GDN_DIM + h * GDN_DIM + j]);
+        const float z = b2f(prow[h * GDN_DIM + j]);
+        const float b = b2f(prow[Hv * GDN_DIM + h]);
+        const float a = b2f(prow[Hv * GDN_DIM + Hv + h]);
+        const float qq = block_sum(q * q, sh);
+        const float kk = block_sum(k * k, sh);
+        if (tid < GDN_DIM) {
+            q = q / sqrtf(qq + 1e-6f);
+            k = k / sqrtf(kk + 1e-6f);
+            if (round_qk) {
+                q = rbf(q);
+                k = rbf(k);
+            }
+            qs[tid] = q * qscale;
+            ks[tid] = k;
+        }
+        const float beta = 1.f / (1.f + expf(-b));
+        const float x = a + db;
+        const float sp = fmaxf(x, 0.f) + logf(1.f + expf(-fabsf(x)));
+        const float decay = expf(na * sp);
+        __syncthreads();
+        float kv = 0.f;
+#pragma unroll
+        for (int i = 0; i < GDN_HALF; i++) {
+            r[i] *= decay;
+            kv += ks[i0 + i] * r[i];
+        }
+        kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+        const float delta = (v - kv) * beta;
+        float o = 0.f;
+#pragma unroll
+        for (int i = 0; i < GDN_HALF; i++) {
+            r[i] += ks[i0 + i] * delta;
+            o += qs[i0 + i] * r[i];
+        }
+        o += __shfl_xor_sync(0xffffffffu, o, 1);
+        const float ob = rbf(o);
+        const float var = block_sum(half ? 0.f : ob * ob, sh) / GDN_DIM;
+        if (!half) {
+            const float y = ob * (1.f / sqrtf(var + eps)) * nw * silu(z);
+            out[(size_t)t * Hv * GDN_DIM + h * GDN_DIM + j] = f2b(y);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < GDN_HALF; i++) S[(i0 + i) * GDN_DIM + j] = r[i];
+}
+
+// Full-attention input preparation, one block of 128 threads per (token, head).
+// qkv rows: [Hq x (q 256 | gate 256) | k (Hkv*256) | v (Hkv*256)].
+// q heads: RMSNorm, rotary -> qout [t][Hq][256]. k heads: RMSNorm, rotary ->
+// kcache[slot]. v heads: copied to vcache[slot]. Slots below zero are skipped.
+// Rotary covers dims 0..63 as pairs (d, d + 32) with bf16 cos/sin, rounding as
+// the bf16 reference does.
+extern "C" __global__ void __launch_bounds__(128)
+    attn_prep(const bf16* __restrict__ qkv, int qstride, int Hq, int Hkv,
+              const float* __restrict__ q_norm, const float* __restrict__ k_norm,
+              const int* __restrict__ pos, const int* __restrict__ slot_map,
+              const float* __restrict__ inv_freq, bf16* __restrict__ qout,
+              bf16* __restrict__ kcache, bf16* __restrict__ vcache, float eps) {
+    __shared__ float sh[32], rot[ROPE_DIM];
+    const int t = blockIdx.x, hh = blockIdx.y, i = threadIdx.x;
+    const bf16* row = qkv + (size_t)t * qstride;
+    const int slot = slot_map[t];
+    if (hh >= Hq + Hkv) {
+        if (slot < 0) return;
+        const int vh = hh - Hq - Hkv;
+        const bf16* src = row + Hq * 2 * HEAD_DIM + Hkv * HEAD_DIM + vh * HEAD_DIM;
+        bf16* dst = vcache + ((size_t)slot * Hkv + vh) * HEAD_DIM;
+        dst[i] = src[i];
+        dst[i + 128] = src[i + 128];
+        return;
+    }
+    const bool is_q = hh < Hq;
+    if (!is_q && slot < 0) return;
+    const bf16* src = is_q ? row + hh * 2 * HEAD_DIM : row + Hq * 2 * HEAD_DIM + (hh - Hq) * HEAD_DIM;
+    const float* w = is_q ? q_norm : k_norm;
+    const float x0 = b2f(src[i]), x1 = b2f(src[i + 128]);
+    const float ss = block_sum(x0 * x0 + x1 * x1, sh);
+    const float scale = 1.f / sqrtf(ss / HEAD_DIM + eps);
+    float y0 = rbf(x0 * scale * w[i]);
+    const float y1 = rbf(x1 * scale * w[i + 128]);
+    if (i < ROPE_DIM) rot[i] = y0;
+    __syncthreads();
+    if (i < ROPE_DIM) {
+        const int d = i & (ROPE_DIM / 2 - 1);
+        const float f = (float)pos[t] * inv_freq[d];
+        const float c = rbf(cosf(f)), s = rbf(sinf(f));
+        const float lo = rot[d], hi = rot[d + ROPE_DIM / 2];
+        y0 = i < ROPE_DIM / 2 ? rbf(rbf(lo * c) - rbf(hi * s)) : rbf(rbf(hi * c) + rbf(lo * s));
+    }
+    bf16* dst = is_q ? qout + ((size_t)t * Hq + hh) * HEAD_DIM
+                     : kcache + ((size_t)slot * Hkv + (hh - Hq)) * HEAD_DIM;
+    dst[i] = f2b(y0);
+    dst[i + 128] = f2b(y1);
+}
+
+// Paged attention for one token against its sequence's first pos+1 keys, one
+// block per (token, kv head) covering the G query heads that share it. Keys
+// are split across warps with an online softmax per warp, then merged. The
+// output is gated: out = bf16(bf16(attn) * sigmoid(gate)).
+// Cache layout: [block * block_size + offset][Hkv][256].
+template <int G>
+__device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16* __restrict__ kcache,
+                                          const bf16* __restrict__ vcache, const bf16* __restrict__ qkv,
+                                          int qstride, int Hq, int Hkv, const int* __restrict__ pos,
+                                          const int* __restrict__ tok_seq,
+                                          const int* __restrict__ block_table, int max_blocks,
+                                          int block_size, bf16* __restrict__ out, float scale) {
+    __shared__ float sm_m[ATTN_WARPS][G], sm_s[ATTN_WARPS][G];
+    __shared__ float sm_acc[ATTN_WARPS][G][HEAD_DIM];
+    const int t = blockIdx.x, kvh = blockIdx.y;
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    const int L = pos[t] + 1;
+    const int* bt = block_table + (size_t)tok_seq[t] * max_blocks;
+    float qr[G][8], acc[G][8], m[G], ssum[G];
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        unpack8(*reinterpret_cast<const uint4*>(q + ((size_t)t * Hq + kvh * G + g) * HEAD_DIM + l * 8),
+                qr[g]);
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+            qr[g][e] *= scale;
+            acc[g][e] = 0.f;
+        }
+        m[g] = -INFINITY;
+        ssum[g] = 0.f;
+    }
+    for (int j = w; j < L; j += ATTN_WARPS) {
+        const size_t slot = (size_t)bt[j / block_size] * block_size + (j % block_size);
+        const size_t off = (slot * Hkv + kvh) * HEAD_DIM + l * 8;
+        float kf[8], vf[8];
+        unpack8(*reinterpret_cast<const uint4*>(kcache + off), kf);
+        unpack8(*reinterpret_cast<const uint4*>(vcache + off), vf);
+#pragma unroll
+        for (int g = 0; g < G; g++) {
+            float d = 0.f;
+#pragma unroll
+            for (int e = 0; e < 8; e++) d += qr[g][e] * kf[e];
+            d = warp_sum(d);
+            const float mn = fmaxf(m[g], d);
+            const float corr = expf(m[g] - mn);
+            const float p = expf(d - mn);
+            ssum[g] = ssum[g] * corr + p;
+#pragma unroll
+            for (int e = 0; e < 8; e++) acc[g][e] = acc[g][e] * corr + p * vf[e];
+            m[g] = mn;
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        if (l == 0) {
+            sm_m[w][g] = m[g];
+            sm_s[w][g] = ssum[g];
+        }
+#pragma unroll
+        for (int e = 0; e < 8; e++) sm_acc[w][g][l * 8 + e] = acc[g][e];
+    }
+    __syncthreads();
+    const int d = threadIdx.x;  // blockDim.x == HEAD_DIM
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+        float M = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < ATTN_WARPS; k++) M = fmaxf(M, sm_m[k][g]);
+        float S = 0.f, A = 0.f;
+#pragma unroll
+        for (int k = 0; k < ATTN_WARPS; k++) {
+            const float f = sm_m[k][g] == -INFINITY ? 0.f : expf(sm_m[k][g] - M);
+            S += sm_s[k][g] * f;
+            A += sm_acc[k][g][d] * f;
+        }
+        const int h = kvh * G + g;
+        const float o = rbf(A / S);
+        const float gate = b2f(qkv[(size_t)t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d]);
+        out[((size_t)t * Hq + h) * HEAD_DIM + d] = f2b(o / (1.f + expf(-gate)));
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(ATTN_WARPS * 32)
+    attn_paged_g4(const bf16* __restrict__ q, const bf16* __restrict__ kcache,
+                  const bf16* __restrict__ vcache, const bf16* __restrict__ qkv, int qstride, int Hq,
+                  int Hkv, const int* __restrict__ pos, const int* __restrict__ tok_seq,
+                  const int* __restrict__ block_table, int max_blocks, int block_size,
+                  bf16* __restrict__ out, float scale) {
+    attn_body<4>(q, kcache, vcache, qkv, qstride, Hq, Hkv, pos, tok_seq, block_table, max_blocks,
+                 block_size, out, scale);
+}
+
+__device__ __forceinline__ uint32_t mix32(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// Picks one token per row of f32 logits. temps[r] <= 0 is greedy (ties go to
+// the lowest index); otherwise Gumbel-max sampling from softmax(logits / T),
+// with noise drawn from a hash of (seeds[r], index).
+extern "C" __global__ void __launch_bounds__(1024)
+    sample(const float* __restrict__ logits, int V, const float* __restrict__ temps,
+           const int* __restrict__ seeds, int* __restrict__ out) {
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const float* row = logits + (size_t)blockIdx.x * V;
+    const float temp = temps[blockIdx.x];
+    const uint32_t seed = mix32((uint32_t)seeds[blockIdx.x] ^ 0x9e3779b9u);
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float x = row[i];
+        if (temp > 0.f) {
+            const uint32_t h = mix32(seed ^ mix32((uint32_t)i));
+            const float u = ((float)(h >> 8) + 0.5f) * (1.f / 16777216.f);
+            x = x / temp - logf(-logf(u));
+        }
+        if (x > best) {
+            best = x;
+            bi = i;
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > best || (ov == best && oi < bi)) {
+            best = ov;
+            bi = oi;
+        }
+    }
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    if (l == 0) {
+        sv[w] = best;
+        si[w] = bi;
+    }
+    __syncthreads();
+    if (w == 0) {
+        best = l < (int)(blockDim.x >> 5) ? sv[l] : -INFINITY;
+        bi = l < (int)(blockDim.x >> 5) ? si[l] : 0x7fffffff;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > best || (ov == best && oi < bi)) {
+                best = ov;
+                bi = oi;
+            }
+        }
+        if (l == 0) out[blockIdx.x] = bi;
+    }
+}

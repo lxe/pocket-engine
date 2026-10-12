@@ -1,0 +1,43 @@
+[package]
+name = "pocket-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "Qwen3.5 inference server on hand-written CUDA kernels with continuous batching"
+repository = "https://github.com/lxe/pocket-engine"
+publish = false
+
+[dependencies]
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cublas", "cuda-13000", "dynamic-loading"] }
+safetensors = "0.8.0"
+memmap2 = "0.9.11"
+half = "2.7.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+axum = "0.8.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
+futures-util = "0.3"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+minijinja = { version = "2", features = ["json", "loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+
+[features]
+default = []
+# Compiles the kernels with nvcc. Without it the crate builds (for CPU CI) but
+# cannot load a model.
+cuda = []
+
+[profile.release]
+debug = "line-tables-only"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json"] }

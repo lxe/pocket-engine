@@ -1,0 +1,38 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  kernels:
+    # Compiles the CUDA kernels and the CUDA build of the crate; no GPU needed.
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:13.0.0-devel-ubuntu24.04
+    strategy:
+      matrix:
+        arch: ["90a", "120a"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update -qq && apt-get install -y -qq curl build-essential pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+      - run: cargo clippy --locked --release --features cuda --all-targets -- -D warnings
+        env:
+          CUDA_COMPUTE_CAP: ${{ matrix.arch }}
+          CUDA_ROOT: /usr/local/cuda

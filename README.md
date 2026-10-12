@@ -1,0 +1,97 @@
+# pocket-engine
+
+An inference server for small Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine, and is ready 5 seconds after launch ([design and measurements](docs/design.md)).
+
+## Supported
+
+| | |
+|---|---|
+| Models | Qwen3.5 0.8B, 2B and 4B, text only (the vision tower is not loaded) |
+| Architecture | Dense. Mixture-of-experts Qwen3.5 models are not supported |
+| Weights | Hugging Face safetensors checkpoints, one file or sharded, in bf16 (f32 tensors are converted) |
+| Quantization | None. Weights and activations run in bf16 with f32 accumulation; recurrent state is f32 |
+| Context | Up to `--max-context` tokens per request (default 4,096) |
+| Sampling | Greedy (`temperature: 0`) or temperature sampling with an optional `seed` |
+| GPUs | NVIDIA, built per architecture: `90a` (H100), `120a` (RTX 50-series); others via `CUDA_COMPUTE_CAP` |
+| Driver | CUDA 13 (driver 580 or newer); cuBLAS 13 at run time |
+
+## Install
+
+You need Rust 1.98 or newer and the CUDA 13 toolkit (`nvcc`).
+
+```sh
+git clone https://github.com/lxe/pocket-engine && cd pocket-engine
+CUDA_COMPUTE_CAP=90a cargo build --release --features cuda   # 120a for an RTX 5090
+```
+
+The binary is `target/release/pocket-engine`. It loads `libcuda`, `libcublas.so.13` and `libcublasLt.so.13` at run time, so they must be on the library path.
+
+## Run
+
+Download a model:
+
+```sh
+hf download Qwen/Qwen3.5-2B --local-dir models/qwen3.5-2b
+```
+
+Serve it:
+
+```sh
+pocket-engine serve --model models/qwen3.5-2b --name qwen3.5-2b --bind 0.0.0.0:8000
+```
+
+Then call it:
+
+```sh
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "qwen3.5-2b", "max_tokens": 64, "temperature": 0,
+  "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+The server answers on three paths:
+
+| Path | What it does |
+|---|---|
+| `POST /v1/chat/completions` | Streamed (`"stream": true`, with `stream_options.include_usage`) or whole responses. Thinking is off. |
+| `GET /v1/models` | Lists the served model. |
+| `GET /health` | Reports running and waiting requests and free KV blocks. Returns 503 once the GPU has failed. |
+
+`serve` takes these options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--max-seqs` | 256 | Most requests decoding at once |
+| `--max-batch-tokens` | 4096 | Most tokens in one step, decode rows plus prompt chunks |
+| `--max-context` | 4096 | Longest prompt plus output, in tokens |
+| `--memory-fraction` | 0.9 | Share of GPU memory to use; the KV cache gets what is left after the weights |
+| `--wait-for PATH` | none | Initialize the GPU, then wait for `PATH` to exist before reading the model. A downloader can create the file when it finishes, so device setup overlaps the download |
+| `--no-graphs` | off | Run every step without CUDA graphs |
+
+## Test
+
+```sh
+cargo test                                   # scheduler, config and layout tests; no GPU needed
+POCKET_ENGINE_MODEL=models/qwen3.5-2b \
+  CUDA_COMPUTE_CAP=120a cargo test --release --features cuda
+```
+
+With a model directory set, `tests/gpu.rs` runs three checks against the model, which can be 0.8B, 2B or 4B:
+
+- its predictions match stored Transformers reference outputs;
+- batching does not change greedy output;
+- the HTTP API streams and reports usage correctly.
+
+To check a model or prompt that isn't in the fixtures, `scripts/accuracy.py` makes new reference data with Transformers:
+
+```sh
+uv venv && uv pip install torch transformers
+.venv/bin/python scripts/accuracy.py reference models/qwen3.5-2b out
+pocket-engine score --model models/qwen3.5-2b out.pairs.json out.ours.json
+python scripts/accuracy.py compare out.ref.json out.ours.json
+```
+
+`scripts/load.py URL MODEL OUT.json` is the load test behind the throughput numbers.
+
+## License
+
+MIT

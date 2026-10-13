@@ -119,6 +119,21 @@ enum Cmd {
     },
     /// Quantizes a bf16 weight matrix to FP8 on the GPU (in the layout this
     /// device's cuBLASLt runs) and times cuBLASLt FP8 against bf16 cuBLAS.
+    /// Times the gated-delta-rule kernel alone: `seqs` sequences of `tokens`
+    /// tokens each, with 27B's head layout by default.
+    BenchGdn {
+        #[arg(long, default_value_t = 48)]
+        heads: usize,
+        #[arg(long, default_value_t = 16)]
+        k_heads: usize,
+        #[arg(long, default_value_t = 1)]
+        seqs: usize,
+        #[arg(long, default_value_t = 128)]
+        tokens: usize,
+        /// Split each head's columns across 4 blocks, with a separate norm.
+        #[arg(long)]
+        split: bool,
+    },
     BenchFp8 {
         #[arg(long)]
         model: PathBuf,
@@ -400,6 +415,117 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tb * 1e6
                 );
             }
+        }
+        Cmd::BenchGdn {
+            heads,
+            k_heads,
+            seqs,
+            tokens,
+            split,
+        } => {
+            use pocket_engine::gpu::{Arg, Gpu};
+            let gpu = Gpu::new(0)?;
+            let (hv, hk, d) = (heads, k_heads, 128usize);
+            let c = 2 * hk * d + hv * d;
+            let pw = c + hv * d + 2 * hv;
+            let t = seqs * tokens;
+            let rnd = |n: usize, scale: f32| -> Vec<u8> {
+                (0..n)
+                    .flat_map(|i| {
+                        let x = ((i.wrapping_mul(2654435761) % 2001) as f32 / 1000.0 - 1.0) * scale;
+                        half::bf16::from_f32(x).to_le_bytes()
+                    })
+                    .collect()
+            };
+            let f32s =
+                |v: Vec<f32>| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            let i32s =
+                |v: Vec<i32>| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            let conv = gpu.upload(&rnd(t * c, 1.0))?;
+            let proj = gpu.upload(&rnd(t * pw, 1.0))?;
+            let neg_a = gpu.upload(&f32s(vec![-0.5; hv]))?;
+            let dt = gpu.upload(&f32s(vec![0.1; hv]))?;
+            let nw = gpu.upload(&f32s(vec![1.0; d]))?;
+            let state = gpu.alloc_zeroed(seqs * hv * d * d * 2)?;
+            let cu = gpu.upload(&i32s((0..=seqs).map(|i| (i * tokens) as i32).collect()))?;
+            let slots = gpu.upload(&i32s((0..seqs as i32).collect()))?;
+            let fresh = gpu.upload(&i32s(vec![0; seqs]))?;
+            let tok_seq = gpu.upload(&i32s((0..t).map(|i| (i / tokens) as i32).collect()))?;
+            let out = gpu.alloc(t * hv * d * 2)?;
+            let k = gpu.kernel(if split {
+                "gdn_recurrent_split"
+            } else {
+                "gdn_recurrent"
+            })?;
+            let norm = gpu.kernel("gdn_norm")?;
+            let run = || -> pocket_engine::Result<()> {
+                if split {
+                    gpu.launch(
+                        norm,
+                        ((t * hv * 32).div_ceil(256) as u32, 1, 1),
+                        256,
+                        0,
+                        &[
+                            Arg::P(proj.ptr),
+                            Arg::I(pw as i32),
+                            Arg::I(c as i32),
+                            Arg::I(hv as i32),
+                            Arg::P(nw.ptr),
+                            Arg::P(out.ptr),
+                            Arg::I(t as i32),
+                            Arg::F(1e-6),
+                            Arg::P(cu.ptr),
+                            Arg::P(tok_seq.ptr),
+                            Arg::P(0),
+                            Arg::P(0),
+                            Arg::I(0),
+                            Arg::I(0),
+                        ],
+                    )?;
+                }
+                gpu.launch(
+                    k,
+                    (seqs as u32, hv as u32, if split { 4 } else { 1 }),
+                    2 * d as u32,
+                    0,
+                    &[
+                        Arg::P(conv.ptr),
+                        Arg::P(proj.ptr),
+                        Arg::I(pw as i32),
+                        Arg::I(c as i32),
+                        Arg::I(hk as i32),
+                        Arg::I(hv as i32),
+                        Arg::P(neg_a.ptr),
+                        Arg::P(dt.ptr),
+                        Arg::P(nw.ptr),
+                        Arg::P(state.ptr),
+                        Arg::I(1),
+                        Arg::P(cu.ptr),
+                        Arg::P(slots.ptr),
+                        Arg::P(fresh.ptr),
+                        Arg::P(out.ptr),
+                        Arg::F(1e-6),
+                        Arg::I(0),
+                        Arg::P(0),
+                        Arg::P(0),
+                        Arg::I(0),
+                        Arg::I(0),
+                    ],
+                )
+            };
+            run()?;
+            gpu.sync()?;
+            let n = 50;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                run()?;
+            }
+            gpu.sync()?;
+            let us = t0.elapsed().as_secs_f64() / n as f64 * 1e6;
+            println!(
+                "gdn_recurrent: {seqs} x {tokens} tokens, {hv} heads: {us:.1} us ({:.2} us per token per sequence)",
+                us / tokens as f64
+            );
         }
         Cmd::BenchFp8 {
             model,

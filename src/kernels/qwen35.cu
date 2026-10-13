@@ -65,6 +65,15 @@ __device__ __forceinline__ void unpack8(uint4 u, float* f) {
     }
 }
 
+__device__ __forceinline__ void unpack4(uint2 u, float* f) {
+    const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&u);
+    const float2 a = __bfloat1622float2(p[0]), b = __bfloat1622float2(p[1]);
+    f[0] = a.x;
+    f[1] = a.y;
+    f[2] = b.x;
+    f[3] = b.y;
+}
+
 __device__ __forceinline__ uint4 pack8(const float* f) {
     uint4 u;
     __nv_bfloat162* p = reinterpret_cast<__nv_bfloat162*>(&u);
@@ -213,16 +222,16 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
 // conv rows: [q (Hk*128) | k (Hk*128) | v (Hv*128)]; proj rows after the
 // convolution inputs: [z (Hv*128) | b (Hv) | a (Hv)].
 #define GDN_HALF (GDN_DIM / 2)
-extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
-    gdn_recurrent(const bf16* __restrict__ conv, const bf16* __restrict__ proj, int pstride, int C,
-                  int Hk, int Hv, const float* __restrict__ neg_a, const float* __restrict__ dt_bias,
-                  const float* __restrict__ norm_w, void* __restrict__ state, int state_bf16,
-                  const int* __restrict__ cu, const int* __restrict__ slots,
-                  const int* __restrict__ fresh, bf16* __restrict__ out, float eps, int tiled,
-                  uint8_t* fq, void* fs, int fmode, int frows) {
+__device__ __forceinline__ void gdn_one(int s, int h, const bf16* __restrict__ conv, const bf16* __restrict__ proj,
+                                        int pstride, int C, int Hk, int Hv, const float* __restrict__ neg_a,
+                                        const float* __restrict__ dt_bias, const float* __restrict__ norm_w,
+                                        void* __restrict__ state, int state_bf16, const int* __restrict__ cu,
+                                        const int* __restrict__ slots, const int* __restrict__ fresh,
+                                        bf16* __restrict__ out, float eps, int tiled, uint8_t* fq, void* fs,
+                                        int fmode, int frows) {
     __shared__ float qs[GDN_DIM], ks[GDN_DIM], sh[32], ys[GDN_DIM];
     const Fp8Out fo{fq, fs, fmode, frows};
-    const int s = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    const int tid = threadIdx.x;
     const int j = tid >> 1, half = tid & 1, i0 = half * GDN_HALF;
     const int t0 = cu[s], t1 = cu[s + 1];
     if (t0 == t1) return;
@@ -311,6 +320,225 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
         const int at = (i0 + i) * GDN_DIM + j;
         if (state_bf16) Sb[at] = f2b(r[i]);
         else S[at] = r[i];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
+    gdn_recurrent(const bf16* __restrict__ conv, const bf16* __restrict__ proj, int pstride, int C, int Hk, int Hv,
+                  const float* __restrict__ neg_a, const float* __restrict__ dt_bias, const float* __restrict__ norm_w,
+                  void* __restrict__ state, int state_bf16, const int* __restrict__ cu, const int* __restrict__ slots,
+                  const int* __restrict__ fresh, bf16* __restrict__ out, float eps, int tiled, uint8_t* fq, void* fs,
+                  int fmode, int frows) {
+    gdn_one(blockIdx.x, blockIdx.y, conv, proj, pstride, C, Hk, Hv, neg_a, dt_bias, norm_w, state, state_bf16, cu,
+            slots, fresh, out, eps, tiled, fq, fs, fmode, frows);
+}
+
+// The same recurrence for steps with prompt tokens, where one sequence may
+// bring hundreds of tokens and gdn_recurrent's per-token barriers and
+// reductions, on one block per head, leave most SMs idle. Here four blocks
+// share a head, each owning 32 value columns, with 8 threads per column.
+// A sequence's tokens are walked in chunks of GDN_CHUNK: everything that
+// does not depend on the state (normalized q and k, v, beta, the decay) is
+// computed for the chunk first, in parallel, into shared memory, and the
+// walk itself needs no barrier. Each thread holds 16 rows of its column,
+// read from shared memory 4 at a time, and the 8 threads of a column add
+// their partial dot products with shuffles. The rounded outputs go to `out`;
+// gdn_norm then applies the gated norm (and FP8) in place.
+// The gated RMSNorm of one (token, head): lane l < 16 holds outputs 8l ..
+// 8l + 7 in o; y = o / rms(o) * w * silu(z), written as bf16 and, with
+// fmode, as FP8. Every lane of the warp calls it.
+__device__ __forceinline__ void gdn_gate8(float* o, int t, int h, int Hv, const bf16* __restrict__ proj, int pstride,
+                                          int C, const float* __restrict__ norm_w, bf16* __restrict__ out, float eps,
+                                          const Fp8Out& fo, int fmode, int lane) {
+    float ss = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; e++) ss += o[e] * o[e];
+    const float var = warp_sum(ss) / GDN_DIM;
+    const float inv = 1.f / sqrtf(var + eps);
+    if (lane < 16) {
+        const bf16* prow = proj + (size_t)t * pstride + C;
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int c = 8 * lane + e;
+            o[e] = o[e] * inv * norm_w[c] * silu(b2f(prow[h * GDN_DIM + c]));
+        }
+        *reinterpret_cast<uint4*>(out + (size_t)t * Hv * GDN_DIM + h * GDN_DIM + 8 * lane) = pack8(o);
+    }
+    if (fmode) quant8(o, t, h * GDN_DIM + 8 * (lane & 15), Hv * GDN_DIM, fo, lane < 16);
+}
+#define GDN_CHUNK 16
+template <int SPLIT, int P>
+__device__ __forceinline__ void gdn_body(const bf16* __restrict__ conv, const bf16* __restrict__ proj, int pstride,
+                                         int C, int Hk, int Hv, const float* __restrict__ neg_a,
+                                         const float* __restrict__ dt_bias, const float* __restrict__ norm_w,
+                                         void* __restrict__ state, int state_bf16, const int* __restrict__ cu,
+                                         const int* __restrict__ slots, const int* __restrict__ fresh,
+                                         bf16* __restrict__ out, float eps, int tiled, uint8_t* fq, void* fs,
+                                         int fmode, int frows) {
+    constexpr int COLS = GDN_DIM / SPLIT, THREADS = COLS * P, WARPS = THREADS / 32, ROWS = GDN_DIM / P;
+    constexpr int GROUPS = ROWS / 4;
+    __shared__ __align__(16) float sq[GDN_CHUNK][GDN_DIM], sk[GDN_CHUNK][GDN_DIM];
+    __shared__ float sv[GDN_CHUNK][COLS], so[GDN_CHUNK][COLS];
+    __shared__ float sbeta[GDN_CHUNK], sdecay[GDN_CHUNK];
+    const Fp8Out fo{fq, fs, fmode, frows};
+    // Steps list decode rows before prompt chunks; prompt sequences are the
+    // long blocks, so they go first.
+    const int s = gridDim.x - 1 - blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    const int p = tid % P, jl = tid / P, j = blockIdx.z * COLS + jl, warp = tid >> 5, lane = tid & 31;
+    // Thread p owns rows p * ROWS .. + ROWS in groups of 4, read with one
+    // 16-byte shared load; its groups are rotated so that the P threads of a
+    // column hit different banks. Register 4g + e holds row row0(g) + e.
+    const int rot = P == 8 ? p >> 1 : 2 * p;
+    auto row0 = [&](int g) { return p * ROWS + ((g + rot) % GROUPS) * 4; };
+    auto row_of = [&](int i) { return row0(i / 4) + i % 4; };
+    const int t0 = cu[s], t1 = cu[s + 1];
+    if (t0 == t1) return;
+    if (t1 - t0 == 1) {
+        // A decoding sequence in a step with prompts: gdn_recurrent's way,
+        // which moves the state in fewer memory segments, on the head's
+        // first block.
+        if (blockIdx.z == 0)
+            gdn_one(s, h, conv, proj, pstride, C, Hk, Hv, neg_a, dt_bias, norm_w, state, state_bf16, cu, slots, fresh,
+                    out, eps, tiled, fq, fs, fmode, frows);
+        return;
+    }
+    // Value head h reads key head h / (Hv / Hk) (grouped order), or h % Hk in
+    // the tiled order GGUF files use.
+    const int kh = tiled ? h % Hk : h / (Hv / Hk);
+    const size_t base = ((size_t)slots[s] * Hv + h) * GDN_DIM * GDN_DIM;
+    float* S = (float*)state + base;
+    bf16* Sb = (bf16*)state + base;
+    float r[ROWS];
+    const bool is_fresh = fresh[s] != 0;
+#pragma unroll
+    for (int i = 0; i < ROWS; i++) {
+        const int at = row_of(i) * GDN_DIM + j;
+        r[i] = is_fresh ? 0.f : state_bf16 ? b2f(Sb[at]) : S[at];
+    }
+    // Prefill rounds the normalized q and k to bf16; single-token decode keeps f32.
+    const bool round_qk = (t1 - t0) > 1 || is_fresh;
+    const float na = neg_a[h], db = dt_bias[h];
+    const float qscale = rsqrtf((float)GDN_DIM);
+    for (int c0 = t0; c0 < t1; c0 += GDN_CHUNK) {
+        const int n = min(GDN_CHUNK, t1 - c0);
+        // The chunk's inputs, a warp per token, four dimensions per lane.
+        for (int w = warp; w < n; w += WARPS) {
+            const int t = c0 + w;
+            const bf16* row = conv + (size_t)t * C;
+            float q[4], k[4];
+            unpack4(*reinterpret_cast<const uint2*>(row + kh * GDN_DIM + 4 * lane), q);
+            unpack4(*reinterpret_cast<const uint2*>(row + Hk * GDN_DIM + kh * GDN_DIM + 4 * lane), k);
+            float qq = 0.f, kk = 0.f;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                qq += q[e] * q[e];
+                kk += k[e] * k[e];
+            }
+            qq = warp_sum(qq);
+            kk = warp_sum(kk);
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                float qn = q[e] / sqrtf(qq + 1e-6f), kn = k[e] / sqrtf(kk + 1e-6f);
+                if (round_qk) {
+                    qn = rbf(qn);
+                    kn = rbf(kn);
+                }
+                sq[w][4 * lane + e] = qn * qscale;
+                sk[w][4 * lane + e] = kn;
+            }
+            for (int c = lane; c < COLS; c += 32)
+                sv[w][c] = b2f(row[2 * Hk * GDN_DIM + h * GDN_DIM + blockIdx.z * COLS + c]);
+            if (lane == 0) {
+                const bf16* prow = proj + (size_t)t * pstride + C;
+                const float b = b2f(prow[Hv * GDN_DIM + h]);
+                const float a = b2f(prow[Hv * GDN_DIM + Hv + h]);
+                const float x = a + db;
+                const float sp = fmaxf(x, 0.f) + logf(1.f + expf(-fabsf(x)));
+                sbeta[w] = 1.f / (1.f + expf(-b));
+                sdecay[w] = expf(na * sp);
+            }
+        }
+        __syncthreads();
+        // The recurrence, token by token.
+        for (int w = 0; w < n; w++) {
+            const float decay = sdecay[w];
+            float4 kr[GROUPS];
+            float kv0 = 0.f, kv1 = 0.f;
+#pragma unroll
+            for (int g = 0; g < GROUPS; g++) {
+                kr[g] = *reinterpret_cast<const float4*>(&sk[w][row0(g)]);
+                r[4 * g] *= decay;
+                r[4 * g + 1] *= decay;
+                r[4 * g + 2] *= decay;
+                r[4 * g + 3] *= decay;
+                kv0 += kr[g].x * r[4 * g] + kr[g].z * r[4 * g + 2];
+                kv1 += kr[g].y * r[4 * g + 1] + kr[g].w * r[4 * g + 3];
+            }
+            float kv = kv0 + kv1;
+#pragma unroll
+            for (int m = 1; m < P; m <<= 1) kv += __shfl_xor_sync(0xffffffffu, kv, m);
+            const float delta = (sv[w][jl] - kv) * sbeta[w];
+            float o0 = 0.f, o1 = 0.f;
+#pragma unroll
+            for (int g = 0; g < GROUPS; g++) {
+                const float4 qr = *reinterpret_cast<const float4*>(&sq[w][row0(g)]);
+                r[4 * g] += kr[g].x * delta;
+                r[4 * g + 1] += kr[g].y * delta;
+                r[4 * g + 2] += kr[g].z * delta;
+                r[4 * g + 3] += kr[g].w * delta;
+                o0 += qr.x * r[4 * g] + qr.z * r[4 * g + 2];
+                o1 += qr.y * r[4 * g + 1] + qr.w * r[4 * g + 3];
+            }
+            float o = o0 + o1;
+#pragma unroll
+            for (int m = 1; m < P; m <<= 1) o += __shfl_xor_sync(0xffffffffu, o, m);
+            if (p == 0) so[w][jl] = rbf(o);
+        }
+        __syncthreads();
+        for (int e = tid; e < n * COLS; e += THREADS) {
+            const int w = e / COLS, c = e % COLS;
+            out[(size_t)(c0 + w) * Hv * GDN_DIM + h * GDN_DIM + blockIdx.z * COLS + c] = f2b(so[w][c]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < ROWS; i++) {
+        const int at = row_of(i) * GDN_DIM + j;
+        if (state_bf16) Sb[at] = f2b(r[i]);
+        else S[at] = r[i];
+    }
+}
+
+#define GDN_ARGS                                                                                       \
+    const bf16 *__restrict__ conv, const bf16 *__restrict__ proj, int pstride, int C, int Hk, int Hv,  \
+        const float *__restrict__ neg_a, const float *__restrict__ dt_bias,                            \
+        const float *__restrict__ norm_w, void *__restrict__ state, int state_bf16,                    \
+        const int *__restrict__ cu, const int *__restrict__ slots, const int *__restrict__ fresh,       \
+        bf16 *__restrict__ out, float eps, int tiled, uint8_t *fq, void *fs, int fmode, int frows
+#define GDN_PASS conv, proj, pstride, C, Hk, Hv, neg_a, dt_bias, norm_w, state, state_bf16, cu, slots, fresh, out, eps, tiled, fq, fs, fmode, frows
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_recurrent_split(GDN_ARGS) {
+    gdn_body<4, 8>(GDN_PASS);
+}
+
+// The gated norm for gdn_recurrent_split's outputs, in place: a warp per
+// (token, head), over the tokens of sequences with more than one.
+extern "C" __global__ void gdn_norm(const bf16* __restrict__ proj, int pstride, int C, int Hv,
+                                    const float* __restrict__ norm_w, bf16* __restrict__ out, int T, float eps,
+                                    const int* __restrict__ cu, const int* __restrict__ tok_seq, uint8_t* fq,
+                                    void* fs, int fmode, int frows) {
+    const Fp8Out fo{fq, fs, fmode, frows};
+    const int lane = threadIdx.x & 31;
+    const long long n = (long long)T * Hv;
+    for (long long e = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5; e < n;
+         e += ((long long)gridDim.x * blockDim.x) >> 5) {
+        const int t = (int)(e / Hv), h = (int)(e % Hv);
+        const int sq = tok_seq[t];
+        if (cu[sq + 1] - cu[sq] == 1) continue;  // finished by gdn_one
+        float o[8];
+        if (lane < 16) unpack8(*reinterpret_cast<const uint4*>(out + (size_t)t * Hv * GDN_DIM + h * GDN_DIM + 8 * lane), o);
+        else
+            for (int i = 0; i < 8; i++) o[i] = 0.f;
+        gdn_gate8(o, t, h, Hv, proj, pstride, C, norm_w, out, eps, fo, fmode, lane);
     }
 }
 

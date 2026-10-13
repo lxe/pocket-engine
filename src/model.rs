@@ -296,6 +296,9 @@ struct Kernels {
     silu_mul: Kernel,
     gdn_conv: Kernel,
     gdn_recurrent: Kernel,
+    /// The recurrence for steps with prompt tokens, and its gated norm.
+    gdn_split: Kernel,
+    gdn_norm: Kernel,
     attn_prep: Kernel,
     attn: Kernel,
     /// Paged attention over an E4M3 cache.
@@ -466,6 +469,8 @@ impl Model {
             silu_mul: gpu.kernel("silu_mul")?,
             gdn_conv: gpu.kernel("gdn_conv")?,
             gdn_recurrent: gpu.kernel("gdn_recurrent")?,
+            gdn_split: gpu.kernel("gdn_recurrent_split")?,
+            gdn_norm: gpu.kernel("gdn_norm")?,
             attn_prep: gpu.kernel("attn_prep")?,
             attn: gpu.kernel(&format!("attn_paged_g{}", cfg.hq / cfg.hkv))?,
             attn8: gpu.kernel(&format!("attn_paged8_g{}", cfg.hq / cfg.hkv))?,
@@ -896,34 +901,67 @@ impl Model {
                             I(cd as i32),
                         ],
                     )?;
-                    gpu.launch(
-                        k.gdn_recurrent,
-                        (si, hv as u32, 1),
-                        2 * GDN_DIM as u32,
-                        0,
-                        &[
-                            P(a.conv.ptr),
-                            P(a.proj.ptr),
-                            I(pw as i32),
-                            I(cd as i32),
-                            I(c.lin_k_heads as i32),
-                            I(hv as i32),
-                            P(neg_a.ptr),
-                            P(dt_bias.ptr),
-                            P(norm_w.ptr),
-                            P(st.rec[*state].ptr),
-                            I(st.state_bf16 as i32),
-                            P(a.m(me.cu())),
-                            P(a.m(me.slots())),
-                            P(a.m(me.fresh())),
-                            P(a.core.ptr),
-                            F(eps),
-                            I(c.tiled_v as i32),
-                        ]
-                        .into_iter()
-                        .chain(a.fp8_args(|f| &f.core, t))
-                        .collect::<Vec<_>>(),
-                    )?;
+                    let args = [
+                        P(a.conv.ptr),
+                        P(a.proj.ptr),
+                        I(pw as i32),
+                        I(cd as i32),
+                        I(c.lin_k_heads as i32),
+                        I(hv as i32),
+                        P(neg_a.ptr),
+                        P(dt_bias.ptr),
+                        P(norm_w.ptr),
+                        P(st.rec[*state].ptr),
+                        I(st.state_bf16 as i32),
+                        P(a.m(me.cu())),
+                        P(a.m(me.slots())),
+                        P(a.m(me.fresh())),
+                        P(a.core.ptr),
+                        F(eps),
+                        I(c.tiled_v as i32),
+                    ];
+                    if t > s {
+                        // Prompt tokens: four blocks per head for prompt
+                        // sequences, then the norm.
+                        gpu.launch(
+                            k.gdn_split,
+                            (si, hv as u32, 4),
+                            2 * GDN_DIM as u32,
+                            0,
+                            &[args.as_slice(), &a.fp8_args(|f| &f.core, t)].concat(),
+                        )?;
+                        gpu.launch(
+                            k.gdn_norm,
+                            ((t * hv * 32).div_ceil(256) as u32, 1, 1),
+                            256,
+                            0,
+                            &[
+                                [
+                                    P(a.proj.ptr),
+                                    I(pw as i32),
+                                    I(cd as i32),
+                                    I(hv as i32),
+                                    P(norm_w.ptr),
+                                    P(a.core.ptr),
+                                    I(t as i32),
+                                    F(eps),
+                                    P(a.m(me.cu())),
+                                    P(a.m(me.tok_seq())),
+                                ]
+                                .as_slice(),
+                                &a.fp8_args(|f| &f.core, t),
+                            ]
+                            .concat(),
+                        )?;
+                    } else {
+                        gpu.launch(
+                            k.gdn_recurrent,
+                            (si, hv as u32, 1),
+                            2 * GDN_DIM as u32,
+                            0,
+                            &[args.as_slice(), &a.fp8_args(|f| &f.core, t)].concat(),
+                        )?;
+                    }
                     w_out.forward(gpu, q, a.input(&a.core, |f| &f.core), t, a.h.ptr, h, false)?;
                 }
                 Mixer::Attn {

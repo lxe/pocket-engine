@@ -22,7 +22,7 @@ Output tokens per second with 64 requests in flight on one H100, from `scripts/l
 
 ¹ Retested on 2026-10-13 after the chunked linear attention, grouped flash attention and multi-token prediction; the other rows are from 2026-10-12. Drafting rows use each engine's multi-token prediction (pocket-engine `--mtp 2`, vLLM's `mtp` method with 2 speculative tokens).
 
-pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. vLLM's prefill is about twice as fast on prompts of 32k tokens and more; [the retest](docs/h100-comparison.md#retest-2026-10-13-27b-prefix-cache-long-contexts-multi-token-prediction) has long prompts and shared prefixes.
+pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. vLLM's prefill is 1.2 to 1.4 times as fast on prompts of 8k to 64k tokens; [the retest](docs/h100-comparison.md#retest-2026-10-13-27b-prefix-cache-long-contexts-multi-token-prediction) has long prompts and shared prefixes.
 
 ## Supported
 
@@ -35,7 +35,7 @@ pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. vLLM's pre
 | Quantization | GGUF weights stay quantized on the GPU: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely within a file. Their activations run in bf16 with f32 accumulation |
 | FP8 | E4M3 weights and activations on H100, H200 and RTX 50-series: Qwen's FP8 checkpoints, or any bf16 checkpoint with `--fp8`. Block scales of 128×128 per weight tile and 128 per activation row on Hopper; MXFP8 (a scale per 32 values) on Blackwell. Images, samplers and CUDA graphs work with it. The KV cache can be FP8 too (`--kv-fp8`) |
 | FP4 | RTX 50-series only: MXFP4 weights (E2M1, a power-of-two scale per 32) times MXFP8 activations on block-scaled tensor cores. NVIDIA's NVFP4 checkpoints (`nvidia/Qwen3.8-27B-NVFP4`) are re-quantized to MXFP4 at load; `--fp4` quantizes a bf16 checkpoint's MLP to FP4 and the rest to FP8 |
-| Context | Up to `--max-context` tokens per request (default 4,096). On an RTX 5090, Qwen3.5-9B takes 0.70 s to a first token at 8k, 3.2 s at 32k and 7.6 s at 64k (on an H100: 0.36, 1.6 and 3.9 s), and decodes at 78 to 85 tok/s at every length |
+| Context | Up to `--max-context` tokens per request (default 4,096). On an RTX 5090, Qwen3.5-9B takes 0.70 s to a first token at 8k, 3.2 s at 32k and 7.6 s at 64k (on an H100: 0.30, 1.3 and 3.2 s, against vLLM's 0.27, 1.05 and 2.25), and decodes at 78 to 85 tok/s at every length |
 | Prefix cache | Prompts that share a beginning (a system prompt, or a conversation's earlier turns) reuse its KV cache and recurrent state. On by default |
 | Speculative decoding | `--mtp` drafts tokens with the checkpoint's multi-token-prediction layer and verifies them in the next step, for greedy and sampled requests alike (not with penalties or `logit_bias`). Qwen3.5-9B on an RTX 5090: 152 tok/s for one request instead of 85 |
 | Sampling | Greedy, or temperature with `top_k`, `top_p`, `min_p` and `seed`; `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`; `stop` strings |

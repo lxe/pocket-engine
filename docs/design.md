@@ -54,15 +54,19 @@ Decoding with a short context runs at 89 tok/s; at 64k, reading the 2 GB of cach
 
 Flash attention runs at 115 TFLOPS on the 5090 (cuBLAS's bf16 matmuls reach 211), after blocks took eight warps of queries instead of four: with one 68 KB block per SM there were too few warps to hide any latency. The convolution splits each sequence into 64-token chunks rather than walking it in one thread per channel.
 
-On an H100 the kernel takes larger tiles in Hopper's 227 KB of shared memory (64 keys per tile for groups of 4, two query tiles of 32 keys for groups of 6), reaching 158 and 168 TFLOPS. Time to first token, one request at a time, against vLLM 0.31.0 on the same kind of machine:
+On an H100, prompts with a bf16 cache run a flash kernel on Hopper's wgmma instead: a block takes 64 query tokens of two heads, a warpgroup each, and 64-key tiles in 128-byte-swizzled shared memory. Q Kᵀ runs as m64n64k16 from shared memory and P V as m64n256k16 with P in registers. The next tile's scores and this tile's P V are issued together, and the next softmax runs while P V is on the tensor cores. It reaches 218 TFLOPS for groups of 4 and 216 for groups of 6, against 158 and 168 for the mma.sync kernel with Hopper-sized tiles (64 keys per tile, and two query tiles for groups of 6) and 123 and 97 with the RTX 50-series shape.
+
+The chunked recurrence runs in two passes, as FLA's does. `gdn_prep` computes every chunk's local terms at once: normalized q and k, the decay, P, and the WY form U = T βV, W = T β e^G K with T = (I + A)⁻¹. `gdn_scan` then walks the chunks with only D = U − W S, the outputs and the state update, which are separable by value column, so up to four blocks share a head when a step has few sequences. A 4,096-token chunk of 9B's recurrence takes 0.65 ms on an RTX 5090 instead of 1.41.
+
+Time to first token, one request at a time, against vLLM 0.31.0 on the same kind of machine ("retest" is the build of the [retest](h100-comparison.md#long-prompts)):
 
 | Prompt | 9B, retest | 9B, now | 9B, vLLM | 27B, retest | 27B, now | 27B, vLLM |
 |---:|---:|---:|---:|---:|---:|---:|
-| 8k | 0.37 s | 0.36 s | 0.27 s | 0.98 s | 0.92 s | 0.70 s |
-| 32k | 1.86 s | 1.57 s | 1.05 s | 4.96 s | 4.46 s | 3.17 s |
-| 64k | 4.88 s | 3.93 s | 2.25 s | 12.7 s | 11.3 s | 6.86 s |
+| 8k | 0.37 s | 0.30 s | 0.27 s | 0.98 s | 0.84 s | 0.70 s |
+| 32k | 1.86 s | 1.30 s | 1.05 s | 4.96 s | 3.88 s | 3.17 s |
+| 64k | 4.88 s | 3.17 s | 2.25 s | 12.7 s | 9.63 s | 6.86 s |
 
-vLLM still prefills long prompts faster. On 27B at 32k, prefill spends 46% of its GPU time in cuBLAS, 34% in flash attention and 14% in the chunked recurrence. FlashAttention 3 runs on Hopper's wgmma at several times the mma.sync kernel's rate, and FLA's recurrence computes each chunk's local terms in parallel, leaving only the state's passage from chunk to chunk in sequence; here one block per head walks every chunk.
+vLLM still prefills long prompts faster, now by 1.2 to 1.4 times. FlashAttention 3 keeps Hopper's tensor cores busier with a producer warpgroup loading tiles by TMA and consumer warpgroups taking turns, where here the two warpgroups load their own tiles.
 
 ## Multi-token prediction
 

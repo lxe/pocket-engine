@@ -58,15 +58,39 @@ On an H100, prompts with a bf16 cache run a flash kernel on Hopper's wgmma inste
 
 The chunked recurrence runs in two passes, as FLA's does. `gdn_prep` computes every chunk's local terms at once: normalized q and k, the decay, P, and the WY form U = T βV, W = T β e^G K with T = (I + A)⁻¹. `gdn_scan` then walks the chunks with only D = U − W S, the outputs and the state update, which are separable by value column, so up to four blocks share a head when a step has few sequences. A 4,096-token chunk of 9B's recurrence takes 0.65 ms on an RTX 5090 instead of 1.41.
 
-Time to first token, one request at a time, against vLLM 0.31.0 on the same kind of machine ("retest" is the build of the [retest](h100-comparison.md#long-prompts)):
+Time to first token, one request at a time, on an H100 against vLLM 0.31.0 run on the same machine ("retest" is the build of the [retest](h100-comparison.md#long-prompts), on another H100):
 
 | Prompt | 9B, retest | 9B, now | 9B, vLLM | 27B, retest | 27B, now | 27B, vLLM |
 |---:|---:|---:|---:|---:|---:|---:|
-| 8k | 0.37 s | 0.30 s | 0.27 s | 0.98 s | 0.84 s | 0.70 s |
-| 32k | 1.86 s | 1.30 s | 1.05 s | 4.96 s | 3.88 s | 3.17 s |
-| 64k | 4.88 s | 3.17 s | 2.25 s | 12.7 s | 9.63 s | 6.86 s |
+| 8k | 0.37 s | 0.28 s | 0.26 s | 0.98 s | 0.81 s | 0.73 s |
+| 32k | 1.86 s | 1.20 s | 1.04 s | 4.96 s | 3.67 s | 3.12 s |
+| 64k | 4.88 s | 2.83 s | 2.17 s | 12.7 s | 8.74 s | 6.83 s |
 
-vLLM still prefills long prompts faster, now by 1.2 to 1.4 times. FlashAttention 3 keeps Hopper's tensor cores busier with a producer warpgroup loading tiles by TMA and consumer warpgroups taking turns, where here the two warpgroups load their own tiles.
+The remaining gap is vLLM's two prefill kernels, which run on Hopper's TMA and wgmma. Each kernel alone on the same shapes (4,096 new tokens after 28,672 cached for attention; 4,096 tokens with a carried state for the recurrence):
+
+| Kernel | H100, pocket-engine | H100, vLLM | RTX 5090, pocket-engine | RTX 5090, vLLM |
+|---|---:|---:|---:|---:|
+| Attention, groups of 4 | 282 TFLOPS | 752 (FlashAttention 3) | 130 | 167 (FlashAttention 2) |
+| Attention, groups of 6 | 287 TFLOPS | 676 | 108 | 174 |
+| Recurrence, 32 heads | 0.68 ms | 0.29 ms (FlashInfer) | 0.66 ms | 0.41 ms |
+| Recurrence, 48 heads | 0.83 ms | 0.32 ms | 0.95 ms | 0.60 ms |
+
+At 64k on 27B the attention alone is about 840 TFLOP: 2.9 s at this kernel's rate and 1.2 s at FlashAttention 3's, most of the 1.9 s between the two engines. A warp-specialized version of the wgmma kernel (a producer warpgroup gathering the paged tiles with cp.async into mbarrier stages, two consumer warpgroups computing) ran at 218 TFLOPS, slower than the plain one, most likely because issuing cp.async for 16-token pages keeps the 40-register producer too busy, where FlashAttention 3 loads its tiles by TMA.
+
+## Time to first token
+
+A short prompt's first token waits for one prompt step. Two things delayed it:
+
+- **Nagle's algorithm.** Streamed tokens are small writes; without `TCP_NODELAY` the first token waited for the previous write's acknowledgement, which Linux delays by up to 40 ms.
+- **Prefix-cache boundaries.** The prefix cache stopped a prompt chunk at each boundary to copy the state there, so a 150-token prompt ran as two prompt steps, each reading every weight. The recurrence now writes its state at a boundary on its 32-token chunk grid straight into the snapshot slot, and the prompt runs whole.
+
+Median time to first token for single short prompts (60 to 200 words, chat template):
+
+| | pocket-engine before | pocket-engine now | vLLM |
+|---|---:|---:|---:|
+| RTX 5090, Qwen3.5-9B | 43.7 ms | 19.6 ms | 22 ms (0.30) |
+| H100, Qwen3.5-9B | | 12.4 ms | 43.8 ms (0.31.0) |
+| H100, Qwen3.8-27B | | 32.6 ms | 73.7 ms (0.31.0) |
 
 ## Multi-token prediction
 

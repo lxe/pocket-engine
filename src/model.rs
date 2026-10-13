@@ -84,18 +84,23 @@ pub fn fa_wgmma(g: usize, arch: u32, kv_fp8: bool) -> bool {
 }
 
 /// Dynamic shared memory of the two-pass chunked gated delta rule
-/// (GDN_PREP_SMEM and GDN_SCAN_SMEM in qwen35.cu).
-pub const GDN_PREP_SMEM: usize = 2 * 32 * 136 * 2 + 32 * 260 * 4 + 32 * 33 * 4 + 3 * 32 * 4;
-pub const GDN_SCAN_SMEM: usize = 5 * 32 * 136 * 2 + 32 * 40 * 2 + 32 * 4 + 128 * 136 * 2;
+/// (GDN_PREP_SMEM and GDN_SCAN_SMEM(NS) in qwen35.cu).
+pub const GDN_PREP_SMEM: usize = 3 * 32 * 136 * 2 + 32 * 36 * 4 + 6 * 32 * 4;
+pub fn gdn_scan_smem(ns: usize) -> usize {
+    let vs = 128 / ns + 8;
+    let buffers = if ns > 1 { 2 } else { 1 };
+    buffers * (3 * 32 * 136 * 2 + 32 * vs * 2 + 32 * 40 * 2 + 3 * 32 * 4)
+        + 2 * 32 * vs * 2
+        + 128 * vs * 2
+}
 /// Value-column shares of gdn_scan for a step of `s` sequences: the most
 /// (up to 4) whose blocks are all resident at once.
 pub fn gdn_split(s: usize, hv: usize, gpu: &Gpu) -> usize {
-    let slots = gpu.sms * (gpu.smem_per_sm / (GDN_SCAN_SMEM + 1024)).max(1);
-    match slots / (s * hv) {
-        0 | 1 => 1,
-        2 | 3 => 2,
-        _ => 4,
-    }
+    let resident = |ns: usize| gpu.sms * (gpu.smem_per_sm / (gdn_scan_smem(ns) + 1024)).max(1);
+    [4, 2]
+        .into_iter()
+        .find(|&ns| s * hv * ns <= resident(ns))
+        .unwrap_or(1)
 }
 
 #[derive(Debug, Clone)]
@@ -678,9 +683,9 @@ impl Model {
             },
             gdn_scan: {
                 let mut ks = Vec::new();
-                for name in ["gdn_scan1", "gdn_scan2", "gdn_scan4"] {
-                    let k = gpu.kernel(name)?;
-                    gpu.set_smem(k, GDN_SCAN_SMEM)?;
+                for ns in [1, 2, 4] {
+                    let k = gpu.kernel(&format!("gdn_scan{ns}"))?;
+                    gpu.set_smem(k, gdn_scan_smem(ns))?;
                     ks.push(k);
                 }
                 [ks[0], ks[1], ks[2]]
@@ -1009,8 +1014,9 @@ pub struct Act {
     fp8: Option<Fp8Acts>,
     /// The draft layer's buffers, with multi-token prediction.
     mtp: Option<MtpActs>,
-    /// gdn_prep's per-token rows for gdn_scan: U, W, q, Kw (bf16, 128 per
-    /// head), P (bf16, 32 per head) and G (f32, one per head).
+    /// gdn_prep's per-token rows for gdn_scan: U, W (bf16, 128 per head),
+    /// q's and k's inverse norms (f32, one per head), P (bf16, 32 per head)
+    /// and G (f32, one per head).
     gdn: [Buf; 6],
 }
 
@@ -1131,8 +1137,8 @@ impl Act {
                 [
                     b(rows * GDN_DIM)?,
                     b(rows * GDN_DIM)?,
-                    b(rows * GDN_DIM)?,
-                    b(rows * GDN_DIM)?,
+                    gpu.alloc_zeroed(rows * 4)?,
+                    gpu.alloc_zeroed(rows * 4)?,
                     b(rows * 32)?,
                     gpu.alloc_zeroed(rows * 4)?,
                 ]
@@ -1770,7 +1776,7 @@ impl Model {
                             k.gdn_scan[split.trailing_zeros() as usize],
                             (si, hv as u32, split as u32),
                             2 * GDN_DIM as u32,
-                            GDN_SCAN_SMEM as u32,
+                            gdn_scan_smem(split) as u32,
                             &[
                                 args.as_slice(),
                                 &a.fp8_args(|f| &f.core, t),
@@ -1782,7 +1788,7 @@ impl Model {
                         )?;
                         gpu.launch(
                             k.gdn_norm,
-                            ((t * hv * 32).div_ceil(256) as u32, 1, 1),
+                            (t as u32, 1, 1),
                             256,
                             0,
                             &[

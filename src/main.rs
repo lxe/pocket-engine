@@ -501,12 +501,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let prep = gpu.kernel("gdn_prep")?;
             gpu.set_smem(prep, pocket_engine::model::GDN_PREP_SMEM)?;
             let kscan = gpu.kernel(&format!("gdn_scan{split}"))?;
-            gpu.set_smem(kscan, pocket_engine::model::GDN_SCAN_SMEM)?;
+            gpu.set_smem(kscan, pocket_engine::model::gdn_scan_smem(split))?;
             let scratch = [
                 gpu.alloc(t * hv * d * 2)?,
                 gpu.alloc(t * hv * d * 2)?,
-                gpu.alloc(t * hv * d * 2)?,
-                gpu.alloc(t * hv * d * 2)?,
+                gpu.alloc(t * hv * 4)?,
+                gpu.alloc(t * hv * 4)?,
                 gpu.alloc(t * hv * 32 * 2)?,
                 gpu.alloc(t * hv * 4)?,
             ];
@@ -545,7 +545,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let (kern, smem, z) = match name {
                         "chunk" => (
                             kscan,
-                            pocket_engine::model::GDN_SCAN_SMEM as u32,
+                            pocket_engine::model::gdn_scan_smem(split) as u32,
                             split as u32,
                         ),
                         _ => (gpu.kernel("gdn_recurrent")?, 0, 1),
@@ -592,7 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if name != "decode" && phases & 4 != 0 {
                     gpu.launch(
                         norm,
-                        ((t * hv * 32).div_ceil(256) as u32, 1, 1),
+                        (t as u32, 1, 1),
                         256,
                         0,
                         &[

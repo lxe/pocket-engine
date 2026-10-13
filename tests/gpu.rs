@@ -479,10 +479,13 @@ fn prefix_cache_reuses_without_changing_output() {
     cached.score(vec![scoring(&first, &vec![cont[0]])]).unwrap();
     let got = cached.score(vec![scoring(&second, &cont)]).unwrap();
     assert!(cached.sched.counters.cached_tokens >= pocket_engine::sched::CACHE_UNIT as u64);
+    // Both runs are this engine; the chunked recurrence's bf16 roundings
+    // fall on different chunk boundaries in each, so the bar is looser than
+    // the one against Transformers.
     if fp8() || fp4() || kv_fp8() {
         close_enough(&reference, &got, 90, 0.03);
     } else {
-        assert!(agree(&reference, &got) < 0.01);
+        assert!(agree(&reference, &got) < 0.02);
     }
 }
 

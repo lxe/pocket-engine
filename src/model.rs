@@ -36,11 +36,41 @@ fn split_ranges(t: usize, hkv: usize, sms: usize) -> usize {
 /// tiles. Hopper's 227 KB take larger key tiles, and two query tiles for
 /// groups of 6 (bench-attn on an H100: groups of 4 from 123 to 158 TFLOPS,
 /// of 6 from 97 to 168).
-pub fn fa_shape(g: usize, arch: u32) -> (usize, usize) {
-    match (arch, g) {
+pub fn fa_shape(g: usize, arch: u32) -> FaShape {
+    let (tiles, keys) = match (arch, g) {
         (90, 4) => (2, 64),
         (90, 6) => (2, 32),
         _ => (if g == 6 { 1 } else { 8 / g }, 16),
+    };
+    FaShape { tiles, keys }
+}
+
+/// A flash kernel's shape: query tiles of 16 tokens per block and keys per
+/// tile.
+#[derive(Clone, Copy, Debug)]
+pub struct FaShape {
+    pub tiles: usize,
+    pub keys: usize,
+}
+
+impl FaShape {
+    /// Parses "NT,BN".
+    pub fn parse(v: &str) -> Option<Self> {
+        let (a, b) = v.split_once(',')?;
+        Some(Self {
+            tiles: a.parse().ok()?,
+            keys: b.parse().ok()?,
+        })
+    }
+    /// The kernel: attn_group_g<G>_t<NT>_k<BN>, attn_group8_ for an E4M3 cache.
+    pub fn kernel(&self, g: usize, fp8: bool) -> String {
+        let f = if fp8 { "8" } else { "" };
+        format!("attn_group{f}_g{g}_t{}_k{}", self.tiles, self.keys)
+    }
+    /// Its dynamic shared memory (fg_smem in qwen35.cu): the tiles' queries
+    /// for each of G heads and two buffers of BN keys and values.
+    pub fn smem(&self, g: usize) -> usize {
+        (g * 16 * self.tiles + 4 * self.keys) * (HEAD_DIM + 8) * 2
     }
 }
 /// Dynamic shared memory of attn_wg_g<G> (WG_SMEM in qwen35.cu): two
@@ -51,11 +81,7 @@ pub const WG_SMEM: usize = 6 * 64 * HEAD_DIM * 2;
 pub fn fa_wgmma(g: usize, arch: u32, kv_fp8: bool) -> bool {
     arch == 90 && !kv_fp8 && matches!(g, 4 | 6)
 }
-/// Dynamic shared memory of that kernel (fg_smem): the tiles' queries for
-/// each of G heads and two buffers of BN keys and values.
-pub fn fa_smem(g: usize, tiles: usize, keys: usize) -> usize {
-    (g * 16 * tiles + 4 * keys) * (HEAD_DIM + 8) * 2
-}
+
 /// Dynamic shared memory of the two-pass chunked gated delta rule
 /// (GDN_PREP_SMEM and GDN_SCAN_SMEM in qwen35.cu).
 pub const GDN_PREP_SMEM: usize = 2 * 32 * 136 * 2 + 32 * 260 * 4 + 32 * 33 * 4 + 3 * 32 * 4;
@@ -396,7 +422,7 @@ struct Kernels {
     /// with query tiles per block and keys per tile.
     attn_flash: Kernel,
     attn_flash8: Kernel,
-    fa_shape: (usize, usize),
+    fa_shape: FaShape,
     /// On Hopper: flash attention on wgmma, for a bf16 cache.
     attn_wg: Option<Kernel>,
     /// FP8 copies of bf16 rows (the flash kernel's output, for FP8 layers).
@@ -663,16 +689,16 @@ impl Model {
             attn8: gpu.kernel(&format!("attn_paged8_g{}", cfg.hq / cfg.hkv))?,
             attn_flash: {
                 let g = cfg.hq / cfg.hkv;
-                let (nt, bn) = fa_shape(g, gpu.arch);
-                let k = gpu.kernel(&format!("attn_group_g{g}_t{nt}_k{bn}"))?;
-                gpu.set_smem(k, fa_smem(g, nt, bn))?;
+                let sh = fa_shape(g, gpu.arch);
+                let k = gpu.kernel(&sh.kernel(g, false))?;
+                gpu.set_smem(k, sh.smem(g))?;
                 k
             },
             attn_flash8: {
                 let g = cfg.hq / cfg.hkv;
-                let (nt, bn) = fa_shape(g, gpu.arch);
-                let k = gpu.kernel(&format!("attn_group8_g{g}_t{nt}_k{bn}"))?;
-                gpu.set_smem(k, fa_smem(g, nt, bn))?;
+                let sh = fa_shape(g, gpu.arch);
+                let k = gpu.kernel(&sh.kernel(g, true))?;
+                gpu.set_smem(k, sh.smem(g))?;
                 k
             },
             fa_shape: fa_shape(cfg.hq / cfg.hkv, gpu.arch),
@@ -1878,7 +1904,7 @@ impl Model {
                         // Prompt sequences: flash attention, a block per KV
                         // head and 16 queries per tile.
                         let group = c.hq / c.hkv;
-                        let (tiles, keys) = k.fa_shape;
+                        let sh = k.fa_shape;
                         let (kern, grid, threads, smem) = match k.attn_wg {
                             Some(wg) if !st.kv_fp8 => (
                                 wg,
@@ -1896,9 +1922,9 @@ impl Model {
                                 } else {
                                     k.attn_flash
                                 },
-                                ((t.div_ceil(16 * tiles) + s) as u32, c.hkv as u32, 1),
-                                (32 * group * tiles) as u32,
-                                fa_smem(group, tiles, keys),
+                                ((t.div_ceil(16 * sh.tiles) + s) as u32, c.hkv as u32, 1),
+                                (32 * group * sh.tiles) as u32,
+                                sh.smem(group),
                             ),
                         };
                         gpu.launch(

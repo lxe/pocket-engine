@@ -725,11 +725,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cu = gpu.upload(&i32s((0..=seqs).map(|i| (i * tokens) as i32).collect()))?;
             let out = gpu.alloc_zeroed(t * hq * D * 2)?;
             let scale = 1.0 / (D as f32).sqrt();
-            let (tiles, keys) = match shape.as_deref().and_then(|v| v.split_once(',')) {
-                Some((a, b)) => (a.parse()?, b.parse()?),
+            let sh = match shape.as_deref() {
+                Some(v) => pocket_engine::model::FaShape::parse(v).ok_or("--shape takes NT,BN")?,
                 None => pocket_engine::model::fa_shape(group, gpu.arch),
             };
-            let smem = pocket_engine::model::fa_smem(group, tiles, keys);
+            let (tiles, smem) = (sh.tiles, sh.smem(group));
             let (name, grid, threads, smem) = if wg {
                 (
                     format!("attn_wg_g{group}"),
@@ -743,7 +743,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             } else {
                 (
-                    format!("attn_group_g{group}_t{tiles}_k{keys}"),
+                    sh.kernel(group, false),
                     ((t.div_ceil(16 * tiles) + seqs) as u32, hkv as u32, 1),
                     (32 * group * tiles) as u32,
                     smem,

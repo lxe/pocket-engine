@@ -1138,6 +1138,12 @@ ATTN_KERNEL(8, 4)
 // as attn_body gates it. Blocks walk the step's prompt sequences (those with
 // more than one token) in tiles of 16; others exit.
 #define FA_STR (HEAD_DIM + 8)
+#define LOG2E 1.4426950408889634f
+__device__ __forceinline__ float fast_exp2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
 __device__ __forceinline__ uint32_t fa_bf2(float lo, float hi) {
     __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
     return *reinterpret_cast<uint32_t*>(&v);
@@ -1203,7 +1209,7 @@ __device__ __forceinline__ void attn_flash_group(
             float f[8];
             unpack8(*reinterpret_cast<const uint4*>(q + ((size_t)(tb + tq) * Hq + kvh * G + hw) * HEAD_DIM + c), f);
 #pragma unroll
-            for (int i = 0; i < 8; i++) f[i] *= scale;
+            for (int i = 0; i < 8; i++) f[i] *= scale * LOG2E;  // scores in log2 units
             v = pack8(f);
         }
         *reinterpret_cast<uint4*>(sQ + row * FA_STR + c) = v;
@@ -1245,24 +1251,11 @@ __device__ __forceinline__ void attn_flash_group(
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
     const bf16* myQ = sQ + warp * 16 * FA_STR;
     const int last = p0 + n - 1;  // this warp's last query position
-    load(0, 0);
-    int buf = 0;
-    for (int k0 = 0; k0 < L; k0 += BN, buf ^= 1) {
-        if (k0 + BN < L) {
-            load(k0 + BN, buf ^ 1);
-            cp_async_wait1();
-        } else {
-            cp_async_wait0();
-        }
-        __syncthreads();
-        const bf16* cK = sK + buf * BN * FA_STR;
-        const bf16* cV = sV + buf * BN * FA_STR;
-        if (k0 > last) {
-            // Keys past all of this warp's queries: nothing to add.
-            __syncthreads();
-            continue;
-        }
-        float sc[BN / 8][4];
+    float sc[BN / 8][4];
+    float c0 = 1.f, c1 = 1.f;
+    // Scores of the tile from k0, masked, and the online softmax into sc;
+    // c0, c1 are the factors the outputs so far take.
+    auto scores = [&](const bf16* cK, int k0) {
 #pragma unroll
         for (int nt = 0; nt < BN / 8; nt++) sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.f;
 #pragma unroll
@@ -1277,33 +1270,42 @@ __device__ __forceinline__ void attn_flash_group(
                 gmma(sc[2 * np + 1], a, b[2], b[3]);
             }
         }
+        // Only tiles reaching past the first query or the context's end need
+        // the mask.
+        if (k0 + BN - 1 > p0 || k0 + BN > L) {
+#pragma unroll
+            for (int nt = 0; nt < BN / 8; nt++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int kp = k0 + nt * 8 + 2 * t4 + (e & 1);
+                    const int qp = p0 + g + (e < 2 ? 0 : 8);
+                    if (kp > qp || kp >= L) sc[nt][e] = -INFINITY;
+                }
+        }
         float mx0 = m0, mx1 = m1;
 #pragma unroll
-        for (int nt = 0; nt < BN / 8; nt++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int kp = k0 + nt * 8 + 2 * t4 + (e & 1);
-                const int qp = p0 + g + (e < 2 ? 0 : 8);
-                if (kp > qp || kp >= L) sc[nt][e] = -INFINITY;
-                if (e < 2) mx0 = fmaxf(mx0, sc[nt][e]);
-                else mx1 = fmaxf(mx1, sc[nt][e]);
-            }
+        for (int nt = 0; nt < BN / 8; nt++) {
+            mx0 = fmaxf(mx0, fmaxf(sc[nt][0], sc[nt][1]));
+            mx1 = fmaxf(mx1, fmaxf(sc[nt][2], sc[nt][3]));
+        }
         mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
         mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
-        const float c0 = mx0 == -INFINITY ? 1.f : expf(m0 - mx0), c1 = mx1 == -INFINITY ? 1.f : expf(m1 - mx1);
+        // A row with no key yet keeps -inf; it subtracts 0 so exp2 gives 0.
+        const float b0 = mx0 == -INFINITY ? 0.f : mx0, b1 = mx1 == -INFINITY ? 0.f : mx1;
+        c0 = fast_exp2(m0 - b0);
+        c1 = fast_exp2(m1 - b1);
         float s0 = 0.f, s1 = 0.f;
 #pragma unroll
-        for (int nt = 0; nt < BN / 8; nt++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const float mm = e < 2 ? mx0 : mx1;
-                const float pr = sc[nt][e] == -INFINITY ? 0.f : expf(sc[nt][e] - mm);
-                sc[nt][e] = pr;
-                if (e < 2) s0 += pr;
-                else s1 += pr;
-            }
+        for (int nt = 0; nt < BN / 8; nt++) {
+            sc[nt][0] = fast_exp2(sc[nt][0] - b0);
+            sc[nt][1] = fast_exp2(sc[nt][1] - b0);
+            sc[nt][2] = fast_exp2(sc[nt][2] - b1);
+            sc[nt][3] = fast_exp2(sc[nt][3] - b1);
+            s0 += sc[nt][0] + sc[nt][1];
+            s1 += sc[nt][2] + sc[nt][3];
+        }
         s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
         s0 += __shfl_xor_sync(0xffffffffu, s0, 2);
         s1 += __shfl_xor_sync(0xffffffffu, s1, 1);
@@ -1312,6 +1314,9 @@ __device__ __forceinline__ void attn_flash_group(
         l1 = l1 * c1 + s1;
         m0 = mx0;
         m1 = mx1;
+    };
+    // The outputs rescaled, plus P V.
+    auto values = [&](const bf16* cV) {
 #pragma unroll
         for (int nt = 0; nt < HEAD_DIM / 8; nt++) {
             o[nt][0] *= c0;
@@ -1331,6 +1336,22 @@ __device__ __forceinline__ void attn_flash_group(
                 gmma(o[2 * np], a, b[0], b[1]);
                 gmma(o[2 * np + 1], a, b[2], b[3]);
             }
+        }
+    };
+    load(0, 0);
+    int buf = 0;
+    for (int k0 = 0; k0 < L; k0 += BN, buf ^= 1) {
+        if (k0 + BN < L) {
+            load(k0 + BN, buf ^ 1);
+            cp_async_wait1();
+        } else {
+            cp_async_wait0();
+        }
+        __syncthreads();
+        if (k0 <= last) {
+            // Keys past all of this warp's queries add nothing.
+            scores(sK + buf * BN * FA_STR, k0);
+            values(sV + buf * BN * FA_STR);
         }
         __syncthreads();  // this buffer is refilled two tiles on
     }
@@ -1360,10 +1381,10 @@ __device__ __forceinline__ void attn_flash_group(
 // shared memory the device allows.
 #define ATTN_GROUP_V(G, NT, BN)                                                                                \
     extern "C" __global__ void __launch_bounds__(G * 32 * NT) attn_group_g##G##_t##NT##_k##BN(ATTN_FLASH_ARGS) {  \
-        attn_flash_group<G, false, NT, BN>(ATTN_FLASH_PASS);                                                   \
+        attn_flash_group<G, false, NT, BN>(ATTN_FLASH_PASS);                                            \
     }                                                                                                          \
     extern "C" __global__ void __launch_bounds__(G * 32 * NT) attn_group8_g##G##_t##NT##_k##BN(ATTN_FLASH_ARGS) { \
-        attn_flash_group<G, true, NT, BN>(ATTN_FLASH_PASS);                                                    \
+        attn_flash_group<G, true, NT, BN>(ATTN_FLASH_PASS);                                             \
     }
 // Up to 99 KB (RTX 50-series): 8 warps of queries and 16-key tiles.
 ATTN_GROUP_V(1, 8, 16)
@@ -1470,7 +1491,7 @@ __device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
                         q + ((size_t)(tb + r) * Hq + kvh * G + 2 * blockIdx.z + hw) * HEAD_DIM + c * 8),
                     f);
 #pragma unroll
-            for (int i = 0; i < 8; i++) f[i] *= scale;
+            for (int i = 0; i < 8; i++) f[i] *= scale * LOG2E;  // scores in log2 units
             v = pack8(f);
         }
         *reinterpret_cast<uint4*>(sQ + hw * WG_TILE + wg_off(r, c)) = v;
@@ -1521,32 +1542,37 @@ __device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
     auto softmax = [&](int k, auto par, float& c0, float& c1) {
         constexpr int P = decltype(par)::value;
         const int k0 = 64 * k;
+        // Only tiles reaching past the block's first query or the context's
+        // end need the mask.
+        if (k0 + 63 > p0 || k0 + 64 > L) {
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int kp = k0 + 8 * j + 2 * (lane & 3) + (e & 1);
+                    if (kp > (e < 2 ? q0 : q1) || kp >= L) sc[4 * j + e] = -INFINITY;
+                }
+        }
         float mx0 = m0, mx1 = m1;
 #pragma unroll
-        for (int j = 0; j < 8; j++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int kp = k0 + 8 * j + 2 * (lane & 3) + (e & 1);
-                const int qp = e < 2 ? q0 : q1;
-                float& x = sc[4 * j + e];
-                if (kp > qp || kp >= L) x = -INFINITY;
-                if (e < 2) mx0 = fmaxf(mx0, x);
-                else mx1 = fmaxf(mx1, x);
-            }
+        for (int j = 0; j < 8; j++) {
+            mx0 = fmaxf(mx0, fmaxf(sc[4 * j], sc[4 * j + 1]));
+            mx1 = fmaxf(mx1, fmaxf(sc[4 * j + 2], sc[4 * j + 3]));
+        }
         mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
         mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
-        c0 = mx0 == -INFINITY ? 1.f : expf(m0 - mx0);
-        c1 = mx1 == -INFINITY ? 1.f : expf(m1 - mx1);
+        // A row with no key yet keeps -inf; it subtracts 0 so exp2 gives 0.
+        const float b0 = mx0 == -INFINITY ? 0.f : mx0, b1 = mx1 == -INFINITY ? 0.f : mx1;
+        c0 = fast_exp2(m0 - b0);
+        c1 = fast_exp2(m1 - b1);
         float s0 = 0.f, s1 = 0.f;
 #pragma unroll
         for (int i = 0; i < 32; i++) {
-            const float mm = (i & 2) ? mx1 : mx0;
-            const float pr = sc[i] == -INFINITY ? 0.f : expf(sc[i] - mm);
-            sc[i] = pr;
-            if (i & 2) s1 += pr;
-            else s0 += pr;
+            sc[i] = fast_exp2(sc[i] - ((i & 2) ? b1 : b0));
+            if (i & 2) s1 += sc[i];
+            else s0 += sc[i];
         }
         s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
         s0 += __shfl_xor_sync(0xffffffffu, s0, 2);

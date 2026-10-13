@@ -2,6 +2,24 @@
 
 An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine. It is ready 5 seconds after launch, and a 27B model reaches serving in about 2 seconds from the page cache ([design and measurements](docs/design.md); [against vLLM and llama.cpp on an H100](docs/h100-comparison.md)).
 
+## Performance
+
+Output tokens per second with 64 requests in flight on one H100, from `scripts/load.py` (streamed chat, prompts of 60 to 200 tokens, 16 to 64 output tokens). vLLM 0.31.0 runs with its prefix cache off, and llama.cpp with its prompt cache off; [the comparison](docs/h100-comparison.md) has both settings, every load from 1 to 64, startup times and the method.
+
+| Model | Format | pocket-engine | vLLM | llama.cpp |
+|---|---|---:|---:|---:|
+| Qwen3.5-0.8B | bf16 | **9,114** | 6,057 | 752 |
+| Qwen3.5-2B | bf16 | **7,530** | 5,172 | 656 |
+| Qwen3.5-4B | bf16 | **3,736** | 3,291 | 471 |
+| Qwen3.5-9B | bf16 | **3,133** | 2,921 | 390 |
+| Qwen3.8-27B | bf16 | 924 | **1,092** | 158 |
+| Qwen3.5-9B | FP8 | **3,523** | 3,460 | — |
+| Qwen3.8-27B | FP8 | 1,150 | **1,299** | — |
+| Qwen3.5-9B | Q4_K_M | **2,315** | does not load | 395 |
+| Qwen3.8-27B | Q4_K_M | **675** | does not load | 156 |
+
+pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170.
+
 ## Supported
 
 | | |

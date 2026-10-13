@@ -33,13 +33,13 @@ fn split_ranges(t: usize, hkv: usize, sms: usize) -> usize {
 /// compute capability `arch`: query tiles of 16 tokens per block and keys
 /// per tile, naming the kernel attn_group_g<G>_t<NT>_k<BN> (qwen35.cu). Up
 /// to 99 KB of shared memory (RTX 50-series): 8 warps of queries and 16-key
-/// tiles. Hopper's 227 KB take larger key tiles, and two query tiles for
-/// groups of 6 (bench-attn on an H100: groups of 4 from 123 to 158 TFLOPS,
-/// of 6 from 97 to 168).
+/// tiles. The 227 KB of Hopper and datacenter Blackwell (B200, B300) take
+/// larger key tiles, and two query tiles for groups of 6 (bench-attn on an
+/// H100: groups of 4 from 123 to 158 TFLOPS, of 6 from 97 to 168).
 pub fn fa_shape(g: usize, arch: u32) -> FaShape {
     let (tiles, keys) = match (arch, g) {
-        (90, 4) => (2, 64),
-        (90, 6) => (2, 32),
+        (90 | 100 | 103, 4) => (2, 64),
+        (90 | 100 | 103, 6) => (2, 32),
         _ => (if g == 6 { 1 } else { 8 / g }, 16),
     };
     FaShape { tiles, keys }

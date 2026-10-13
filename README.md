@@ -128,16 +128,17 @@ POCKET_ENGINE_MODEL=models/qwen3.5-2b \
   CUDA_COMPUTE_CAP=120a cargo test --release --features cuda
 ```
 
-With a model set, `tests/gpu.rs` runs six checks against it. The model can be Qwen3.5 0.8B, 2B, 4B or 9B or Qwen3.8-27B, as a directory or a GGUF file. `POCKET_ENGINE_FP8=1` runs the suite with `--fp8`, `POCKET_ENGINE_FP4=1` with `--fp4`, `POCKET_ENGINE_KV_FP8=1` with `--kv-fp8` and `POCKET_ENGINE_STATE_F32=1` with `--state-f32`:
+With a model set, `tests/gpu.rs` runs seven checks against it. The model can be Qwen3.5 0.8B, 2B, 4B or 9B or Qwen3.8-27B, as a directory or a GGUF file. `POCKET_ENGINE_FP8=1` runs the suite with `--fp8`, `POCKET_ENGINE_FP4=1` with `--fp4`, `POCKET_ENGINE_KV_FP8=1` with `--kv-fp8` and `POCKET_ENGINE_STATE_F32=1` with `--state-f32`:
 
 - its predictions match stored Transformers reference outputs;
 - image prompts tokenize exactly as Transformers' processor does, and their predictions match too;
-- batching does not change greedy output;
+- batching does not change predictions beyond rounding: the same tokens scored alone and among other requests agree except at near ties;
+- a prompt extending a cached one gives exactly the output it gives without the prefix cache;
 - the samplers keep exactly the right tokens and draw them in proportion to the model's probabilities;
 - penalties cut repetition;
 - the HTTP API streams and reports usage correctly.
 
-Quantized weights are held to looser bars on the accuracy checks. For GGUF, 85% of picks agree with bf16 Transformers and the median log-probability difference stays under 0.1; the image check is skipped. For FP8, 93% agree with a median under 0.03, and 95% with a median under 0.01 on images; FP4 takes the GGUF bar, and 90% with a median under 0.05 on images. FP8's batching check compares the same request scored alone and among others (90%, median under 0.03) rather than requiring identical greedy text: GEMM kernels differ by batch size in the last bit, and rounding activations to FP8 magnifies that about as much as FP8's own error.
+Quantized weights are held to looser bars on the accuracy checks. For GGUF, 85% of picks agree with bf16 Transformers and the median log-probability difference stays under 0.1; the image check is skipped. For FP8, 93% agree with a median under 0.03, and 95% with a median under 0.01 on images; FP4 takes the GGUF bar, and 90% with a median under 0.05 on images. An FP8 KV cache takes the FP8 bar too. The batching check allows rounding because GEMM kernels differ by batch size in the last bit; with FP8 or FP4 activations or an FP8 KV cache, which magnify that about as much as their own error, it takes 90% with a median under 0.03.
 
 To check a model or prompt that isn't in the fixtures, `scripts/accuracy.py` makes new reference data with Transformers:
 

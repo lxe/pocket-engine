@@ -34,6 +34,8 @@ pub struct Config {
     pub eos: Vec<u32>,
     /// The image placeholder token.
     pub image_token: u32,
+    /// The token that opens a chat message (<|im_start|>).
+    pub turn_token: u32,
     /// Rotary frequencies per axis (time, height, width), interleaved.
     pub mrope_section: [usize; 3],
     /// Linear-attention value heads in GGUF's tiled order (see Source).
@@ -84,6 +86,7 @@ impl Config {
             // <|endoftext|> and <|im_end|>: chat turns end with the latter.
             eos: vec![t["eos_token_id"].as_u64().unwrap_or(248044) as u32, 248046],
             image_token: raw["image_token_id"].as_u64().unwrap_or(248056) as u32,
+            turn_token: 248045,
             mrope_section: match rope["mrope_section"].as_array() {
                 Some(a) if a.len() == 3 => {
                     let v: Vec<usize> =
@@ -213,6 +216,7 @@ impl Config {
             attn_layers: (0..layers).map(|i| (i + 1) % every == 0).collect(),
             eos,
             image_token: find("<|image_pad|>").unwrap_or(248056),
+            turn_token: find("<|im_start|>").unwrap_or(248045),
             mrope_section: if sections.len() >= 3 {
                 [sections[0], sections[1], sections[2]]
             } else {
@@ -547,6 +551,9 @@ pub struct State {
     pub state_bf16: bool,
     pub slots: usize,
     pub blocks: usize,
+    /// Bytes of one slot in each layer's convolution and recurrent buffers.
+    conv_slot: usize,
+    rec_slot: usize,
 }
 
 impl State {
@@ -574,6 +581,8 @@ impl State {
             state_bf16,
             slots,
             blocks,
+            conv_slot: conv_bytes / slots,
+            rec_slot: rec_bytes / slots,
         };
         for _ in 0..cfg.gdn_layers() {
             s.conv.push(gpu.alloc_zeroed(conv_bytes)?);
@@ -588,6 +597,17 @@ impl State {
             }
         }
         Ok(s)
+    }
+
+    /// Copies slot `from`'s recurrent and convolution state to slot `to`,
+    /// ordered on the stream.
+    pub fn copy_slot(&self, gpu: &Gpu, from: usize, to: usize) -> Result<()> {
+        for (bufs, n) in [(&self.conv, self.conv_slot), (&self.rec, self.rec_slot)] {
+            for b in bufs {
+                gpu.dtod(b.ptr + (to * n) as u64, b.ptr + (from * n) as u64, n)?;
+            }
+        }
+        Ok(())
     }
 
     /// Scale pointers of an attention layer's cache, 0 for a bf16 cache.

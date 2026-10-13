@@ -131,6 +131,9 @@ pub struct Seq {
     pool: Option<(usize, usize)>,
     image_rows: Vec<i32>,
     vision_pending: bool,
+    /// Prefix-cache boundaries to snapshot this sequence's state at, in
+    /// increasing order.
+    snap_at: Vec<usize>,
 }
 
 impl Seq {
@@ -207,6 +210,9 @@ impl<'a> Pen<'a> {
 pub struct Step {
     rows: Vec<(usize, usize)>,
     pub tokens: usize,
+    /// State slot copies (from, to) to make, in order, before the step runs:
+    /// prefix-cache snapshots and restores.
+    pub copies: Vec<(usize, usize)>,
 }
 
 impl Step {
@@ -223,6 +229,47 @@ pub struct Counters {
     pub steps: u64,
     pub decode_tokens: u64,
     pub prompt_tokens: u64,
+    /// Prompt tokens served from the prefix cache instead of computed.
+    pub cached_tokens: u64,
+}
+
+/// Prompt tokens per prefix-cache unit: entries cover whole units, a
+/// multiple of the KV block.
+pub const CACHE_UNIT: usize = 64;
+
+/// A cached prompt prefix: its tokens, the KV blocks that hold their keys
+/// and values, and a state slot holding the recurrent state after them.
+struct Entry {
+    tokens: Vec<u32>,
+    blocks: Vec<u32>,
+    snap: usize,
+    used: u64,
+}
+
+/// Prefix cache: entries by the chained hash of their units.
+#[derive(Default)]
+struct Prefixes {
+    entries: HashMap<u64, Entry>,
+    free_snaps: Vec<usize>,
+    clock: u64,
+    /// The token that opens a chat message.
+    turn: u32,
+}
+
+/// Chained hashes of a prompt's whole units: element k covers tokens
+/// [0, (k + 1) * CACHE_UNIT).
+fn unit_hashes(tokens: &[u32]) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut out = Vec::with_capacity(tokens.len() / CACHE_UNIT);
+    let mut h = 0u64;
+    for unit in tokens.as_chunks::<CACHE_UNIT>().0 {
+        let mut st = std::collections::hash_map::DefaultHasher::new();
+        h.hash(&mut st);
+        unit.hash(&mut st);
+        h = st.finish();
+        out.push(h);
+    }
+    out
 }
 
 pub struct Scheduler {
@@ -233,7 +280,13 @@ pub struct Scheduler {
     max_context: usize,
     free_slots: Vec<usize>,
     free_blocks: Vec<u32>,
+    /// References to each KV block, from sequences and cache entries; a block
+    /// is free at zero.
+    block_refs: Vec<u16>,
     total_blocks: usize,
+    prefixes: Prefixes,
+    /// State copies for the next step (see Step::copies).
+    pending_copies: Vec<(usize, usize)>,
     waiting: VecDeque<Seq>,
     running: Vec<Seq>,
     eos: Vec<u32>,
@@ -277,12 +330,26 @@ impl Scheduler {
             max_context,
             free_slots: (0..meta.max_seqs).rev().collect(),
             free_blocks: (0..blocks as u32).rev().collect(),
+            block_refs: vec![0; blocks],
             total_blocks: blocks,
+            prefixes: Prefixes::default(),
+            pending_copies: Vec::new(),
             waiting: VecDeque::new(),
             running: Vec::new(),
             eos,
             counters: Counters::default(),
         }
+    }
+
+    /// Keeps prompt prefixes for reuse, with state snapshots in `slots`
+    /// (state slots no sequence uses). A prompt leaves up to two: at its last
+    /// whole unit, for a conversation's next turn, and at the unit before its
+    /// last message (opened by `turn`), for prompts that share everything
+    /// before it, such as a system prompt.
+    pub fn with_prefix_cache(mut self, slots: std::ops::Range<usize>, turn: u32) -> Self {
+        self.prefixes.free_snaps = slots.rev().collect();
+        self.prefixes.turn = turn;
+        self
     }
 
     pub fn load(&self) -> Load {
@@ -351,6 +418,7 @@ impl Scheduler {
             pool: None,
             image_rows: Vec::new(),
             vision_pending: false,
+            snap_at: Vec::new(),
         });
     }
 
@@ -359,8 +427,39 @@ impl Scheduler {
             let Some(seq) = self.waiting.front() else {
                 break;
             };
-            let need = (seq.req.prompt.len() + seq.req.max_new).div_ceil(BLOCK_SIZE);
+            let total_blocks = (seq.req.prompt.len() + seq.req.max_new).div_ceil(BLOCK_SIZE);
             let rows: usize = seq.req.images.iter().map(Image::tokens).sum();
+            // Plain text prompts may reuse and leave cached prefixes; images
+            // and teacher-forced scoring do not.
+            let cacheable = rows == 0
+                && seq.forced.is_none()
+                && (!self.prefixes.free_snaps.is_empty() || !self.prefixes.entries.is_empty());
+            let hit = if cacheable {
+                self.lookup(&seq.req.prompt)
+            } else {
+                None
+            };
+            let reused = hit.map_or(0, |(_, len)| len / BLOCK_SIZE);
+            let need = total_blocks - reused;
+            // Cache entries give way to new requests, oldest first (but not
+            // the one this request is about to use).
+            while self.free_blocks.len() < need
+                && self.prefixes.entries.len() > hit.is_some() as usize
+            {
+                let keep = hit.map(|(h, _)| h);
+                let Some((&h, _)) = self
+                    .prefixes
+                    .entries
+                    .iter()
+                    .filter(|(h, _)| Some(**h) != keep)
+                    .min_by_key(|(_, e)| e.used)
+                else {
+                    break;
+                };
+                let e = self.prefixes.entries.remove(&h).expect("present");
+                self.unref_blocks(&e.blocks);
+                self.prefixes.free_snaps.push(e.snap);
+            }
             let pool_at = if rows > 0 {
                 self.pool_free.iter().position(|r| r.1 >= rows)
             } else {
@@ -398,7 +497,36 @@ impl Scheduler {
                     .collect();
             }
             seq.slot = self.free_slots.pop().expect("slot available");
-            seq.blocks = self.free_blocks.split_off(self.free_blocks.len() - need);
+            seq.blocks = Vec::with_capacity(total_blocks);
+            if let Some((h, len)) = hit {
+                self.prefixes.clock += 1;
+                let e = self.prefixes.entries.get_mut(&h).expect("looked up");
+                e.used = self.prefixes.clock;
+                for &b in &e.blocks {
+                    self.block_refs[b as usize] += 1;
+                }
+                seq.blocks.extend_from_slice(&e.blocks);
+                self.pending_copies.push((e.snap, seq.slot));
+                seq.fed = len;
+                self.counters.cached_tokens += len as u64;
+            }
+            let own = self.take_blocks(need);
+            seq.blocks.extend(own);
+            if cacheable {
+                // Leave prefixes for later requests: before the last message
+                // and the longest whole-unit prefix short of the last token.
+                let p = &seq.req.prompt;
+                let last = (p.len() - 1) / CACHE_UNIT * CACHE_UNIT;
+                let turn = p
+                    .iter()
+                    .rposition(|&t| t == self.prefixes.turn)
+                    .map_or(0, |i| i / CACHE_UNIT * CACHE_UNIT);
+                for at in [turn, last] {
+                    if at > seq.fed && seq.snap_at.last().is_none_or(|&l| l < at) {
+                        seq.snap_at.push(at);
+                    }
+                }
+            }
             seq.admitted = Instant::now();
             if seq.req.sampling.repetition_penalty != 1.0 {
                 seq.prompt_tokens = seq.req.prompt.iter().copied().collect();
@@ -407,9 +535,53 @@ impl Scheduler {
         }
     }
 
+    fn take_blocks(&mut self, n: usize) -> Vec<u32> {
+        let blocks = self.free_blocks.split_off(self.free_blocks.len() - n);
+        for &b in &blocks {
+            self.block_refs[b as usize] = 1;
+        }
+        blocks
+    }
+
+    fn unref_blocks(&mut self, blocks: &[u32]) {
+        for &b in blocks {
+            let r = &mut self.block_refs[b as usize];
+            *r -= 1;
+            if *r == 0 {
+                self.free_blocks.push(b);
+            }
+        }
+    }
+
+    /// Frees the least recently used cache entry; false when there is none.
+    fn evict_one(&mut self) -> bool {
+        let Some((&h, _)) = self.prefixes.entries.iter().min_by_key(|(_, e)| e.used) else {
+            return false;
+        };
+        let e = self.prefixes.entries.remove(&h).expect("present");
+        self.unref_blocks(&e.blocks);
+        self.prefixes.free_snaps.push(e.snap);
+        true
+    }
+
+    /// The longest cached prefix of `prompt` that leaves at least one token to
+    /// compute: its hash and length.
+    fn lookup(&self, prompt: &[u32]) -> Option<(u64, usize)> {
+        let hashes = unit_hashes(&prompt[..prompt.len() - 1]);
+        hashes.iter().enumerate().rev().find_map(|(k, h)| {
+            let len = (k + 1) * CACHE_UNIT;
+            self.prefixes
+                .entries
+                .get(h)
+                .filter(|e| e.tokens[..] == prompt[..len])
+                .map(|_| (*h, len))
+        })
+    }
+
     fn release(&mut self, mut seq: Seq) -> Seq {
         self.free_slots.push(seq.slot);
-        self.free_blocks.extend_from_slice(&seq.blocks);
+        let blocks = std::mem::take(&mut seq.blocks);
+        self.unref_blocks(&blocks);
         self.release_pool(&mut seq);
         seq
     }
@@ -473,7 +645,11 @@ impl Scheduler {
         let mut budget = self.meta.max_tokens;
         let mut step = Step::default();
         for (i, s) in self.running.iter().enumerate() {
-            let n = (s.total() - s.fed).min(budget);
+            let mut n = (s.total() - s.fed).min(budget);
+            if let Some(&at) = s.snap_at.first() {
+                // Stop the chunk at the boundary, so the state can be kept.
+                n = n.min(at - s.fed);
+            }
             if n == 0 {
                 break;
             }
@@ -481,6 +657,7 @@ impl Scheduler {
             step.tokens += n;
             step.rows.push((i, n));
         }
+        step.copies = std::mem::take(&mut self.pending_copies);
         Some(step)
     }
 
@@ -600,6 +777,11 @@ impl Scheduler {
                 self.counters.decode_tokens += n as u64;
             }
             s.fed += n;
+            if s.snap_at.first() == Some(&s.fed) {
+                s.snap_at.remove(0);
+                self.keep_prefix(ri);
+            }
+            let s = &mut self.running[ri];
             // Image embeddings are read only by the prompt's own steps.
             if s.fed >= s.req.prompt.len()
                 && let Some(range) = s.pool.take()
@@ -644,6 +826,42 @@ impl Scheduler {
                 self.release(s)
             })
             .collect()
+    }
+
+    /// Makes running sequence `ri`'s fed prompt prefix a cache entry: its
+    /// blocks gain a reference and its state is copied to a snapshot slot
+    /// before the next step.
+    fn keep_prefix(&mut self, ri: usize) {
+        let len = self.running[ri].fed;
+        let Some(&h) = unit_hashes(&self.running[ri].req.prompt[..len]).last() else {
+            return;
+        };
+        if self.prefixes.entries.contains_key(&h) {
+            return;
+        }
+        if self.prefixes.free_snaps.is_empty() && !self.evict_one() {
+            return;
+        }
+        let Some(snap) = self.prefixes.free_snaps.pop() else {
+            return;
+        };
+        let s = &self.running[ri];
+        let blocks = s.blocks[..len / BLOCK_SIZE].to_vec();
+        let tokens = s.req.prompt[..len].to_vec();
+        self.pending_copies.push((s.slot, snap));
+        for &b in &blocks {
+            self.block_refs[b as usize] += 1;
+        }
+        self.prefixes.clock += 1;
+        self.prefixes.entries.insert(
+            h,
+            Entry {
+                tokens,
+                blocks,
+                snap,
+                used: self.prefixes.clock,
+            },
+        );
     }
 
     /// Fails every request, as when the GPU stops working.
@@ -701,6 +919,101 @@ mod tests {
         let (t, n) = (step.tokens, step.seqs());
         let done = s.finish(step, &vec![pick; n], Vec::new());
         (t, n, done)
+    }
+
+    #[test]
+    fn prompts_sharing_everything_before_the_last_message_reuse_it() {
+        let meta = Meta {
+            max_tokens: 1024,
+            max_seqs: 4,
+            max_blocks: 64,
+        };
+        let mut s =
+            Scheduler::new(meta, 64 * BLOCK_SIZE, 64, vec![EOS]).with_prefix_cache(5..9, 999);
+        // A 200-token system prompt, the turn token, then a question.
+        let ask = |q: u32| -> Vec<u32> {
+            let mut p: Vec<u32> = (1..=200).collect();
+            p.push(999);
+            p.extend(q..q + 100);
+            p
+        };
+        let (tx, _ra) = unbounded_channel();
+        s.submit(Request::text(ask(1000), 1, Sampling::default(), tx));
+        // Chunks stop at 192 (the unit before the last message) and 256.
+        assert_eq!(step(&mut s, 7).0, 192);
+        assert_eq!(step(&mut s, 7).0, 64);
+        step(&mut s, 7);
+        let (tx, _rb) = unbounded_channel();
+        s.submit(Request::text(ask(2000), 1, Sampling::default(), tx));
+        let st = s.plan().expect("work");
+        assert_eq!(s.counters.cached_tokens, 192, "the system prompt's units");
+        assert_eq!(
+            st.tokens,
+            301 - 192 - 45,
+            "then up to its own boundary at 256"
+        );
+    }
+
+    #[test]
+    fn prefixes_are_kept_reused_and_evicted() {
+        // 4 sequence slots, then snapshot slots 5 and 6.
+        let meta = Meta {
+            max_tokens: 512,
+            max_seqs: 4,
+            max_blocks: 64,
+        };
+        let mut s = Scheduler::new(meta, 64 * BLOCK_SIZE, 64, vec![EOS]).with_prefix_cache(5..7, 0);
+        let base: Vec<u32> = (1..=150).collect();
+        let (tx, mut ra) = unbounded_channel();
+        s.submit(Request::text(base.clone(), 2, Sampling::default(), tx));
+        // The prompt chunk stops at the 128-token boundary for the snapshot.
+        let (t, _, _) = step(&mut s, 7);
+        assert_eq!(t, 128);
+        let st = s.plan().expect("work");
+        assert_eq!(st.copies, vec![(0, 5)], "state kept after the boundary");
+        assert_eq!(st.tokens, 22);
+        let mut m = vec![0; s.meta.words()];
+        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        s.finish(st, &[7], Vec::new());
+        step(&mut s, 7);
+        assert_eq!(tokens(&mut ra).0, vec![7, 7]);
+        // The finished request's blocks past the prefix are free again; the
+        // prefix's 8 blocks stay with the cache.
+        assert_eq!(s.load().free_kv_blocks, 64 - 8);
+        // A longer prompt with the same start reuses the prefix: its state is
+        // restored and only the rest is computed.
+        let mut longer = base.clone();
+        longer.extend(500..600);
+        let (tx, mut rb) = unbounded_channel();
+        s.submit(Request::text(longer, 1, Sampling::default(), tx));
+        let st = s.plan().expect("work");
+        assert_eq!(st.copies, vec![(5, 0)]);
+        assert_eq!(st.tokens, 192 - 128, "stops at its own boundary, 192");
+        assert_eq!(s.counters.cached_tokens, 128);
+        let mut m = vec![0; s.meta.words()];
+        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        // Positions continue after the prefix, in the cache's blocks.
+        assert_eq!(m[s.meta.pos()], 128);
+        s.finish(st, &[3], Vec::new());
+        let st = s.plan().expect("work");
+        assert_eq!(st.copies, vec![(0, 6)], "second entry");
+        let mut m = vec![0; s.meta.words()];
+        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        s.finish(st, &[3], Vec::new());
+        assert_eq!(tokens(&mut rb).0, vec![3]);
+        // Both entries hold blocks; the second shares the first's 8.
+        assert_eq!(s.load().free_kv_blocks, 64 - 12);
+        // A request needing every block evicts the entries.
+        let (tx, _rc) = unbounded_channel();
+        s.submit(Request::text(
+            (900..1000).collect(),
+            64 * 16 - 100,
+            Sampling::default(),
+            tx,
+        ));
+        let st = s.plan().expect("admitted after eviction");
+        assert_eq!(st.seqs(), 1);
+        assert_eq!(s.load().free_kv_blocks, 0);
     }
 
     #[test]

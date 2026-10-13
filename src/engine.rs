@@ -42,6 +42,9 @@ pub struct EngineConfig {
     pub kv_fp8: bool,
     /// Store the recurrent state as bf16 (math stays f32).
     pub state_bf16: bool,
+    /// State slots for prefix-cache snapshots; None picks a quarter of
+    /// max_seqs (2 to 64), 0 turns the cache off.
+    pub prefix_cache: Option<usize>,
 }
 
 impl EngineConfig {
@@ -62,6 +65,7 @@ impl EngineConfig {
             fp4: false,
             kv_fp8: false,
             state_bf16: true,
+            prefix_cache: None,
         }
     }
 }
@@ -190,14 +194,16 @@ impl Engine {
             max_blocks,
         };
         let act = Act::new(&gpu, &mc, meta, pool_rows, model.fp8)?;
-        // One extra slot absorbs the padding rows of graph replays.
-        let slots = cfg.max_seqs + 1;
+        // One extra slot absorbs the padding rows of graph replays; the
+        // prefix cache's snapshots follow it.
+        let snaps = cfg.prefix_cache.unwrap_or((cfg.max_seqs / 4).clamp(2, 64));
+        let slots = cfg.max_seqs + 1 + snaps;
         let (free, total) = gpu.mem_info()?;
         let reserve = (total as f64 * (1.0 - cfg.memory_fraction)) as usize;
         let usable = free
             .saturating_sub(reserve)
             .saturating_sub(slots * mc.slot_bytes(cfg.state_bf16));
-        let blocks = (usable / mc.block_bytes(cfg.kv_fp8)).min(cfg.max_seqs * max_blocks);
+        let blocks = (usable / mc.block_bytes(cfg.kv_fp8)).min((cfg.max_seqs + snaps) * max_blocks);
         if blocks < max_blocks {
             return Err(Error::Config(format!(
                 "not enough memory for one full context: {blocks} KV blocks, {max_blocks} needed"
@@ -205,7 +211,7 @@ impl Engine {
         }
         let state = State::new(&gpu, &mc, slots, blocks, cfg.kv_fp8, cfg.state_bf16)?;
         gpu.sync()?;
-        let sched = Scheduler::with_images(
+        let mut sched = Scheduler::with_images(
             meta,
             cfg.max_context,
             blocks,
@@ -213,6 +219,10 @@ impl Engine {
             mc.image_token,
             pool_rows,
         );
+        if snaps > 0 {
+            sched =
+                sched.with_prefix_cache(cfg.max_seqs + 1..cfg.max_seqs + 1 + snaps, mc.turn_token);
+        }
         let mut e = Self {
             gpu,
             model,
@@ -282,6 +292,9 @@ impl Engine {
             return Ok(Vec::new());
         };
         self.encode_images()?;
+        for &(from, to) in &step.copies {
+            self.state.copy_slot(&self.gpu, from, to)?;
+        }
         let (t, s) = (step.tokens, step.seqs());
         let pens = self.sched.fill(
             &step,
@@ -489,11 +502,12 @@ pub fn spawn(cfg: EngineConfig) -> Result<(mpsc::Sender<Request>, Info, Arc<Mute
                     let st = &engine.stats;
                     let load = engine.sched.load();
                     eprintln!(
-                        "steps {} (graph {}), decode {} tok, prompt {} tok, {:.1} ms/step, running {}, waiting {}",
+                        "steps {} (graph {}), decode {} tok, prompt {} tok (+{} cached), {:.1} ms/step, running {}, waiting {}",
                         c.steps,
                         st.graph_steps,
                         c.decode_tokens,
                         c.prompt_tokens,
+                        c.cached_tokens,
                         1e3 * st.step_seconds / c.steps.max(1) as f64,
                         load.running,
                         load.waiting

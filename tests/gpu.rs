@@ -274,7 +274,13 @@ fn batching_does_not_change_greedy_output() {
     let Some(dir) = model() else { return };
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let pairs: Vec<Pair> = fixture(&format!("{}.pairs.json", size(&dir)));
-    let mut e = Engine::new(config(dir)).unwrap();
+    // Without the prefix cache: a cached prefix would move the first prompt's
+    // remaining tokens into a step shared with the others.
+    let mut e = Engine::new(EngineConfig {
+        prefix_cache: Some(0),
+        ..config(dir)
+    })
+    .unwrap();
     if fp8() || fp4() {
         // FP8 rounding of activations magnifies the last-bit differences
         // that come from GEMM kernels chosen by batch size, about as much as
@@ -317,6 +323,41 @@ fn batching_does_not_change_greedy_output() {
 
 /// The tokens a sampler should keep, given a row's top five log-probabilities.
 type KeepSet<'a> = dyn Fn(&[(u32, f32)]) -> Vec<u32> + 'a;
+
+/// A prompt that extends a cached one starts from the cached prefix (keys,
+/// values and recurrent state) and produces what it would without the cache.
+#[test]
+fn prefix_cache_reuses_without_changing_output() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let text = "Here is a long note about trains, tracks and timetables. ".repeat(24);
+    let first = tok
+        .chat(&[serde_json::json!({ "role": "user", "content": text })])
+        .unwrap()
+        .0;
+    let second = tok
+        .chat(&[serde_json::json!({ "role": "user", "content": format!("{text} Summarize it in one line.") })])
+        .unwrap()
+        .0;
+    assert!(first.len() > 2 * pocket_engine::sched::CACHE_UNIT);
+    let mut cached = Engine::new(config(dir.clone())).unwrap();
+    generate(&mut cached, std::slice::from_ref(&first), 8);
+    let with = generate(&mut cached, std::slice::from_ref(&second), 24);
+    assert!(
+        cached.sched.counters.cached_tokens >= pocket_engine::sched::CACHE_UNIT as u64,
+        "the second prompt reused the first's prefix"
+    );
+    drop(cached);
+    let mut plain = Engine::new(EngineConfig {
+        prefix_cache: Some(0),
+        ..config(dir)
+    })
+    .unwrap();
+    let without = generate(&mut plain, std::slice::from_ref(&second), 24);
+    assert_eq!(plain.sched.counters.cached_tokens, 0);
+    assert_eq!(with, without);
+}
 
 /// Draws one token `n` times from the first position of a prompt.
 fn draws(e: &mut Engine, prompt: &[u32], sampling: Sampling, n: usize) -> Vec<u32> {

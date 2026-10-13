@@ -60,6 +60,11 @@ struct EngineArgs {
     /// f32 either way): twice the memory per request.
     #[arg(long)]
     state_f32: bool,
+    /// Prompt prefixes to keep for reuse (each holds a copy of the
+    /// recurrent state); 0 turns the prefix cache off. Default: a quarter
+    /// of --max-seqs, 2 to 64.
+    #[arg(long)]
+    prefix_cache: Option<usize>,
 }
 
 impl EngineArgs {
@@ -79,6 +84,7 @@ impl EngineArgs {
             fp4: self.fp4,
             kv_fp8: self.kv_fp8,
             state_bf16: !self.state_f32,
+            prefix_cache: self.prefix_cache,
             ..EngineConfig::new(self.model.clone())
         }
     }

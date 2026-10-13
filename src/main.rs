@@ -128,8 +128,6 @@ enum Cmd {
         #[arg(long, value_delimiter = ',', default_value = "1,4,8,16,32,64,128,512")]
         rows: Vec<usize>,
     },
-    /// Quantizes a bf16 weight matrix to FP8 on the GPU (in the layout this
-    /// device's cuBLASLt runs) and times cuBLASLt FP8 against bf16 cuBLAS.
     /// Times the gated-delta-rule kernel alone: `seqs` sequences of `tokens`
     /// tokens each, with 27B's head layout by default.
     BenchGdn {
@@ -177,6 +175,8 @@ enum Cmd {
         #[arg(long)]
         wg: bool,
     },
+    /// Quantizes a bf16 weight matrix to FP8 on the GPU (in the layout this
+    /// device's cuBLASLt runs) and times cuBLASLt FP8 against bf16 cuBLAS.
     BenchFp8 {
         #[arg(long)]
         model: PathBuf,

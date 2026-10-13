@@ -262,11 +262,12 @@ pub struct Counters {
     pub accepted: u64,
 }
 
-/// Most tokens a step verifying drafts may feed. Past this, verification
-/// turns the step's matmuls compute-bound and costs more than the accepted
-/// drafts save (Qwen3.5-9B on an RTX 5090: three drafts each for 32
-/// sequences, 128 rows, ran 6% slower than plain decoding).
-const VERIFY_ROWS: usize = 96;
+/// Most tokens a step verifying drafts may feed by default (see
+/// [`Scheduler::with_verify_rows`]). Past this, verification turns the step's
+/// matmuls compute-bound and costs more than the accepted drafts save
+/// (Qwen3.5-9B on an RTX 5090: three drafts each for 32 sequences, 128 rows,
+/// ran 6% slower than plain decoding).
+pub const VERIFY_ROWS: usize = 96;
 
 /// The recurrence's chunk length (GC in qwen35.cu): it can keep its state at
 /// any multiple of it inside a step.
@@ -328,6 +329,8 @@ pub struct Scheduler {
     prefixes: Prefixes,
     /// State copies for the next step (see Step::copies).
     pending_copies: Vec<(usize, usize)>,
+    /// Most tokens a step verifying drafts may feed.
+    verify_rows: usize,
     waiting: VecDeque<Seq>,
     running: Vec<Seq>,
     eos: Vec<u32>,
@@ -375,6 +378,7 @@ impl Scheduler {
             total_blocks: blocks,
             prefixes: Prefixes::default(),
             pending_copies: Vec::new(),
+            verify_rows: VERIFY_ROWS,
             waiting: VecDeque::new(),
             running: Vec::new(),
             eos,
@@ -387,6 +391,13 @@ impl Scheduler {
     /// whole unit, for a conversation's next turn, and at the unit before its
     /// last message (opened by `turn`), for prompts that share everything
     /// before it, such as a system prompt.
+    /// Lets steps verifying drafts feed up to `rows` tokens: more on GPUs
+    /// with more compute per byte of memory bandwidth.
+    pub fn with_verify_rows(mut self, rows: usize) -> Self {
+        self.verify_rows = rows;
+        self
+    }
+
     pub fn with_prefix_cache(mut self, slots: std::ops::Range<usize>, turn: u32) -> Self {
         self.prefixes.free_snaps = slots.rev().collect();
         self.prefixes.turn = turn;
@@ -691,7 +702,7 @@ impl Scheduler {
         let drafting = self.running.iter().filter(|s| !s.drafts.is_empty()).count();
         let verify = drafting > 0
             && self.free_slots.len() >= drafting * (self.meta.spec - 1)
-            && drafting * self.meta.spec <= VERIFY_ROWS;
+            && drafting * self.meta.spec <= self.verify_rows;
         let mut budget = self.meta.max_tokens;
         let mut step = Step::default();
         for (i, s) in self.running.iter_mut().enumerate() {

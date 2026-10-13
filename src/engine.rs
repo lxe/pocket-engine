@@ -246,6 +246,11 @@ impl Engine {
             mc.image_token,
             pool_rows,
         );
+        // An H100 does about 2.5 times the matmul work per byte read of an
+        // RTX 5090, so verification stays weight-bound to more rows.
+        if gpu.arch == 90 {
+            sched = sched.with_verify_rows(256);
+        }
         if snaps > 0 {
             sched =
                 sched.with_prefix_cache(cfg.max_seqs + 1..cfg.max_seqs + 1 + snaps, mc.turn_token);

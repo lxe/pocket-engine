@@ -1488,15 +1488,25 @@ __device__ __forceinline__ void mbar_wait(uint32_t bar, int parity) {
 }
 #endif
 
-// Warp-specialized as FlashAttention 3 is: warpgroup 0
-// produces (queries once, then each 64-key tile's keys and values into one
-// of two stages by TMA: per 16-token page and 64-column swizzle atom one box
-// of the cache's tensor map, [slot][kv head][256]) and keeps 40 registers;
-// warpgroups 1 and 2 consume, a head each, with 232. Stages pass between
-// them through mbarriers (full: the tile's bytes landed; empty: both
-// consumers finished its P V). Pages past the context read past the map's
-// slots, which TMA fills with zeros.
-#define WS_SMEM (6 * WG_TILE + 64)
+// Warp-specialized as FlashAttention 3 is, and persistent: a block per SM
+// loops over work items (64 query tokens of two heads of one key/value
+// group). Warpgroup 0 produces: each item's queries, then each 64-key tile's
+// keys and values into one of two stages by TMA (per 16-token page and
+// 64-column swizzle atom one box of the cache's tensor map,
+// [slot][kv head][256]), one page per warp; it keeps 40 registers.
+// Warpgroups 1 and 2 consume, a head each, with 232. Keys and values pass
+// through separate mbarrier pipelines (full: the bytes landed; empty: every
+// consumer warp is done with them) that run on across items, so a key stage
+// frees as soon as Q K^T has read it and the next tile's keys load while
+// P V runs. Pages past the context read past the map's slots, which TMA
+// fills with zeros.
+//
+// Items are ordered key/value head first, then head pair, then tile, the
+// last tiles (the most keys) first, and block b takes items b, b + grid,
+// ...: all blocks work through one head's cache together, so a long
+// context's keys and values, too big for L2 when blocks drift apart, stream
+// from memory about once per head.
+#define WS_SMEM (6 * WG_TILE + 128 + 8 * 256)
 #define ATTN_WS_ARGS                                                                                    \
     ATTN_FLASH_ARGS, const __grid_constant__ CUtensorMap kmap, const __grid_constant__ CUtensorMap vmap, \
         int nslots
@@ -1508,90 +1518,130 @@ __device__ __forceinline__ void attn_ws_body(ATTN_FLASH_ARGS, const CUtensorMap*
     const uint32_t base = (uint32_t)__cvta_generic_to_shared(wsm);
     unsigned char* sQ = wsm;                // [2][WG_TILE]
     // Then two stages of keys (2 + stage) and values (4 + stage).
-    // Barriers: q, full[2], empty[2].
-    const uint32_t bars = base + 6 * WG_TILE, qbar = bars, full0 = bars + 8, empty0 = bars + 24;
+    // Barriers: queries full and empty, then full and empty for keys and
+    // for values, per stage.
+    const uint32_t bars = base + 6 * WG_TILE, qfull = bars, qempty = bars + 8, fullk = bars + 16,
+                   fullv = bars + 32, emptyk = bars + 48, emptyv = bars + 64;
     const int tid = threadIdx.x, wg = tid >> 7, w = (tid >> 5) & 3, lane = tid & 31, pt = tid & 127;
-    const int kvh = blockIdx.y;
-    int s = -1, tile = blockIdx.x;
+    int ntiles = 0;
     for (int i = 0; i < seqs; i++) {
         const int n = cu[i + 1] - cu[i];
-        if (n <= 1 || is_spec(outs, spec, i)) continue;
-        const int tiles = (n + 63) / 64;
-        if (tile < tiles) {
-            s = i;
-            break;
-        }
-        tile -= tiles;
+        if (n > 1 && !is_spec(outs, spec, i)) ntiles += (n + 63) / 64;
     }
-    if (s < 0) return;
-    const int tb = cu[s] + tile * 64, nb = min(64, cu[s + 1] - tb);
-    const int p0 = pos[tb], L = p0 + nb, T = (L + 63) / 64;
+    const int items = ntiles * (G / 2) * Hkv;
+    // Item it: key/value head, head pair, sequence and first token.
+    int kvh, pair, s, tb;
+    auto item = [&](int it) {
+        kvh = it / (ntiles * (G / 2));
+        const int r = it - kvh * ntiles * (G / 2);
+        pair = r / ntiles;
+        int tile = ntiles - 1 - (r - pair * ntiles);
+        for (s = 0; s < seqs; s++) {
+            const int n = cu[s + 1] - cu[s];
+            if (n <= 1 || is_spec(outs, spec, s)) continue;
+            const int tiles = (n + 63) / 64;
+            if (tile < tiles) break;
+            tile -= tiles;
+        }
+        tb = cu[s] + tile * 64;
+    };
     if (tid == 0) {
-        mbar_init(qbar, 128);
+        mbar_init(qfull, 128);
+        mbar_init(qempty, 8);
         for (int i = 0; i < 2; i++) {
-            mbar_init(full0 + 8 * i, 1);
-            mbar_init(empty0 + 8 * i, 256);
+            mbar_init(fullk + 8 * i, 4);
+            mbar_init(fullv + 8 * i, 4);
+            mbar_init(emptyk + 8 * i, 8);
+            mbar_init(emptyv + 8 * i, 8);
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     }
     __syncthreads();
     if (wg == 0) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n");
-        const int* bt = block_table + (size_t)s * max_blocks;
-        for (int e = pt; e < 2 * 64 * 32; e += 128) {
-            const int hw = e >> 11, r = (e >> 5) & 63, c = e & 31;
-            uint4 v = make_uint4(0, 0, 0, 0);
-            if (r < nb) {
-                float f[8];
-                unpack8(*reinterpret_cast<const uint4*>(
-                            q + ((size_t)(tb + r) * Hq + kvh * G + 2 * blockIdx.z + hw) * HEAD_DIM + c * 8),
-                        f);
-#pragma unroll
-                for (int i = 0; i < 8; i++) f[i] *= scale * LOG2E;  // scores in log2 units
-                v = pack8(f);
-            }
-            *reinterpret_cast<uint4*>(sQ + hw * WG_TILE + wg_off(r, c)) = v;
-        }
-        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-        mbar_arrive(qbar);
         if (pt == 0) {
-            for (int k = 0; k < T; k++) {
-                const int st = k & 1, k0 = 64 * k;
-                if (k >= 2) mbar_wait(empty0 + 8 * st, ((k >> 1) - 1) & 1);
-                const uint32_t full = full0 + 8 * st;
-                mbar_expect(full, 2 * WG_TILE);
-                const uint32_t dk = base + (2 + st) * WG_TILE, dv = base + (4 + st) * WG_TILE;
+            asm volatile("prefetch.tensormap [%0];\n" ::"l"(kmap) : "memory");
+            asm volatile("prefetch.tensormap [%0];\n" ::"l"(vmap) : "memory");
+        }
+        int n = 0, i = 0;  // tiles and items so far
+        for (int it = blockIdx.x; it < items; it += gridDim.x, i++) {
+            item(it);
+            const int nb = min(64, cu[s + 1] - tb), L = pos[tb] + nb, T = (L + 63) / 64;
+            if (i > 0) mbar_wait(qempty, (i - 1) & 1);
+            for (int e = pt; e < 2 * 64 * 32; e += 128) {
+                const int hw = e >> 11, r = (e >> 5) & 63, c = e & 31;
+                uint4 v = make_uint4(0, 0, 0, 0);
+                if (r < nb) {
+                    float f[8];
+                    unpack8(*reinterpret_cast<const uint4*>(
+                                q + ((size_t)(tb + r) * Hq + kvh * G + 2 * pair + hw) * HEAD_DIM + c * 8),
+                            f);
 #pragma unroll
-                for (int pg = 0; pg < 4; pg++) {
-                    const int kp = k0 + 16 * pg;
-                    const int slot = kp < L ? bt[kp / block_size] * block_size : nslots;
+                    for (int j = 0; j < 8; j++) f[j] *= scale * LOG2E;  // scores in log2 units
+                    v = pack8(f);
+                }
+                *reinterpret_cast<uint4*>(sQ + hw * WG_TILE + wg_off(r, c)) = v;
+            }
+            asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            mbar_arrive(qfull);
+            if (lane == 0) {
+                // Keys run a tile ahead of values: K(k + 1) goes out before
+                // V(k). A stage is reused once the consumers have released
+                // its previous tile.
+                const int* bt = block_table + (size_t)s * max_blocks;
+                auto slot = [&](int k) {
+                    const int kp = 64 * k + 16 * w;
+                    return kp < L ? bt[kp / block_size] * block_size : nslots;
+                };
+                auto load = [&](int k, int sl, const CUtensorMap* map, uint32_t full, uint32_t empty, int buf) {
+                    const int j = n + k, st = j & 1;
+                    if (j >= 2) mbar_wait(empty + 8 * st, ((j >> 1) - 1) & 1);
+                    mbar_expect(full + 8 * st, WG_TILE / 4);
+                    const uint32_t d = base + (buf + st) * WG_TILE + w * 2048;
 #pragma unroll
-                    for (int a = 0; a < 4; a++) {
-                        tma3(dk + a * 8192 + pg * 2048, kmap, 64 * a, kvh, slot, full);
-                        tma3(dv + a * 8192 + pg * 2048, vmap, 64 * a, kvh, slot, full);
-                    }
+                    for (int a = 0; a < 4; a++) tma3(d + a * 8192, map, 64 * a, kvh, sl, full + 8 * st);
+                };
+                int cur = slot(0);
+                load(0, cur, kmap, fullk, emptyk, 2);
+                for (int k = 0; k < T; k++) {
+                    const int next = k + 1 < T ? slot(k + 1) : 0;
+                    if (k + 1 < T) load(k + 1, next, kmap, fullk, emptyk, 2);
+                    load(k, cur, vmap, fullv, emptyv, 4);
+                    cur = next;
                 }
             }
+            __syncwarp();
+            n += T;
         }
         return;
     }
     asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n");
-    const int c_wg = wg - 1, h = kvh * G + 2 * blockIdx.z + c_wg;
+    const int c_wg = wg - 1;
+    const uint32_t qa = base + c_wg * WG_TILE, spin = base + 6 * WG_TILE + 128;
+    const int r0 = 16 * w + (lane >> 2);
+    int n = 0, i = 0;  // tiles and items so far
+    for (int it = blockIdx.x; it < items; it += gridDim.x, i++) {
+    item(it);
+    const int nb = min(64, cu[s + 1] - tb), p0 = pos[tb], L = p0 + nb, T = (L + 63) / 64;
+    const int h = kvh * G + 2 * pair + c_wg, q0 = p0 + r0, q1 = q0 + 8;
     float o[128];
 #pragma unroll
-    for (int i = 0; i < 128; i++) o[i] = 0.f;
+    for (int j = 0; j < 128; j++) o[j] = 0.f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
-    const int r0 = 16 * w + (lane >> 2), q0 = p0 + r0, q1 = q0 + 8;
-    const uint32_t qa = base + c_wg * WG_TILE;
-    float sc[32];
-    uint32_t pa[2][4][4];
-    // Waits for tile k's stage (cp.async writes, then read by wgmma).
-    auto ready = [&](int k) {
-        mbar_wait(full0 + 8 * (k & 1), (k >> 1) & 1);
-        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    // Scores of the newest tile, then its probabilities (f32) until P V of
+    // the tile before has read pa; only then are they packed into pa. The
+    // corrections c0, c1 rescale o just before the tile's P V is issued, so
+    // they run while Q K^T is on the tensor cores.
+    float sc[32], c0 = 1.f, c1 = 1.f;
+    uint32_t pa[4][4];
+    // Waits for tile k's keys or values (TMA writes; wgmma reads them in
+    // the same async proxy, so no fence is needed).
+    auto ready = [&](uint32_t full, int k) { mbar_wait(full + 8 * ((n + k) & 1), ((n + k) >> 1) & 1); };
+    auto release = [&](uint32_t empty, int k) {
+        if (lane == 0) mbar_arrive(empty + 8 * ((n + k) & 1));
     };
     auto issue_s = [&](int k) {
-        const uint32_t ka = base + (2 + (k & 1)) * WG_TILE;
+        const uint32_t ka = base + (2 + ((n + k) & 1)) * WG_TILE;
         wg_pin<32>(sc);
         wg_fence();
 #pragma unroll
@@ -1601,8 +1651,7 @@ __device__ __forceinline__ void attn_ws_body(ATTN_FLASH_ARGS, const CUtensorMap*
         }
         wg_commit();
     };
-    auto softmax = [&](int k, auto par, float& c0, float& c1) {
-        constexpr int P = decltype(par)::value;
+    auto softmax = [&](int k) {
         const int k0 = 64 * k;
         if (k0 + 63 > p0 || k0 + 64 > L) {
 #pragma unroll
@@ -1641,63 +1690,67 @@ __device__ __forceinline__ void attn_ws_body(ATTN_FLASH_ARGS, const CUtensorMap*
         l1 = l1 * c1 + s1;
         m0 = mx0;
         m1 = mx1;
+        wg_pin<32>(sc);
+    };
+    auto pack = [&]() {
 #pragma unroll
         for (int kk = 0; kk < 4; kk++) {
-            pa[P][kk][0] = fa_bf2(sc[8 * kk + 0], sc[8 * kk + 1]);
-            pa[P][kk][1] = fa_bf2(sc[8 * kk + 2], sc[8 * kk + 3]);
-            pa[P][kk][2] = fa_bf2(sc[8 * kk + 4], sc[8 * kk + 5]);
-            pa[P][kk][3] = fa_bf2(sc[8 * kk + 6], sc[8 * kk + 7]);
+            pa[kk][0] = fa_bf2(sc[8 * kk + 0], sc[8 * kk + 1]);
+            pa[kk][1] = fa_bf2(sc[8 * kk + 2], sc[8 * kk + 3]);
+            pa[kk][2] = fa_bf2(sc[8 * kk + 4], sc[8 * kk + 5]);
+            pa[kk][3] = fa_bf2(sc[8 * kk + 6], sc[8 * kk + 7]);
         }
     };
-    auto issue_pv = [&](int k, auto par) {
-        constexpr int P = decltype(par)::value;
-        const uint32_t va = base + (4 + (k & 1)) * WG_TILE;
-        wg_pin<128>(o);
-        wg_fence();
-#pragma unroll
-        for (int kk = 0; kk < 4; kk++) wg_o(o, pa[P][kk], wg_desc(va + kk * 2048, 8192, 1024));
-        wg_commit();
-    };
-    auto step = [&](int k, auto par) {
-        constexpr int P = decltype(par)::value;
-        ready(k + 1);
-        issue_s(k + 1);
-        issue_pv(k, par);
-        asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
-        wg_pin<32>(sc);
-        float c0, c1;
-        softmax(k + 1, std::integral_constant<int, 1 - P>{}, c0, c1);
-        wg_wait0();
-        wg_pin<128>(o);
-        mbar_arrive(empty0 + 8 * (k & 1));  // tile k's stage is free
+    auto rescale = [&]() {
         if (__any_sync(0xffffffffu, c0 != 1.f || c1 != 1.f)) {
 #pragma unroll
             for (int i = 0; i < 128; i++) o[i] *= (i & 2) ? c1 : c0;
         }
     };
-    mbar_wait(qbar, 0);
-    ready(0);
+    auto issue_pv = [&](int k) {
+        const uint32_t va = base + (4 + ((n + k) & 1)) * WG_TILE;
+        wg_pin<128>(o);
+        wg_pin<16>(&pa[0][0]);
+        wg_fence();
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++) wg_o(o, pa[kk], wg_desc(va + kk * 2048, 8192, 1024));
+        wg_commit();
+    };
+    mbar_wait(qfull, i & 1);
+    ready(fullk, 0);
     issue_s(0);
     wg_wait0();
     wg_pin<32>(sc);
-    {
-        float c0, c1;
-        softmax(0, std::integral_constant<int, 0>{}, c0, c1);
+    release(emptyk, 0);
+    softmax(0);
+    pack();
+    for (int k = 0; k + 1 < T; k++) {
+        ready(fullk, k + 1);
+        issue_s(k + 1);
+        rescale();
+        ready(fullv, k);
+        issue_pv(k);
+        asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+        wg_pin<32>(sc);
+        release(emptyk, k + 1);
+        softmax(k + 1);
+        // ptxas otherwise hoists the wait above the softmax: a shared store
+        // of its last result (the row sums) holds it below.
+        asm volatile("st.shared.v2.f32 [%0], {%1, %2};\n" ::"r"(spin + 8 * (tid - 128)), "f"(l0), "f"(l1) : "memory");
+        wg_wait0();
+        wg_pin<128>(o);
+        wg_pin<16>(&pa[0][0]);
+        release(emptyv, k);
+        pack();
     }
-    int k = 0;
-    for (; k + 2 < T; k += 2) {
-        step(k, std::integral_constant<int, 0>{});
-        step(k + 1, std::integral_constant<int, 1>{});
-    }
-    if (k + 1 < T) {
-        step(k, std::integral_constant<int, 0>{});
-        k++;
-        issue_pv(k, std::integral_constant<int, 1>{});
-    } else {
-        issue_pv(k, std::integral_constant<int, 0>{});
-    }
+    rescale();
+    ready(fullv, T - 1);
+    issue_pv(T - 1);
     wg_wait0();
     wg_pin<128>(o);
+    release(emptyv, T - 1);
+    if (lane == 0) mbar_arrive(qempty);  // the queries are free for the next item
+    n += T;
     const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
 #pragma unroll
     for (int hf = 0; hf < 2; hf++) {
@@ -1718,9 +1771,10 @@ __device__ __forceinline__ void attn_ws_body(ATTN_FLASH_ARGS, const CUtensorMap*
             *reinterpret_cast<__nv_bfloat162*>(out + (t * Hq + h) * HEAD_DIM + d) = __floats2bfloat162_rn(y[0], y[1]);
         }
     }
+    }
 #endif
 }
-// attn_ws_g<G>: grid (64-token tiles + sequences, key/value heads, G / 2), 384 threads.
+// attn_ws_g<G>: a block per SM, 384 threads.
 #define ATTN_WS_PASS ATTN_FLASH_PASS, &kmap, &vmap, nslots
 extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g4(ATTN_WS_ARGS) { attn_ws_body<4>(ATTN_WS_PASS); }
 extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g6(ATTN_WS_ARGS) { attn_ws_body<6>(ATTN_WS_PASS); }

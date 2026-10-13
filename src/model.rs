@@ -75,8 +75,8 @@ impl FaShape {
 }
 /// Dynamic shared memory of attn_ws_g<G> (WS_SMEM in qwen35.cu): two
 /// warpgroups' queries and two stages of keys and values, 64 x 256 bf16
-/// each, and the stages' mbarriers.
-pub const WS_SMEM: usize = 6 * 64 * HEAD_DIM * 2 + 64;
+/// each, the stages' mbarriers and 8 bytes per consumer thread.
+pub const WS_SMEM: usize = 6 * 64 * HEAD_DIM * 2 + 128 + 8 * 256;
 /// Whether prompts take the wgmma flash kernel: Hopper, a bf16 cache and
 /// groups of 4 or 6.
 pub fn fa_wgmma(g: usize, arch: u32, kv_fp8: bool) -> bool {
@@ -1924,22 +1924,12 @@ impl Model {
                         )?;
                     }
                     if t > s {
-                        // Prompt sequences: flash attention, a block per KV
-                        // head and 16 queries per tile.
+                        // Prompt sequences: flash attention.
                         let group = c.hq / c.hkv;
                         let sh = k.fa_shape;
                         let maps = st.maps.get(*cache);
                         let (kern, grid, threads, smem) = match (k.attn_wg, maps) {
-                            (Some(wg), Some(_)) => (
-                                wg,
-                                (
-                                    (t.div_ceil(64) + s) as u32,
-                                    c.hkv as u32,
-                                    (group / 2) as u32,
-                                ),
-                                384,
-                                WS_SMEM,
-                            ),
+                            (Some(wg), Some(_)) => (wg, (gpu.sms as u32, 1, 1), 384, WS_SMEM),
                             _ => (
                                 if st.kv_fp8 {
                                     k.attn_flash8

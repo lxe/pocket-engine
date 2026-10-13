@@ -733,11 +733,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (name, grid, threads, smem) = if wg {
                 (
                     format!("attn_ws_g{group}"),
-                    (
-                        (t.div_ceil(64) + seqs) as u32,
-                        hkv as u32,
-                        (group / 2) as u32,
-                    ),
+                    (gpu.sms as u32, 1, 1),
                     384,
                     pocket_engine::model::WS_SMEM,
                 )

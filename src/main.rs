@@ -149,6 +149,24 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Times flash attention for prompts alone: `seqs` prompts of `tokens`
+    /// new tokens after `context` cached ones, `group` query heads per key
+    /// and value head (9B: 4 kv heads, group 4; 27B: 4, 6).
+    BenchAttn {
+        #[arg(long, default_value_t = 4)]
+        kv_heads: usize,
+        #[arg(long, default_value_t = 4)]
+        group: usize,
+        #[arg(long, default_value_t = 1)]
+        seqs: usize,
+        #[arg(long, default_value_t = 4096)]
+        tokens: usize,
+        #[arg(long, default_value_t = 0)]
+        context: usize,
+        /// Compare with the paged decode kernel, token by token.
+        #[arg(long)]
+        check: bool,
+    },
     BenchFp8 {
         #[arg(long)]
         model: PathBuf,
@@ -509,6 +527,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Arg::P(0),
                         Arg::I(0),
                         Arg::I(0),
+                        Arg::P(0),
+                        Arg::I(1),
                     ],
                 )?;
                 if name != "decode" {
@@ -532,6 +552,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Arg::P(0),
                             Arg::I(0),
                             Arg::I(0),
+                            Arg::P(0),
+                            Arg::I(1),
                         ],
                     )?;
                 }
@@ -596,6 +618,164 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "gdn_recurrent: {seqs} x {tokens} tokens, {hv} heads: {us:.1} us ({:.2} us per token per sequence)",
                 us / tokens as f64
+            );
+        }
+        Cmd::BenchAttn {
+            kv_heads,
+            group,
+            seqs,
+            tokens,
+            context,
+            check,
+        } => {
+            use pocket_engine::gpu::{Arg, Gpu};
+            const D: usize = 256;
+            let gpu = Gpu::new(0)?;
+            let (hkv, hq) = (kv_heads, kv_heads * group);
+            let qstride = (2 * hq + 2 * hkv) * D;
+            let t = seqs * tokens;
+            let len = context + tokens;
+            let max_blocks = len.div_ceil(16);
+            let rnd = |n: usize, seed: usize, scale: f32| -> Vec<u8> {
+                (0..n)
+                    .flat_map(|i| {
+                        let h = (i ^ seed.wrapping_mul(0x9e37_79b9)).wrapping_mul(2654435761);
+                        let x = ((h % 2001) as f32 / 1000.0 - 1.0) * scale;
+                        half::bf16::from_f32(x).to_le_bytes()
+                    })
+                    .collect()
+            };
+            let i32s =
+                |v: Vec<i32>| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            let q = gpu.upload(&rnd(t * hq * D, 1, 1.0))?;
+            let proj = gpu.upload(&rnd(t * qstride, 2, 1.0))?;
+            let slots = seqs * max_blocks * 16;
+            let kc = gpu.upload(&rnd(slots * hkv * D, 3, 1.0))?;
+            let vc = gpu.upload(&rnd(slots * hkv * D, 4, 1.0))?;
+            // Blocks of a sequence in reverse order, as a paged cache may hold them.
+            let bt = gpu.upload(&i32s(
+                (0..seqs * max_blocks)
+                    .map(|i| {
+                        let (sq, b) = (i / max_blocks, i % max_blocks);
+                        (sq * max_blocks + max_blocks - 1 - b) as i32
+                    })
+                    .collect(),
+            ))?;
+            let pos = gpu.upload(&i32s(
+                (0..t).map(|i| (context + i % tokens) as i32).collect(),
+            ))?;
+            let tok_seq = gpu.upload(&i32s((0..t).map(|i| (i / tokens) as i32).collect()))?;
+            let cu = gpu.upload(&i32s((0..=seqs).map(|i| (i * tokens) as i32).collect()))?;
+            let out = gpu.alloc_zeroed(t * hq * D * 2)?;
+            let scale = 1.0 / (D as f32).sqrt();
+            let smem = pocket_engine::model::fa_smem(group);
+            let tiles = pocket_engine::model::fa_tiles(group);
+            let flash = gpu.kernel(&format!("attn_group_g{group}"))?;
+            gpu.set_smem(flash, smem)?;
+            let run = |o: u64| {
+                gpu.launch(
+                    flash,
+                    ((t.div_ceil(16 * tiles) + seqs) as u32, hkv as u32, 1),
+                    (32 * group * tiles) as u32,
+                    smem as u32,
+                    &[
+                        Arg::P(q.ptr),
+                        Arg::P(kc.ptr),
+                        Arg::P(vc.ptr),
+                        Arg::P(0),
+                        Arg::P(0),
+                        Arg::P(proj.ptr),
+                        Arg::I(qstride as i32),
+                        Arg::I(hq as i32),
+                        Arg::I(hkv as i32),
+                        Arg::P(pos.ptr),
+                        Arg::P(cu.ptr),
+                        Arg::I(seqs as i32),
+                        Arg::P(bt.ptr),
+                        Arg::I(max_blocks as i32),
+                        Arg::I(16),
+                        Arg::P(o),
+                        Arg::F(scale),
+                        Arg::P(0),
+                        Arg::I(1),
+                    ],
+                )
+            };
+            if check {
+                let reference = gpu.alloc_zeroed(t * hq * D * 2)?;
+                gpu.launch(
+                    gpu.kernel(&format!("attn_paged_g{group}"))?,
+                    (t as u32, hkv as u32, 1),
+                    if group >= 6 { 128 } else { 256 },
+                    0,
+                    &[
+                        Arg::P(q.ptr),
+                        Arg::P(kc.ptr),
+                        Arg::P(vc.ptr),
+                        Arg::P(0),
+                        Arg::P(0),
+                        Arg::P(proj.ptr),
+                        Arg::I(qstride as i32),
+                        Arg::I(hq as i32),
+                        Arg::I(hkv as i32),
+                        Arg::P(pos.ptr),
+                        Arg::P(tok_seq.ptr),
+                        Arg::P(bt.ptr),
+                        Arg::I(max_blocks as i32),
+                        Arg::I(16),
+                        Arg::P(reference.ptr),
+                        Arg::F(scale),
+                        Arg::P(0),
+                        Arg::P(0),
+                        Arg::I(0),
+                        Arg::I(0),
+                        Arg::P(cu.ptr),
+                        Arg::I(0),
+                        Arg::I(256),
+                        Arg::P(0),
+                        Arg::P(0),
+                        Arg::I(1),
+                    ],
+                )?;
+                run(out.ptr)?;
+                let fetch = |ptr: u64| -> pocket_engine::Result<Vec<f32>> {
+                    let mut h = gpu.pinned(t * hq * D * 2)?;
+                    gpu.dtoh(&mut h, ptr, t * hq * D * 2)?;
+                    gpu.sync()?;
+                    Ok(h.as_slice::<u16>()
+                        .iter()
+                        .map(|&b| half::bf16::from_bits(b).to_f32())
+                        .collect())
+                };
+                let (a, b) = (fetch(reference.ptr)?, fetch(out.ptr)?);
+                let mut diffs: Vec<f32> = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).collect();
+                diffs.sort_by(f32::total_cmp);
+                let amax = a.iter().fold(0f32, |m, x| m.max(x.abs()));
+                println!(
+                    "flash against paged: |diff| median {:.2e}, p99 {:.2e}, max {:.2e} (outputs up to {amax:.3})",
+                    diffs[diffs.len() / 2],
+                    diffs[diffs.len() * 99 / 100],
+                    diffs.last().unwrap()
+                );
+                return Ok(());
+            }
+            run(out.ptr)?;
+            gpu.sync()?;
+            let n = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                run(out.ptr)?;
+            }
+            gpu.sync()?;
+            let s = t0.elapsed().as_secs_f64() / n as f64;
+            // Each query attends to the keys up to its position: 4 flops
+            // per key and dimension (QK^T and PV).
+            let keys: f64 = (0..tokens).map(|i| (context + i + 1) as f64).sum();
+            let flops = 4.0 * keys * (D * hq * seqs) as f64;
+            println!(
+                "attn_group_g{group}: {seqs} x {tokens} tokens after {context}, {hq} heads: {:.2} ms, {:.1} TFLOPS",
+                s * 1e3,
+                flops / s / 1e12
             );
         }
         Cmd::BenchFp8 {

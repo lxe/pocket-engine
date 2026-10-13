@@ -29,10 +29,15 @@ fn split_ranges(t: usize, hkv: usize, sms: usize) -> usize {
     (4 * sms).div_ceil(t * hkv).clamp(1, SPLIT_MAX)
 }
 
-/// Dynamic shared memory of attn_group_g<G> (fg_smem in qwen35.cu): 16
-/// queries of each of G heads and two buffers of 16 keys and values.
-fn fa_smem(g: usize) -> usize {
-    (g * 16 + 4 * 16) * (HEAD_DIM + 8) * 2
+/// Query tiles of 16 tokens per block of attn_group_g<G> (fg_tiles in
+/// qwen35.cu).
+pub fn fa_tiles(g: usize) -> usize {
+    if g == 6 { 1 } else { 8 / g }
+}
+/// Its dynamic shared memory (fg_smem): the tiles' queries for each of G
+/// heads and two buffers of 16 keys and values.
+pub fn fa_smem(g: usize) -> usize {
+    (g * 16 * fa_tiles(g) + 4 * 16) * (HEAD_DIM + 8) * 2
 }
 /// Dynamic shared memory of the chunked gated delta rule (GDN_CHUNK_SMEM in
 /// qwen35.cu).
@@ -1756,16 +1761,17 @@ impl Model {
                     }
                     if t > s {
                         // Prompt sequences: flash attention, a block per KV
-                        // head and 16 queries.
+                        // head and 16 queries per tile.
                         let group = c.hq / c.hkv;
+                        let tiles = fa_tiles(group);
                         gpu.launch(
                             if st.kv_fp8 {
                                 k.attn_flash8
                             } else {
                                 k.attn_flash
                             },
-                            ((t.div_ceil(16) + s) as u32, c.hkv as u32, 1),
-                            32 * group as u32,
+                            ((t.div_ceil(16 * tiles) + s) as u32, c.hkv as u32, 1),
+                            (32 * group * tiles) as u32,
                             fa_smem(group) as u32,
                             &[
                                 P(a.q.ptr),

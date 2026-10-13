@@ -1029,8 +1029,13 @@ __device__ __forceinline__ uint32_t fa_bf2(float lo, float hi) {
 #define ATTN_FLASH_PASS q, kcache, vcache, kscale, vscale, qkv, qstride, Hq, Hkv, pos, cu, seqs, block_table, max_blocks, block_size, out, scale, outs, spec
 
 #define FG_BN 16
+// Query tiles of 16 tokens per block: 8 warps where 99 KB of shared memory
+// (the most an RTX 50-series block takes) hold their queries, and one tile
+// for a group of 6.
 template <int G>
-constexpr int fg_smem() { return (G * 16 + 4 * FG_BN) * FA_STR * 2; }
+__host__ __device__ constexpr int fg_tiles() { return G == 6 ? 1 : 8 / G; }
+template <int G>
+__host__ __device__ constexpr int fg_smem() { return (G * 16 * fg_tiles<G>() + 4 * FG_BN) * FA_STR * 2; }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
     const uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
@@ -1047,17 +1052,19 @@ __device__ __forceinline__ void attn_flash_group(
     const int* __restrict__ block_table, int max_blocks, int block_size, bf16* __restrict__ out, float scale,
     const int* __restrict__ outs, int spec) {
     extern __shared__ __align__(16) unsigned char fsm[];
-    bf16* sQ = (bf16*)fsm;                 // [G][16][FA_STR]
-    bf16* sK = sQ + G * 16 * FA_STR;       // [2][FG_BN][FA_STR]
+    constexpr int NT = fg_tiles<G>(), BT = 16 * NT;  // query tiles, tokens per block
+    bf16* sQ = (bf16*)fsm;                 // [NT][G][16][FA_STR]
+    bf16* sK = sQ + NT * G * 16 * FA_STR;  // [2][FG_BN][FA_STR]
     bf16* sV = sK + 2 * FG_BN * FA_STR;    // [2][FG_BN][FA_STR]
-    constexpr int T = G * 32;
+    constexpr int T = NT * G * 32;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
-    const int kvh = blockIdx.y, h = kvh * G + warp;
+    // Warp w takes query head w % G of query tile w / G.
+    const int kvh = blockIdx.y, h = kvh * G + warp % G, qt = warp / G;
     int s = -1, tile = blockIdx.x;
     for (int i = 0; i < seqs; i++) {
         const int n = cu[i + 1] - cu[i];
         if (n <= 1 || is_spec(outs, spec, i)) continue;
-        const int tiles = (n + 15) / 16;
+        const int tiles = (n + BT - 1) / BT;
         if (tile < tiles) {
             s = i;
             break;
@@ -1065,20 +1072,23 @@ __device__ __forceinline__ void attn_flash_group(
         tile -= tiles;
     }
     if (s < 0) return;
-    const int t0 = cu[s] + tile * 16, n = min(16, cu[s + 1] - t0);
-    const int p0 = pos[t0], L = p0 + n;
+    const int tb = cu[s] + tile * BT, nb = min(BT, cu[s + 1] - tb);
+    const int L = pos[tb] + nb;
+    // This warp's 16 queries: tokens t0 .. t0 + n - 1 at positions p0 on.
+    const int t0 = tb + qt * 16, n = max(0, min(16, nb - qt * 16)), p0 = pos[tb] + qt * 16;
     const int* bt = block_table + (size_t)s * max_blocks;
-    for (int e = tid; e < G * 16 * (HEAD_DIM / 8); e += T) {
-        const int hw = e / (16 * (HEAD_DIM / 8)), r = (e / (HEAD_DIM / 8)) % 16, c = (e % (HEAD_DIM / 8)) * 8;
+    for (int e = tid; e < NT * G * 16 * (HEAD_DIM / 8); e += T) {
+        const int row = e / (HEAD_DIM / 8), c = (e % (HEAD_DIM / 8)) * 8;
+        const int hw = row / 16 % G, r = row % 16, tq = row / (16 * G) * 16 + r;
         uint4 v = make_uint4(0, 0, 0, 0);
-        if (r < n) {
+        if (tq < nb) {
             float f[8];
-            unpack8(*reinterpret_cast<const uint4*>(q + ((size_t)(t0 + r) * Hq + kvh * G + hw) * HEAD_DIM + c), f);
+            unpack8(*reinterpret_cast<const uint4*>(q + ((size_t)(tb + tq) * Hq + kvh * G + hw) * HEAD_DIM + c), f);
 #pragma unroll
             for (int i = 0; i < 8; i++) f[i] *= scale;
             v = pack8(f);
         }
-        *reinterpret_cast<uint4*>(sQ + (hw * 16 + r) * FA_STR + c) = v;
+        *reinterpret_cast<uint4*>(sQ + row * FA_STR + c) = v;
     }
     auto load = [&](int k0, int buf) {
         bf16* dk = sK + buf * FG_BN * FA_STR;
@@ -1116,6 +1126,7 @@ __device__ __forceinline__ void attn_flash_group(
     for (int nt = 0; nt < HEAD_DIM / 8; nt++) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
     const bf16* myQ = sQ + warp * 16 * FA_STR;
+    const int last = p0 + n - 1;  // this warp's last query position
     load(0, 0);
     int buf = 0;
     for (int k0 = 0; k0 < L; k0 += FG_BN, buf ^= 1) {
@@ -1128,6 +1139,11 @@ __device__ __forceinline__ void attn_flash_group(
         __syncthreads();
         const bf16* cK = sK + buf * FG_BN * FA_STR;
         const bf16* cV = sV + buf * FG_BN * FA_STR;
+        if (k0 > last) {
+            // Keys past all of this warp's queries: nothing to add.
+            __syncthreads();
+            continue;
+        }
         float sc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
 #pragma unroll
         for (int kd = 0; kd < HEAD_DIM; kd += 16) {
@@ -1212,10 +1228,10 @@ __device__ __forceinline__ void attn_flash_group(
     }
 }
 #define ATTN_GROUP(G)                                                                                          \
-    extern "C" __global__ void __launch_bounds__(G * 32) attn_group_g##G(ATTN_FLASH_ARGS) {                   \
+    extern "C" __global__ void __launch_bounds__(G * 32 * fg_tiles<G>()) attn_group_g##G(ATTN_FLASH_ARGS) {   \
         attn_flash_group<G, false>(ATTN_FLASH_PASS);                                                           \
     }                                                                                                          \
-    extern "C" __global__ void __launch_bounds__(G * 32) attn_group8_g##G(ATTN_FLASH_ARGS) {                  \
+    extern "C" __global__ void __launch_bounds__(G * 32 * fg_tiles<G>()) attn_group8_g##G(ATTN_FLASH_ARGS) {  \
         attn_flash_group<G, true>(ATTN_FLASH_PASS);                                                            \
     }
 ATTN_GROUP(1)

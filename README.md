@@ -1,6 +1,14 @@
 # pocket-engine
 
-An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine. With the checkpoint's multi-token-prediction layer drafting two tokens a step (`--mtp`), one Qwen3.5-9B stream decodes at 280 tokens per second, against vLLM's 245 with the same drafting, and a short prompt's first token arrives in 13 ms against vLLM's 55. It is ready 5 seconds after launch, and a 27B model reaches serving in about 2 seconds from the page cache ([design and measurements](docs/design.md); [against vLLM and llama.cpp on an H100](docs/h100-comparison.md)).
+An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API, for text and images, from bf16, FP8, FP4 or GGUF weights. It is ready 2 to 5 seconds after launch.
+
+On one H100, against vLLM 0.31.0 on the same machine:
+
+- **Throughput.** Qwen3.5-2B serves 7,530 output tokens per second with 64 requests in flight, against vLLM's 5,172; it leads on every dense model in bf16 up to 9B and in FP8.
+- **First token.** A short prompt's first token arrives in 13.5 ms on Qwen3.5-9B, against vLLM's 57.5. Long prompts prefill at about the same speed: a 64k-token prompt takes 2.29 s on 9B, against 2.28, and 7.27 s on 27B, against 6.93.
+- **Speculative decoding.** With the checkpoint's multi-token-prediction layer drafting two tokens a step (`--mtp`), one 9B stream decodes at 293 tokens per second, against vLLM's 253 with the same drafting, and 64 in flight reach 4,155 against 2,882.
+
+[Design and measurements](docs/design.md); [against vLLM and llama.cpp on an H100](docs/h100-comparison.md).
 
 ## Performance
 
@@ -15,14 +23,23 @@ Output tokens per second with 64 requests in flight on one H100, from `scripts/l
 | Qwen3.8-27B | bf16 | 978¹ | **1,088**¹ | 158 |
 | Qwen3.5-9B | FP8 | **3,523** | 3,460 | — |
 | Qwen3.8-27B | FP8 | **1,314**¹ | 1,302¹ | — |
-| Qwen3.5-9B | bf16, 2 drafts a step | **4,154**² | 3,024² | — |
-| Qwen3.8-27B | bf16, 2 drafts a step | **1,098**² | 830² | — |
+| Qwen3.5-9B | bf16, 2 drafts a step | **4,155**² | 2,882² | — |
+| Qwen3.8-27B | bf16, 2 drafts a step | **1,124**² | 897² | — |
 | Qwen3.5-9B | Q4_K_M | **2,315** | does not load | 395 |
 | Qwen3.8-27B | Q4_K_M | **675** | does not load | 156 |
 
 ¹ From [a separate H100 run](docs/h100-comparison.md#27b-multi-token-prediction-and-shared-prefixes), with vLLM at `--max-num-seqs 256`. ² Both engines drafting two tokens a step with their multi-token prediction (pocket-engine `--mtp 2`, vLLM's `mtp` method with 2 speculative tokens); [all loads and draft counts](docs/design.md#multi-token-prediction).
 
-pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. On long prompts the two prefill at about the same speed: 9B's first token comes sooner at 8k and within 5% at 32k and 64k, 27B's within 4% to 7% ([time to first token](docs/design.md#long-contexts)); [the comparison](docs/h100-comparison.md#27b-multi-token-prediction-and-shared-prefixes) has shared prefixes.
+Time to first token, one request at a time, bf16 ([receipt](docs/receipts/h100-mtp-ttft.json)):
+
+| Prompt | Qwen3.5-9B | vLLM | Qwen3.8-27B | vLLM |
+|---|---:|---:|---:|---:|
+| 60 to 200 tokens (median) | **13.5 ms** | 57.5 ms | **36.5 ms** | 97.4 ms |
+| 8k tokens | **0.29 s** | 0.34 s | 0.81 s | **0.79 s** |
+| 32k tokens | **1.06 s** | 1.10 s | 3.28 s | **3.22 s** |
+| 64k tokens | 2.29 s | **2.28 s** | 7.27 s | **6.93 s** |
+
+Prompts run on a FlashAttention-3-style warp-specialized flash kernel and a two-pass chunked linear-attention recurrence, both written for this engine ([long contexts](docs/design.md#long-contexts)).
 
 ## Supported
 
@@ -35,9 +52,9 @@ pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. On long pr
 | Quantization | GGUF weights stay quantized on the GPU: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely within a file. Their activations run in bf16 with f32 accumulation |
 | FP8 | E4M3 weights and activations on H100, H200 and RTX 50-series: Qwen's FP8 checkpoints, or any bf16 checkpoint with `--fp8`. Block scales of 128×128 per weight tile and 128 per activation row on Hopper; MXFP8 (a scale per 32 values) on Blackwell. Images, samplers and CUDA graphs work with it. The KV cache can be FP8 too (`--kv-fp8`) |
 | FP4 | RTX 50-series only: MXFP4 weights (E2M1, a power-of-two scale per 32) times MXFP8 activations on block-scaled tensor cores. NVIDIA's NVFP4 checkpoints (`nvidia/Qwen3.8-27B-NVFP4`) are re-quantized to MXFP4 at load; `--fp4` quantizes a bf16 checkpoint's MLP to FP4 and the rest to FP8 |
-| Context | Up to `--max-context` tokens per request (default 4,096). On an RTX 5090, Qwen3.5-9B takes 0.70 s to a first token at 8k, 3.2 s at 32k and 7.6 s at 64k (on an H100: 0.29, 1.13 and 2.40 s, against vLLM's 0.33, 1.10 and 2.29), and decodes at 78 to 85 tok/s at every length |
+| Context | Up to `--max-context` tokens per request (default 4,096). On an RTX 5090, Qwen3.5-9B takes 0.66 s to a first token at 8k, 2.97 s at 32k and 7.04 s at 64k, and decodes at 77 to 85 tok/s at every length |
 | Prefix cache | Prompts that share a beginning (a system prompt, or a conversation's earlier turns) reuse its KV cache and recurrent state. On by default |
-| Speculative decoding | `--mtp` drafts tokens with the checkpoint's multi-token-prediction layer and verifies them in the next step, for greedy and sampled requests alike (not with penalties or `logit_bias`). Qwen3.5-9B: 280 tok/s for one stream instead of 150 on an H100 (vLLM's MTP: 245), 152 instead of 85 on an RTX 5090 |
+| Speculative decoding | `--mtp` drafts tokens with the checkpoint's multi-token-prediction layer and verifies them in the next step, for greedy and sampled requests alike (not with penalties or `logit_bias`). Qwen3.5-9B with two drafts: 293 tok/s for one stream instead of 150 on an H100 (vLLM's MTP: 253), 152 instead of 85 on an RTX 5090 |
 | Sampling | Greedy, or temperature with `top_k`, `top_p`, `min_p` and `seed`; `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`; `stop` strings |
 | GPUs | NVIDIA, built per architecture: `90a` (H100), `120a` (RTX 50-series); others via `CUDA_COMPUTE_CAP` |
 | Driver | CUDA 13 (driver 580 or newer); cuBLAS 13 at run time |
@@ -141,7 +158,7 @@ With a model set, `tests/gpu.rs` runs eight checks against it. The model can be 
 - its predictions match stored Transformers reference outputs;
 - image prompts tokenize exactly as Transformers' processor does, and their predictions match too;
 - batching does not change predictions beyond rounding: the same tokens scored alone and among other requests agree except at near ties;
-- a prompt extending a cached one gives exactly the output it gives without the prefix cache;
+- a prompt extending a cached one gives exactly the output it gives without the prefix cache, and scored over whole prompt steps it agrees with an uncached run except for rounding;
 - with three drafts a step, greedy output departs from the model's own picks (that output scored teacher-forced) only at near ties, and more than a third of drafts are accepted;
 - the samplers keep exactly the right tokens and draw them in proportion to the model's probabilities;
 - penalties cut repetition;

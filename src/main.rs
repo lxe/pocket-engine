@@ -510,8 +510,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gpu.alloc(t * hv * 32 * 2)?,
                 gpu.alloc(t * hv * 4)?,
             ];
-            let launch = |name: &str, fresh_ptr: u64| -> pocket_engine::Result<()> {
-                if name == "chunk" {
+            // Phases: 1 the prep, 2 the scan (or the recurrent kernel), 4 the norm.
+            let launch = |name: &str, fresh_ptr: u64, phases: u8| -> pocket_engine::Result<()> {
+                if name == "chunk" && phases & 1 != 0 {
                     gpu.launch(
                         prep,
                         ((t.div_ceil(32) + seqs) as u32, hv as u32, 1),
@@ -540,53 +541,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ],
                     )?;
                 }
-                let (kern, smem, z) = match name {
-                    "chunk" => (
-                        kscan,
-                        pocket_engine::model::GDN_SCAN_SMEM as u32,
-                        split as u32,
-                    ),
-                    _ => (gpu.kernel("gdn_recurrent")?, 0, 1),
-                };
-                gpu.launch(
-                    kern,
-                    (seqs as u32, hv as u32, z),
-                    2 * d as u32,
-                    smem,
-                    &[
-                        Arg::P(conv.ptr),
-                        Arg::P(proj.ptr),
-                        Arg::I(pw as i32),
-                        Arg::I(c as i32),
-                        Arg::I(hk as i32),
-                        Arg::I(hv as i32),
-                        Arg::P(neg_a.ptr),
-                        Arg::P(dt.ptr),
-                        Arg::P(nw.ptr),
-                        Arg::P(state.ptr),
-                        Arg::I(1),
-                        Arg::P(cu.ptr),
-                        Arg::P(slots.ptr),
-                        Arg::P(fresh_ptr),
-                        Arg::P(out.ptr),
-                        Arg::F(1e-6),
-                        Arg::I(0),
-                        Arg::P(0),
-                        Arg::P(0),
-                        Arg::I(0),
-                        Arg::I(0),
-                        Arg::P(0),
-                        Arg::I(1),
-                        Arg::P(scratch[0].ptr),
-                        Arg::P(scratch[1].ptr),
-                        Arg::P(scratch[2].ptr),
-                        Arg::P(scratch[3].ptr),
-                        Arg::P(scratch[4].ptr),
-                        Arg::P(scratch[5].ptr),
-                        Arg::P(0),
-                    ],
-                )?;
-                if name != "decode" {
+                if phases & 2 != 0 {
+                    let (kern, smem, z) = match name {
+                        "chunk" => (
+                            kscan,
+                            pocket_engine::model::GDN_SCAN_SMEM as u32,
+                            split as u32,
+                        ),
+                        _ => (gpu.kernel("gdn_recurrent")?, 0, 1),
+                    };
+                    gpu.launch(
+                        kern,
+                        (seqs as u32, hv as u32, z),
+                        2 * d as u32,
+                        smem,
+                        &[
+                            Arg::P(conv.ptr),
+                            Arg::P(proj.ptr),
+                            Arg::I(pw as i32),
+                            Arg::I(c as i32),
+                            Arg::I(hk as i32),
+                            Arg::I(hv as i32),
+                            Arg::P(neg_a.ptr),
+                            Arg::P(dt.ptr),
+                            Arg::P(nw.ptr),
+                            Arg::P(state.ptr),
+                            Arg::I(1),
+                            Arg::P(cu.ptr),
+                            Arg::P(slots.ptr),
+                            Arg::P(fresh_ptr),
+                            Arg::P(out.ptr),
+                            Arg::F(1e-6),
+                            Arg::I(0),
+                            Arg::P(0),
+                            Arg::P(0),
+                            Arg::I(0),
+                            Arg::I(0),
+                            Arg::P(0),
+                            Arg::I(1),
+                            Arg::P(scratch[0].ptr),
+                            Arg::P(scratch[1].ptr),
+                            Arg::P(scratch[2].ptr),
+                            Arg::P(scratch[3].ptr),
+                            Arg::P(scratch[4].ptr),
+                            Arg::P(scratch[5].ptr),
+                            Arg::P(0),
+                        ],
+                    )?;
+                }
+                if name != "decode" && phases & 4 != 0 {
                     gpu.launch(
                         norm,
                         ((t * hv * 32).div_ceil(256) as u32, 1, 1),
@@ -618,7 +621,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if check {
                 // Warm the state, then run both kernels from the same state.
                 let fresh1 = gpu.upload(&i32s(vec![1; seqs]))?;
-                launch("decode", fresh1.ptr)?;
+                launch("decode", fresh1.ptr, 7)?;
                 let sbytes = seqs * hv * d * d * 2;
                 let saved = gpu.alloc(sbytes)?;
                 gpu.dtod(saved.ptr, state.ptr, sbytes)?;
@@ -633,10 +636,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 for (label, f) in [("fresh", fresh1.ptr), ("carried", fresh.ptr)] {
                     gpu.dtod(state.ptr, saved.ptr, sbytes)?;
-                    launch("decode", f)?;
+                    launch("decode", f, 7)?;
                     let (o1, s1) = (fetch(out.ptr, t * hv * d * 2)?, fetch(state.ptr, sbytes)?);
                     gpu.dtod(state.ptr, saved.ptr, sbytes)?;
-                    launch("chunk", f)?;
+                    launch("chunk", f, 7)?;
                     let (o2, s2) = (fetch(out.ptr, t * hv * d * 2)?, fetch(state.ptr, sbytes)?);
                     let rel = |a: &[f32], b: &[f32]| {
                         let scale = a.iter().fold(0f32, |m, x| m.max(x.abs()));
@@ -660,20 +663,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
-            let run = || launch(which, fresh.ptr);
-            run()?;
-            gpu.sync()?;
-            let n = 50;
-            let t0 = std::time::Instant::now();
-            for _ in 0..n {
-                run()?;
-            }
-            gpu.sync()?;
-            let us = t0.elapsed().as_secs_f64() / n as f64 * 1e6;
+            let time = |phases: u8| -> pocket_engine::Result<f64> {
+                launch(which, fresh.ptr, phases)?;
+                gpu.sync()?;
+                let n = 50;
+                let t0 = std::time::Instant::now();
+                for _ in 0..n {
+                    launch(which, fresh.ptr, phases)?;
+                }
+                gpu.sync()?;
+                Ok(t0.elapsed().as_secs_f64() / n as f64 * 1e6)
+            };
+            let us = time(7)?;
+            let kernel = if chunk { "chunked" } else { "gdn_recurrent" };
             println!(
-                "gdn_recurrent: {seqs} x {tokens} tokens, {hv} heads: {us:.1} us ({:.2} us per token per sequence)",
+                "{kernel}: {seqs} x {tokens} tokens, {hv} heads: {us:.1} us ({:.2} us per token per sequence)",
                 us / tokens as f64
             );
+            if chunk {
+                println!(
+                    "  gdn_prep {:.1} us, gdn_scan{split} {:.1} us, gdn_norm {:.1} us",
+                    time(1)?,
+                    time(2)?,
+                    time(4)?
+                );
+            }
         }
         Cmd::BenchAttn {
             kv_heads,

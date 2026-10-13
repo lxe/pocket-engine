@@ -395,16 +395,10 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_recurrent(GDN_ARGS
 //   S = exp(G_last) S0 + (K * exp(G_last - G))^T D
 // which is the token-by-token recurrence of gdn_one, exactly in exact
 // arithmetic. The matrix products run on mma.sync with bf16 operands and f32
-// accumulation; the triangular solve runs in f32, one thread per value
-// column. One block of 8 warps per (sequence, head) walks its chunks; warp w
-// keeps state rows 16w .. 16w + 15 in registers as mma accumulators, with a
-// bf16 copy in shared memory for the products that read it. Sequences with
-// one token take gdn_one's way. Outputs go to `out` unnormalized; gdn_norm
-// finishes them.
+// accumulation; the triangular solve runs in f32, one thread per column.
 #define GC 32
 #define GSTR 136  // bf16 row stride of 128-wide tiles, padded against bank conflicts
 #define GPSTR 40  // bf16 row stride of the 32-wide P tile
-#define GRSTR 132 // f32 row stride of R
 __device__ __forceinline__ void ldsm_x4(uint32_t* r, const void* p) {
     const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -444,237 +438,312 @@ __device__ __forceinline__ void frag_b_t(uint32_t* b, const bf16* B, int stride,
     ldsm_x4_t(b, B + (size_t)(k0 + r + (q & 1) * 8) * stride + n0 + (q >> 1) * 8);
 }
 
-// Shared memory of gdn_chunk, in bytes.
-#define GDN_CHUNK_SMEM (4 * GC * GSTR * 2 + GDN_DIM * GSTR * 2 + GC * GRSTR * 4 + GC * (GC + 1) * 4 + GC * GPSTR * 2 + 4 * GC * 4)
-
-extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_chunk(GDN_ARGS) {
-    extern __shared__ __align__(16) unsigned char gsm[];
-    bf16* sQ = (bf16*)gsm;                      // [GC][GSTR] normalized q (unscaled)
+// Two passes, as FLA computes it. With T = (I + A)^-1, the chunk's update
+// D = T beta (V - exp(G) K S0) splits into D = U - W S0, where U = T (beta V)
+// and W = T (beta exp(G) K) depend only on the chunk's own tokens:
+//   gdn_prep, one block per (chunk, head), all chunks at once: normalized q
+//     and k, the decay G, U, W, Kw = K exp(G_last - G) and
+//     P = tril(qscale Q K^T * Gamma), into per-token scratch rows
+//     [token][Hv][...];
+//   gdn_scan, one block per (sequence, head, share of the value columns),
+//     walking the chunks: D = U - W S0, O = exp(G) qscale Q S0 + P D and
+//     S = exp(G_last) S0 + Kw^T D. Every product there is separable by value
+//     column, so NS blocks split a head's columns without repeating work.
+//     Warp w keeps state rows 16w .. 16w + 15 of its columns in registers
+//     as mma accumulators, with a bf16 copy in shared memory for the
+//     products that read it. Sequences with one token, or verifying drafts,
+//     take gdn_one's way. Outputs go to `out` unnormalized; gdn_norm finishes
+//     them.
+#define GDN_PREP_SMEM (2 * GC * GSTR * 2 + GC * (2 * GDN_DIM + 4) * 4 + GC * (GC + 1) * 4 + 3 * GC * 4)
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
+    gdn_prep(const bf16* __restrict__ conv, const bf16* __restrict__ proj, int pstride, int C, int Hk, int Hv,
+             const float* __restrict__ neg_a, const float* __restrict__ dt_bias, const int* __restrict__ cu, int seqs,
+             const int* __restrict__ outs, int spec, int tiled, bf16* __restrict__ Uo, bf16* __restrict__ Wo,
+             bf16* __restrict__ Qo, bf16* __restrict__ Kwo, bf16* __restrict__ Po, float* __restrict__ Go) {
+    extern __shared__ __align__(16) unsigned char psm[];
+    constexpr int RS = 2 * GDN_DIM + 4;         // f32 row stride of the right-hand sides
+    bf16* sQ = (bf16*)psm;                      // [GC][GSTR] normalized q (unscaled)
     bf16* sK = sQ + GC * GSTR;                  // [GC][GSTR] normalized k
-    bf16* sKw = sK + GC * GSTR;                 // [GC][GSTR] k * exp(G_last - G)
-    bf16* sV = sKw + GC * GSTR;                 // [GC][GSTR] v, then D
-    bf16* sS = sV + GC * GSTR;                  // [GDN_DIM][GSTR] the state, bf16
-    float* sR = (float*)(sS + GDN_DIM * GSTR);  // [GC][GRSTR]
-    float* sA = sR + GC * GRSTR;                // [GC][GC + 1]
-    bf16* sP = (bf16*)(sA + GC * (GC + 1));     // [GC][GPSTR]
-    float* sG = (float*)(sP + GC * GPSTR);      // [GC] cumulative log decay
+    float* sR = (float*)(sK + GC * GSTR);       // [GC][RS] beta v | beta exp(G) k, then U | W
+    float* sA = sR + GC * RS;                   // [GC][GC + 1]
+    float* sG = sA + GC * (GC + 1);             // [GC] cumulative log decay
     float* sB = sG + GC;                        // [GC] beta
     float* sg = sB + GC;                        // [GC] log decay
-    const int s = gridDim.x - 1 - blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    const int h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    int s = -1, chunk = blockIdx.x;
+    for (int i = 0; i < seqs; i++) {
+        const int n = cu[i + 1] - cu[i];
+        if (n <= 1 || is_spec(outs, spec, i)) continue;
+        const int chunks = (n + GC - 1) / GC;
+        if (chunk < chunks) {
+            s = i;
+            break;
+        }
+        chunk -= chunks;
+    }
+    if (s < 0) return;
+    const int c0 = cu[s] + chunk * GC, n = min(GC, cu[s + 1] - c0);
+    const int kh = tiled ? h % Hk : h / (Hv / Hk);
+    const float na = neg_a[h], db = dt_bias[h], qscale = rsqrtf((float)GDN_DIM);
+    // Inputs: a warp per token, four dimensions per lane; rows past n are zero.
+    for (int w = warp; w < GC; w += 8) {
+        float q[4] = {0, 0, 0, 0}, k[4] = {0, 0, 0, 0}, v[4] = {0, 0, 0, 0};
+        if (w < n) {
+            const bf16* row = conv + (size_t)(c0 + w) * C;
+            unpack4(*reinterpret_cast<const uint2*>(row + kh * GDN_DIM + 4 * lane), q);
+            unpack4(*reinterpret_cast<const uint2*>(row + Hk * GDN_DIM + kh * GDN_DIM + 4 * lane), k);
+            unpack4(*reinterpret_cast<const uint2*>(row + 2 * Hk * GDN_DIM + h * GDN_DIM + 4 * lane), v);
+        }
+        float qq = 0.f, kk = 0.f;
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            qq += q[e] * q[e];
+            kk += k[e] * k[e];
+        }
+        qq = warp_sum(qq);
+        kk = warp_sum(kk);
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int d = 4 * lane + e;
+            sQ[w * GSTR + d] = f2b(q[e] / sqrtf(qq + 1e-6f));
+            sK[w * GSTR + d] = f2b(k[e] / sqrtf(kk + 1e-6f));
+            sR[w * RS + d] = v[e];
+        }
+        if (lane == 0) {
+            float beta = 0.f, lg = 0.f;
+            if (w < n) {
+                const bf16* prow = proj + (size_t)(c0 + w) * pstride + C;
+                const float b = b2f(prow[Hv * GDN_DIM + h]);
+                const float a = b2f(prow[Hv * GDN_DIM + Hv + h]);
+                const float x = a + db;
+                const float sp = fmaxf(x, 0.f) + logf(1.f + expf(-fabsf(x)));
+                beta = 1.f / (1.f + expf(-b));
+                lg = na * sp;
+            }
+            sB[w] = beta;
+            sg[w] = lg;
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        // Cumulative log decay (GC == 32: one value per lane).
+        float x = sg[lane];
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const float y = __shfl_up_sync(0xffffffffu, x, o);
+            if (lane >= o) x += y;
+        }
+        sG[lane] = x;
+    }
+    __syncthreads();
+    const float glast = sG[GC - 1];
+    // Right-hand sides beta v and beta exp(G) k; Kw, q and G to the scratch.
+    for (int e = tid; e < GC * GDN_DIM; e += 2 * GDN_DIM) {
+        const int i = e / GDN_DIM, d = e % GDN_DIM;
+        const float kf = b2f(sK[i * GSTR + d]);
+        sR[i * RS + d] *= sB[i];
+        sR[i * RS + GDN_DIM + d] = sB[i] * expf(sG[i]) * kf;
+        if (i < n) {
+            const size_t at = ((size_t)(c0 + i) * Hv + h) * GDN_DIM + d;
+            Kwo[at] = f2b(kf * expf(glast - sG[i]));
+            Qo[at] = sQ[i * GSTR + d];
+        }
+    }
+    if (tid < n) Go[(size_t)(c0 + tid) * Hv + h] = sG[tid];
+    // K K^T (warps 0-3) into A and Q K^T (warps 4-7) into P, a 16 x 16 tile each.
+    {
+        const int m0 = (warp & 1) * 16, n0 = ((warp >> 1) & 1) * 16;
+        const bf16* X = warp < 4 ? sK : sQ;
+        float acc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+#pragma unroll
+        for (int k0 = 0; k0 < GDN_DIM; k0 += 16) {
+            uint32_t a[4], b[4];
+            frag_a(a, X, GSTR, m0, k0);
+            frag_b(b, sK, GSTR, k0, n0);
+            gmma(acc[0], a, b[0], b[1]);
+            gmma(acc[1], a, b[2], b[3]);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 2; nt++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int i = m0 + g + (e >> 1) * 8, j = n0 + nt * 8 + 2 * t + (e & 1);
+                const float gam = j <= i ? expf(sG[i] - sG[j]) : 0.f;
+                if (warp < 4) sA[i * (GC + 1) + j] = j < i ? sB[i] * gam * acc[nt][e] : 0.f;
+                else if (i < n) Po[((size_t)(c0 + i) * Hv + h) * GC + j] = f2b(qscale * gam * acc[nt][e]);
+            }
+    }
+    __syncthreads();
+    // (I + A) [U | W] = [beta v | beta exp(G) k], by forward substitution: a thread per column.
+    {
+        float d[GC];
+#pragma unroll
+        for (int i = 0; i < GC; i++) {
+            float a0 = sR[i * RS + tid], a1 = 0.f;
+#pragma unroll
+            for (int j = 0; j + 1 < i; j += 2) {
+                a0 -= sA[i * (GC + 1) + j] * d[j];
+                a1 -= sA[i * (GC + 1) + j + 1] * d[j + 1];
+            }
+            if (i & 1) a0 -= sA[i * (GC + 1) + i - 1] * d[i - 1];
+            d[i] = a0 + a1;
+        }
+        bf16* dst = tid < GDN_DIM ? Uo : Wo;
+        const int col = tid % GDN_DIM;
+#pragma unroll
+        for (int i = 0; i < GC; i++)
+            if (i < n) dst[((size_t)(c0 + i) * Hv + h) * GDN_DIM + col] = f2b(d[i]);
+    }
+}
+
+#define GDN_SCAN_SMEM (5 * GC * GSTR * 2 + GC * GPSTR * 2 + GC * 4 + GDN_DIM * GSTR * 2)
+template <int NS>
+__device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__ Ui, const bf16* __restrict__ Wi,
+                                              const bf16* __restrict__ Qi, const bf16* __restrict__ Kwi,
+                                              const bf16* __restrict__ Pi, const float* __restrict__ Gi) {
+    constexpr int VW = GDN_DIM / NS, ON = VW / 32;
+    extern __shared__ __align__(16) unsigned char ssm[];
+    bf16* sW = (bf16*)ssm;                      // [GC][GSTR]
+    bf16* sQ = sW + GC * GSTR;                  // [GC][GSTR]
+    bf16* sKw = sQ + GC * GSTR;                 // [GC][GSTR]
+    bf16* sU = sKw + GC * GSTR;                 // [GC][GSTR] this block's columns of U
+    bf16* sD = sU + GC * GSTR;                  // [GC][GSTR] D
+    bf16* sP = sD + GC * GSTR;                  // [GC][GPSTR]
+    float* sG = (float*)(sP + GC * GPSTR);      // [GC]
+    bf16* sS = (bf16*)(sG + GC);                // [GDN_DIM][GSTR] the state's columns, bf16
+    const int s = gridDim.x - 1 - blockIdx.x, h = blockIdx.y, vz = blockIdx.z, tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int t0 = cu[s], t1 = cu[s + 1];
     if (t0 == t1) return;
     if (t1 - t0 == 1 || is_spec(outs, spec, s)) {
-        gdn_one(s, h, GDN_PASS);
+        if (vz == 0) gdn_one(s, h, GDN_PASS);
         return;
     }
-    const int kh = tiled ? h % Hk : h / (Hv / Hk);
+    const int v0 = vz * VW;
     const size_t base = ((size_t)slots[s] * Hv + h) * GDN_DIM * GDN_DIM;
     float* Sg = (float*)state + base;
     bf16* Sgb = (bf16*)state + base;
     const bool is_fresh = fresh[s] != 0;
-    const float na = neg_a[h], db = dt_bias[h], qscale = rsqrtf((float)GDN_DIM);
-    // The state, rows 16w + g (+8) and columns 8n + 2t (+1) of 16 tiles.
-    float st[16][4];
+    const float qscale = rsqrtf((float)GDN_DIM);
+    // The state, rows 16w + g (+8) and columns v0 + 8n + 2t (+1); sS holds
+    // them from column 0.
+    float st[VW / 8][4];
 #pragma unroll
-    for (int n = 0; n < 16; n++)
+    for (int nn = 0; nn < VW / 8; nn++)
 #pragma unroll
         for (int e = 0; e < 4; e++) {
-            const int row = 16 * warp + g + (e >> 1) * 8, col = 8 * n + 2 * t + (e & 1);
+            const int row = 16 * warp + g + (e >> 1) * 8, col = v0 + 8 * nn + 2 * t + (e & 1);
             const size_t at = (size_t)row * GDN_DIM + col;
-            st[n][e] = is_fresh ? 0.f : state_bf16 ? b2f(Sgb[at]) : Sg[at];
+            st[nn][e] = is_fresh ? 0.f : state_bf16 ? b2f(Sgb[at]) : Sg[at];
         }
     auto store_state_smem = [&]() {
 #pragma unroll
-        for (int n = 0; n < 16; n++)
+        for (int nn = 0; nn < VW / 8; nn++)
 #pragma unroll
             for (int hf = 0; hf < 2; hf++) {
-                const int row = 16 * warp + g + hf * 8, col = 8 * n + 2 * t;
+                const int row = 16 * warp + g + hf * 8, col = 8 * nn + 2 * t;
                 *reinterpret_cast<__nv_bfloat162*>(sS + (size_t)row * GSTR + col) =
-                    __floats2bfloat162_rn(st[n][2 * hf], st[n][2 * hf + 1]);
+                    __floats2bfloat162_rn(st[nn][2 * hf], st[nn][2 * hf + 1]);
             }
     };
     store_state_smem();
     bool zero_state = is_fresh;
+    const int om0 = (warp & 1) * 16, on0 = (warp >> 1) * (VW / 4);
     for (int c0 = t0; c0 < t1; c0 += GC) {
         const int n = min(GC, t1 - c0);
-        // Inputs: a warp per token, four dimensions per lane; rows past n are zero.
-        for (int w = warp; w < GC; w += 8) {
-            float q[4] = {0, 0, 0, 0}, k[4] = {0, 0, 0, 0}, v[4] = {0, 0, 0, 0};
-            if (w < n) {
-                const bf16* row = conv + (size_t)(c0 + w) * C;
-                unpack4(*reinterpret_cast<const uint2*>(row + kh * GDN_DIM + 4 * lane), q);
-                unpack4(*reinterpret_cast<const uint2*>(row + Hk * GDN_DIM + kh * GDN_DIM + 4 * lane), k);
-                unpack4(*reinterpret_cast<const uint2*>(row + 2 * Hk * GDN_DIM + h * GDN_DIM + 4 * lane), v);
+        // This chunk's scratch rows; rows past n are zero.
+        for (int e = tid; e < GC * (GDN_DIM / 8); e += 2 * GDN_DIM) {
+            const int i = e / (GDN_DIM / 8), c = (e % (GDN_DIM / 8)) * 8;
+            uint4 w4 = make_uint4(0, 0, 0, 0), q4 = w4, k4 = w4, u4 = w4;
+            if (i < n) {
+                const size_t at = ((size_t)(c0 + i) * Hv + h) * GDN_DIM + c;
+                w4 = *reinterpret_cast<const uint4*>(Wi + at);
+                q4 = *reinterpret_cast<const uint4*>(Qi + at);
+                k4 = *reinterpret_cast<const uint4*>(Kwi + at);
+                if (c < VW) u4 = *reinterpret_cast<const uint4*>(Ui + at + v0);
             }
-            float qq = 0.f, kk = 0.f;
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                qq += q[e] * q[e];
-                kk += k[e] * k[e];
-            }
-            qq = warp_sum(qq);
-            kk = warp_sum(kk);
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const int d = 4 * lane + e;
-                sQ[w * GSTR + d] = f2b(q[e] / sqrtf(qq + 1e-6f));
-                sK[w * GSTR + d] = f2b(k[e] / sqrtf(kk + 1e-6f));
-                sV[w * GSTR + d] = f2b(v[e]);
-            }
-            if (lane == 0) {
-                float beta = 0.f, lg = 0.f;
-                if (w < n) {
-                    const bf16* prow = proj + (size_t)(c0 + w) * pstride + C;
-                    const float b = b2f(prow[Hv * GDN_DIM + h]);
-                    const float a = b2f(prow[Hv * GDN_DIM + Hv + h]);
-                    const float x = a + db;
-                    const float sp = fmaxf(x, 0.f) + logf(1.f + expf(-fabsf(x)));
-                    beta = 1.f / (1.f + expf(-b));
-                    lg = na * sp;
-                }
-                sB[w] = beta;
-                sg[w] = lg;
-            }
+            *reinterpret_cast<uint4*>(sW + i * GSTR + c) = w4;
+            *reinterpret_cast<uint4*>(sQ + i * GSTR + c) = q4;
+            *reinterpret_cast<uint4*>(sKw + i * GSTR + c) = k4;
+            if (c < VW) *reinterpret_cast<uint4*>(sU + i * GSTR + c) = u4;
         }
-        __syncthreads();
-        if (warp == 0) {
-            // Cumulative log decay (GC == 32: one value per lane).
-            float x = sg[lane];
-#pragma unroll
-            for (int o = 1; o < 32; o <<= 1) {
-                const float y = __shfl_up_sync(0xffffffffu, x, o);
-                if (lane >= o) x += y;
-            }
-            sG[lane] = x;
+        for (int e = tid; e < GC * (GC / 8); e += 2 * GDN_DIM) {
+            const int i = e / (GC / 8), c = (e % (GC / 8)) * 8;
+            uint4 p4 = make_uint4(0, 0, 0, 0);
+            if (i < n) p4 = *reinterpret_cast<const uint4*>(Pi + ((size_t)(c0 + i) * Hv + h) * GC + c);
+            *reinterpret_cast<uint4*>(sP + i * GPSTR + c) = p4;
         }
+        if (tid < GC) sG[tid] = Gi[(size_t)(c0 + min(tid, n - 1)) * Hv + h];
         __syncthreads();
         const float glast = sG[GC - 1];
-        for (int e = tid; e < GC * GDN_DIM; e += 2 * GDN_DIM) {
-            const int j = e / GDN_DIM, d = e % GDN_DIM;
-            sKw[j * GSTR + d] = f2b(b2f(sK[j * GSTR + d]) * expf(glast - sG[j]));
-        }
-        // K K^T (warps 0-3) and Q K^T (warps 4-7), a 16 x 16 tile each.
+        // D = U - W S0 and Q S0, rows om0 .. om0 + 15, this warp's columns.
+        float accq[ON][4];
         {
-            const int m0 = (warp & 1) * 16, n0 = ((warp >> 1) & 1) * 16;
-            const bf16* X = warp < 4 ? sK : sQ;
-            float acc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+            float acc[ON][4];
 #pragma unroll
-            for (int k0 = 0; k0 < GDN_DIM; k0 += 16) {
-                uint32_t a[4], b[4];
-                frag_a(a, X, GSTR, m0, k0);
-                frag_b(b, sK, GSTR, k0, n0);
-                gmma(acc[0], a, b[0], b[1]);
-                gmma(acc[1], a, b[2], b[3]);
-            }
+            for (int nt = 0; nt < ON; nt++)
 #pragma unroll
-            for (int nt = 0; nt < 2; nt++)
-#pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    const int i = m0 + g + (e >> 1) * 8, j = n0 + nt * 8 + 2 * t + (e & 1);
-                    const float gam = j <= i ? expf(sG[i] - sG[j]) : 0.f;
-                    if (warp < 4) sA[i * (GC + 1) + j] = j < i ? sB[i] * gam * acc[nt][e] : 0.f;
-                    else sP[i * GPSTR + j] = f2b(qscale * gam * acc[nt][e]);
-                }
-        }
-        // R = beta * (V - exp(G) * K S0): rows m0 .. m0 + 15, columns n0 .. n0 + 31 per warp.
-        const int om0 = (warp & 1) * 16, on0 = (warp >> 1) * 32;
-        {
-            float acc[4][4];
-#pragma unroll
-            for (int nt = 0; nt < 4; nt++) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
+                for (int e = 0; e < 4; e++) acc[nt][e] = accq[nt][e] = 0.f;
             if (!zero_state) {
 #pragma unroll
                 for (int k0 = 0; k0 < GDN_DIM; k0 += 16) {
-                    uint32_t a[4], b0[4], b1[4];
-                    frag_a(a, sK, GSTR, om0, k0);
-                    frag_b_t(b0, sS, GSTR, k0, on0);
-                    frag_b_t(b1, sS, GSTR, k0, on0 + 16);
-                    gmma(acc[0], a, b0[0], b0[1]);
-                    gmma(acc[1], a, b0[2], b0[3]);
-                    gmma(acc[2], a, b1[0], b1[1]);
-                    gmma(acc[3], a, b1[2], b1[3]);
+                    uint32_t a[4], aq[4];
+                    frag_a(a, sW, GSTR, om0, k0);
+                    frag_a(aq, sQ, GSTR, om0, k0);
+#pragma unroll
+                    for (int nt = 0; nt < ON; nt++) {
+                        uint32_t b[4];
+                        frag_b_t(b, sS, GSTR, k0, on0 + 8 * nt);
+                        gmma(acc[nt], a, b[0], b[1]);
+                        gmma(accq[nt], aq, b[0], b[1]);
+                    }
                 }
             }
 #pragma unroll
-            for (int nt = 0; nt < 4; nt++)
-#pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    const int i = om0 + g + (e >> 1) * 8, c = on0 + nt * 8 + 2 * t + (e & 1);
-                    sR[i * GRSTR + c] = sB[i] * (b2f(sV[i * GSTR + c]) - expf(sG[i]) * acc[nt][e]);
-                }
-        }
-        __syncthreads();
-        // (I + A) D = R, by forward substitution: a thread per column.
-        if (tid < GDN_DIM) {
-            float d[GC];
-#pragma unroll
-            for (int i = 0; i < GC; i++) {
-                float a0 = sR[i * GRSTR + tid], a1 = 0.f;
-#pragma unroll
-                for (int j = 0; j + 1 < i; j += 2) {
-                    a0 -= sA[i * (GC + 1) + j] * d[j];
-                    a1 -= sA[i * (GC + 1) + j + 1] * d[j + 1];
-                }
-                if (i & 1) a0 -= sA[i * (GC + 1) + i - 1] * d[i - 1];
-                d[i] = a0 + a1;
-            }
-#pragma unroll
-            for (int i = 0; i < GC; i++) sV[i * GSTR + tid] = f2b(d[i]);
-        }
-        __syncthreads();
-        // O = exp(G) * qscale * Q S0 + P D, written unnormalized.
-        {
-            float acc[4][4];
-#pragma unroll
-            for (int nt = 0; nt < 4; nt++) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
-            if (!zero_state) {
-#pragma unroll
-                for (int k0 = 0; k0 < GDN_DIM; k0 += 16) {
-                    uint32_t a[4], b0[4], b1[4];
-                    frag_a(a, sQ, GSTR, om0, k0);
-                    frag_b_t(b0, sS, GSTR, k0, on0);
-                    frag_b_t(b1, sS, GSTR, k0, on0 + 16);
-                    gmma(acc[0], a, b0[0], b0[1]);
-                    gmma(acc[1], a, b0[2], b0[3]);
-                    gmma(acc[2], a, b1[0], b1[1]);
-                    gmma(acc[3], a, b1[2], b1[3]);
-                }
-                const float e0 = qscale * expf(sG[om0 + g]), e1 = qscale * expf(sG[om0 + g + 8]);
-#pragma unroll
-                for (int nt = 0; nt < 4; nt++) {
-                    acc[nt][0] *= e0;
-                    acc[nt][1] *= e0;
-                    acc[nt][2] *= e1;
-                    acc[nt][3] *= e1;
-                }
-            }
-#pragma unroll
-            for (int k0 = 0; k0 < GC; k0 += 16) {
-                uint32_t a[4], b0[4], b1[4];
-                frag_a(a, sP, GPSTR, om0, k0);
-                frag_b_t(b0, sV, GSTR, k0, on0);
-                frag_b_t(b1, sV, GSTR, k0, on0 + 16);
-                gmma(acc[0], a, b0[0], b0[1]);
-                gmma(acc[1], a, b0[2], b0[3]);
-                gmma(acc[2], a, b1[0], b1[1]);
-                gmma(acc[3], a, b1[2], b1[3]);
-            }
-#pragma unroll
-            for (int nt = 0; nt < 4; nt++)
+            for (int nt = 0; nt < ON; nt++)
 #pragma unroll
                 for (int hf = 0; hf < 2; hf++) {
                     const int i = om0 + g + hf * 8, c = on0 + nt * 8 + 2 * t;
-                    if (i < n)
-                        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)(c0 + i) * Hv * GDN_DIM + h * GDN_DIM + c) =
-                            __floats2bfloat162_rn(acc[nt][2 * hf], acc[nt][2 * hf + 1]);
+                    const __nv_bfloat162 u = *reinterpret_cast<const __nv_bfloat162*>(sU + i * GSTR + c);
+                    *reinterpret_cast<__nv_bfloat162*>(sD + i * GSTR + c) = __floats2bfloat162_rn(
+                        __low2float(u) - acc[nt][2 * hf], __high2float(u) - acc[nt][2 * hf + 1]);
                 }
+            const float e0 = qscale * expf(sG[om0 + g]), e1 = qscale * expf(sG[om0 + g + 8]);
+#pragma unroll
+            for (int nt = 0; nt < ON; nt++) {
+                accq[nt][0] *= e0;
+                accq[nt][1] *= e0;
+                accq[nt][2] *= e1;
+                accq[nt][3] *= e1;
+            }
         }
-        // S = exp(G_last) S0 + Kw^T D: this warp's 16 rows, all 128 columns.
+        __syncthreads();
+        // O = exp(G) qscale Q S0 + P D, written unnormalized.
+#pragma unroll
+        for (int k0 = 0; k0 < GC; k0 += 16) {
+            uint32_t a[4];
+            frag_a(a, sP, GPSTR, om0, k0);
+#pragma unroll
+            for (int nt = 0; nt < ON; nt++) {
+                uint32_t b[4];
+                frag_b_t(b, sD, GSTR, k0, on0 + 8 * nt);
+                gmma(accq[nt], a, b[0], b[1]);
+            }
+        }
+#pragma unroll
+        for (int nt = 0; nt < ON; nt++)
+#pragma unroll
+            for (int hf = 0; hf < 2; hf++) {
+                const int i = om0 + g + hf * 8, c = on0 + nt * 8 + 2 * t;
+                if (i < n)
+                    *reinterpret_cast<__nv_bfloat162*>(out + (size_t)(c0 + i) * Hv * GDN_DIM + h * GDN_DIM + v0 + c) =
+                        __floats2bfloat162_rn(accq[nt][2 * hf], accq[nt][2 * hf + 1]);
+            }
+        // S = exp(G_last) S0 + Kw^T D: this warp's 16 rows, this block's columns.
         {
             const float decay = expf(glast);
 #pragma unroll
-            for (int nt = 0; nt < 16; nt++)
+            for (int nt = 0; nt < VW / 8; nt++)
 #pragma unroll
                 for (int e = 0; e < 4; e++) st[nt][e] *= decay;
 #pragma unroll
@@ -682,9 +751,9 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_chunk(GDN_ARGS) {
                 uint32_t a[4];
                 frag_a_t(a, sKw, GSTR, 16 * warp, k0);
 #pragma unroll
-                for (int np = 0; np < 8; np++) {
+                for (int np = 0; np < VW / 16; np++) {
                     uint32_t b[4];
-                    frag_b_t(b, sV, GSTR, k0, 16 * np);
+                    frag_b_t(b, sD, GSTR, k0, 16 * np);
                     gmma(st[2 * np], a, b[0], b[1]);
                     gmma(st[2 * np + 1], a, b[2], b[3]);
                 }
@@ -696,14 +765,26 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_chunk(GDN_ARGS) {
         __syncthreads();
     }
 #pragma unroll
-    for (int nt = 0; nt < 16; nt++)
+    for (int nn = 0; nn < VW / 8; nn++)
 #pragma unroll
         for (int e = 0; e < 4; e++) {
-            const int row = 16 * warp + g + (e >> 1) * 8, col = 8 * nt + 2 * t + (e & 1);
+            const int row = 16 * warp + g + (e >> 1) * 8, col = v0 + 8 * nn + 2 * t + (e & 1);
             const size_t at = (size_t)row * GDN_DIM + col;
-            if (state_bf16) Sgb[at] = f2b(st[nt][e]);
-            else Sg[at] = st[nt][e];
+            if (state_bf16) Sgb[at] = f2b(st[nn][e]);
+            else Sg[at] = st[nn][e];
         }
+}
+#define GDN_SCAN_ARGS                                                                                   \
+    GDN_ARGS, const bf16 *__restrict__ Ui, const bf16 *__restrict__ Wi, const bf16 *__restrict__ Qi,  \
+        const bf16 *__restrict__ Kwi, const bf16 *__restrict__ Pi, const float *__restrict__ Gi
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan1(GDN_SCAN_ARGS) {
+    gdn_scan_cols<1>(GDN_PASS, Ui, Wi, Qi, Kwi, Pi, Gi);
+}
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan2(GDN_SCAN_ARGS) {
+    gdn_scan_cols<2>(GDN_PASS, Ui, Wi, Qi, Kwi, Pi, Gi);
+}
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan4(GDN_SCAN_ARGS) {
+    gdn_scan_cols<4>(GDN_PASS, Ui, Wi, Qi, Kwi, Pi, Gi);
 }
 
 // The gated RMSNorm of one (token, head): lane l < 16 holds outputs 8l ..
@@ -728,7 +809,7 @@ __device__ __forceinline__ void gdn_gate8(float* o, int t, int h, int Hv, const 
     }
     if (fmode) quant8(o, t, h * GDN_DIM + 8 * (lane & 15), Hv * GDN_DIM, fo, lane < 16);
 }
-// The gated norm for gdn_chunk's outputs, in place: a warp per (token,
+// The gated norm for gdn_scan's outputs, in place: a warp per (token,
 // head), over the tokens of sequences with more than one.
 extern "C" __global__ void gdn_norm(const bf16* __restrict__ proj, int pstride, int C, int Hv,
                                     const float* __restrict__ norm_w, bf16* __restrict__ out, int T, float eps,

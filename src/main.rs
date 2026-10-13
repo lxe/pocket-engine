@@ -141,13 +141,16 @@ enum Cmd {
         seqs: usize,
         #[arg(long, default_value_t = 128)]
         tokens: usize,
-        /// The chunked tensor-core kernel for prompts, with its norm, instead
-        /// of gdn_recurrent.
+        /// The chunked tensor-core kernels for prompts (gdn_prep, gdn_scan
+        /// and the norm) instead of gdn_recurrent.
         #[arg(long)]
         chunk: bool,
-        /// Compare the chunked kernel's outputs and state with gdn_recurrent's.
+        /// Compare the chunked kernels' outputs and state with gdn_recurrent's.
         #[arg(long)]
         check: bool,
+        /// gdn_scan's blocks per head: 1, 2 or 4.
+        #[arg(long, default_value_t = 1)]
+        split: usize,
     },
     /// Times flash attention for prompts alone: `seqs` prompts of `tokens`
     /// new tokens after `context` cached ones, `group` query heads per key
@@ -460,6 +463,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokens,
             chunk,
             check,
+            split,
         } => {
             use pocket_engine::gpu::{Arg, Gpu};
             let gpu = Gpu::new(0)?;
@@ -490,23 +494,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fresh = gpu.upload(&i32s(vec![0; seqs]))?;
             let tok_seq = gpu.upload(&i32s((0..t).map(|i| (i / tokens) as i32).collect()))?;
             let out = gpu.alloc(t * hv * d * 2)?;
-            let chunk_smem = 4 * 32 * 136 * 2
-                + 128 * 136 * 2
-                + 32 * 132 * 4
-                + 32 * 33 * 4
-                + 32 * 40 * 2
-                + 4 * 32 * 4;
-            let kchunk = gpu.kernel("gdn_chunk")?;
-            gpu.set_smem(kchunk, chunk_smem)?;
             let norm = gpu.kernel("gdn_norm")?;
+            let prep = gpu.kernel("gdn_prep")?;
+            gpu.set_smem(prep, pocket_engine::model::GDN_PREP_SMEM)?;
+            let kscan = gpu.kernel(&format!("gdn_scan{split}"))?;
+            gpu.set_smem(kscan, pocket_engine::model::GDN_SCAN_SMEM)?;
+            let scratch = [
+                gpu.alloc(t * hv * d * 2)?,
+                gpu.alloc(t * hv * d * 2)?,
+                gpu.alloc(t * hv * d * 2)?,
+                gpu.alloc(t * hv * d * 2)?,
+                gpu.alloc(t * hv * 32 * 2)?,
+                gpu.alloc(t * hv * 4)?,
+            ];
             let launch = |name: &str, fresh_ptr: u64| -> pocket_engine::Result<()> {
-                let (kern, smem) = match name {
-                    "chunk" => (kchunk, chunk_smem as u32),
-                    _ => (gpu.kernel("gdn_recurrent")?, 0),
+                if name == "chunk" {
+                    gpu.launch(
+                        prep,
+                        ((t.div_ceil(32) + seqs) as u32, hv as u32, 1),
+                        2 * d as u32,
+                        pocket_engine::model::GDN_PREP_SMEM as u32,
+                        &[
+                            Arg::P(conv.ptr),
+                            Arg::P(proj.ptr),
+                            Arg::I(pw as i32),
+                            Arg::I(c as i32),
+                            Arg::I(hk as i32),
+                            Arg::I(hv as i32),
+                            Arg::P(neg_a.ptr),
+                            Arg::P(dt.ptr),
+                            Arg::P(cu.ptr),
+                            Arg::I(seqs as i32),
+                            Arg::P(0),
+                            Arg::I(1),
+                            Arg::I(0),
+                            Arg::P(scratch[0].ptr),
+                            Arg::P(scratch[1].ptr),
+                            Arg::P(scratch[2].ptr),
+                            Arg::P(scratch[3].ptr),
+                            Arg::P(scratch[4].ptr),
+                            Arg::P(scratch[5].ptr),
+                        ],
+                    )?;
+                }
+                let (kern, smem, z) = match name {
+                    "chunk" => (
+                        kscan,
+                        pocket_engine::model::GDN_SCAN_SMEM as u32,
+                        split as u32,
+                    ),
+                    _ => (gpu.kernel("gdn_recurrent")?, 0, 1),
                 };
                 gpu.launch(
                     kern,
-                    (seqs as u32, hv as u32, 1),
+                    (seqs as u32, hv as u32, z),
                     2 * d as u32,
                     smem,
                     &[
@@ -533,6 +574,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Arg::I(0),
                         Arg::P(0),
                         Arg::I(1),
+                        Arg::P(scratch[0].ptr),
+                        Arg::P(scratch[1].ptr),
+                        Arg::P(scratch[2].ptr),
+                        Arg::P(scratch[3].ptr),
+                        Arg::P(scratch[4].ptr),
+                        Arg::P(scratch[5].ptr),
                     ],
                 )?;
                 if name != "decode" {

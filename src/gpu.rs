@@ -240,6 +240,8 @@ pub struct Gpu {
     pub sms: usize,
     /// Compute capability, as major * 10 + minor.
     pub arch: u32,
+    /// Shared memory per SM, in bytes.
+    pub smem_per_sm: usize,
     lt: lt::cublasLtHandle_t,
     lt_ws: Buf,
     lt_plans: RefCell<HashMap<PlanKey, LtPlan>>,
@@ -303,6 +305,15 @@ impl Gpu {
                 ),
                 "cuDeviceGetAttribute",
             )?;
+            let mut smem_per_sm = 0;
+            check(
+                cu::cuDeviceGetAttribute(
+                    &mut smem_per_sm,
+                    cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+                    dev,
+                ),
+                "cuDeviceGetAttribute",
+            )?;
             let mut stream = std::ptr::null_mut();
             check(
                 cu::cuStreamCreate(
@@ -351,6 +362,7 @@ impl Gpu {
             check(cu::cuMemAlloc_v2(&mut lw, lt_bytes), "cuMemAlloc")?;
             Ok(Self {
                 sms: sms as usize,
+                smem_per_sm: smem_per_sm as usize,
                 arch: (major * 10 + minor) as u32,
                 lt: lth,
                 lt_ws: Buf {

@@ -48,10 +48,20 @@ pub fn fa_shape(g: usize, arch: u32) -> (usize, usize) {
 pub fn fa_smem(g: usize, tiles: usize, keys: usize) -> usize {
     (g * 16 * tiles + 4 * keys) * (HEAD_DIM + 8) * 2
 }
-/// Dynamic shared memory of the chunked gated delta rule (GDN_CHUNK_SMEM in
-/// qwen35.cu).
-const GDN_CHUNK_SMEM: usize =
-    4 * 32 * 136 * 2 + 128 * 136 * 2 + 32 * 132 * 4 + 32 * 33 * 4 + 32 * 40 * 2 + 4 * 32 * 4;
+/// Dynamic shared memory of the two-pass chunked gated delta rule
+/// (GDN_PREP_SMEM and GDN_SCAN_SMEM in qwen35.cu).
+pub const GDN_PREP_SMEM: usize = 2 * 32 * 136 * 2 + 32 * 260 * 4 + 32 * 33 * 4 + 3 * 32 * 4;
+pub const GDN_SCAN_SMEM: usize = 5 * 32 * 136 * 2 + 32 * 40 * 2 + 32 * 4 + 128 * 136 * 2;
+/// Value-column shares of gdn_scan for a step of `s` sequences: the most
+/// (up to 4) whose blocks are all resident at once.
+pub fn gdn_split(s: usize, hv: usize, gpu: &Gpu) -> usize {
+    let slots = gpu.sms * (gpu.smem_per_sm / (GDN_SCAN_SMEM + 1024)).max(1);
+    match slots / (s * hv) {
+        0 | 1 => 1,
+        2 | 3 => 2,
+        _ => 4,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -364,9 +374,11 @@ struct Kernels {
     silu_mul: Kernel,
     gdn_conv: Kernel,
     gdn_recurrent: Kernel,
-    /// The recurrence for steps with prompt tokens (chunked, on tensor
-    /// cores), and its gated norm.
-    gdn_split: Kernel,
+    /// The recurrence for steps with prompt tokens, chunked on tensor cores
+    /// in two passes (see gdn_prep in qwen35.cu), gdn_scan with 1, 2 or 4
+    /// blocks per head; and its gated norm.
+    gdn_prep: Kernel,
+    gdn_scan: [Kernel; 3],
     gdn_norm: Kernel,
     attn_prep: Kernel,
     attn: Kernel,
@@ -621,10 +633,19 @@ impl Model {
             silu_mul: gpu.kernel("silu_mul")?,
             gdn_conv: gpu.kernel("gdn_conv")?,
             gdn_recurrent: gpu.kernel("gdn_recurrent")?,
-            gdn_split: {
-                let k = gpu.kernel("gdn_chunk")?;
-                gpu.set_smem(k, GDN_CHUNK_SMEM)?;
+            gdn_prep: {
+                let k = gpu.kernel("gdn_prep")?;
+                gpu.set_smem(k, GDN_PREP_SMEM)?;
                 k
+            },
+            gdn_scan: {
+                let mut ks = Vec::new();
+                for name in ["gdn_scan1", "gdn_scan2", "gdn_scan4"] {
+                    let k = gpu.kernel(name)?;
+                    gpu.set_smem(k, GDN_SCAN_SMEM)?;
+                    ks.push(k);
+                }
+                [ks[0], ks[1], ks[2]]
             },
             gdn_norm: gpu.kernel("gdn_norm")?,
             attn_prep: gpu.kernel("attn_prep")?,
@@ -917,6 +938,9 @@ pub struct Act {
     fp8: Option<Fp8Acts>,
     /// The draft layer's buffers, with multi-token prediction.
     mtp: Option<MtpActs>,
+    /// gdn_prep's per-token rows for gdn_scan: U, W, q, Kw (bf16, 128 per
+    /// head), P (bf16, 32 per head) and G (f32, one per head).
+    gdn: [Buf; 6],
 }
 
 struct MtpActs {
@@ -1031,6 +1055,17 @@ impl Act {
             pen_staging: gpu.pinned(3 * pen_capacity * 4)?,
             pen_capacity,
             fp8,
+            gdn: {
+                let rows = t * cfg.lin_v_heads;
+                [
+                    b(rows * GDN_DIM)?,
+                    b(rows * GDN_DIM)?,
+                    b(rows * GDN_DIM)?,
+                    b(rows * GDN_DIM)?,
+                    b(rows * 32)?,
+                    gpu.alloc_zeroed(rows * 4)?,
+                ]
+            },
             mtp: if cfg.mtp {
                 Some(MtpActs {
                     tok: gpu.alloc_zeroed(t * 4)?,
@@ -1625,13 +1660,48 @@ impl Model {
                         I(c.tiled_v as i32),
                     ];
                     if t > s {
-                        // Prompt tokens: chunked on tensor cores, then the norm.
+                        // Prompt tokens: chunked on tensor cores, in two
+                        // passes, then the norm.
+                        let scratch = a.gdn.each_ref().map(|b| P(b.ptr));
                         gpu.launch(
-                            k.gdn_split,
-                            (si, hv as u32, 1),
+                            k.gdn_prep,
+                            ((t.div_ceil(32) + s) as u32, hv as u32, 1),
                             2 * GDN_DIM as u32,
-                            GDN_CHUNK_SMEM as u32,
-                            &[args.as_slice(), &a.fp8_args(|f| &f.core, t), &outs].concat(),
+                            GDN_PREP_SMEM as u32,
+                            &[
+                                [
+                                    P(a.conv.ptr),
+                                    P(a.proj.ptr),
+                                    I(pw as i32),
+                                    I(cd as i32),
+                                    I(c.lin_k_heads as i32),
+                                    I(hv as i32),
+                                    P(neg_a.ptr),
+                                    P(dt_bias.ptr),
+                                    P(v.cu),
+                                    I(s as i32),
+                                    outs[0],
+                                    outs[1],
+                                    I(c.tiled_v as i32),
+                                ]
+                                .as_slice(),
+                                &scratch,
+                            ]
+                            .concat(),
+                        )?;
+                        let split = gdn_split(s, hv, gpu);
+                        gpu.launch(
+                            k.gdn_scan[split.trailing_zeros() as usize],
+                            (si, hv as u32, split as u32),
+                            2 * GDN_DIM as u32,
+                            GDN_SCAN_SMEM as u32,
+                            &[
+                                args.as_slice(),
+                                &a.fp8_args(|f| &f.core, t),
+                                &outs,
+                                &scratch,
+                            ]
+                            .concat(),
                         )?;
                         gpu.launch(
                             k.gdn_norm,

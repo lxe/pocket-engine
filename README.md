@@ -1,6 +1,6 @@
 # pocket-engine
 
-An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine. It is ready 5 seconds after launch, and a 27B model reaches serving in about 2 seconds from the page cache ([design and measurements](docs/design.md)).
+An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine. It is ready 5 seconds after launch, and a 27B model reaches serving in about 2 seconds from the page cache ([design and measurements](docs/design.md); [against vLLM and llama.cpp on an H100](docs/h100-comparison.md)).
 
 ## Supported
 

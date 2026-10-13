@@ -46,9 +46,9 @@ Qwen3.5-9B, bf16, one request at a time on an RTX 5090, 128 output tokens (`scri
 
 | Prompt | First token, before | First token, now | Prefill | Decode, before | Decode, now |
 |---:|---:|---:|---:|---:|---:|
-| 8k | 0.95 s | 0.75 s | 11,000 tok/s | 57 tok/s | 85 tok/s |
-| 32k | 7.2 s | 3.5 s | 9,400 tok/s | 28 tok/s | 82 tok/s |
-| 64k | 24.1 s | 8.6 s | 7,600 tok/s | 17 tok/s | 78 tok/s |
+| 8k | 0.95 s | 0.70 s | 11,700 tok/s | 57 tok/s | 84 tok/s |
+| 32k | 7.2 s | 3.2 s | 10,300 tok/s | 28 tok/s | 81 tok/s |
+| 64k | 24.1 s | 7.6 s | 8,600 tok/s | 17 tok/s | 78 tok/s |
 
 Decoding with a short context runs at 89 tok/s; at 64k, reading the 2 GB of cached keys and values each step accounts for the rest. Four 32k prompts at once share the GPU at 9,400 prompt tokens per second.
 

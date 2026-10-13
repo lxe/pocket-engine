@@ -2,7 +2,7 @@
 //! one forward step over a flat token batch.
 
 use crate::gguf::Gguf;
-use crate::gpu::{Arg, Buf, Fp8Mode, Gpu, Kernel, Pinned};
+use crate::gpu::{Arg, Buf, Fp8Mode, Gpu, Kernel, Pinned, TensorMap};
 use crate::linear::{Input, Kind, Linear, Part, Quants};
 use crate::source::{Load, Source};
 use crate::{Error, Result};
@@ -73,9 +73,10 @@ impl FaShape {
         (g * 16 * self.tiles + 4 * self.keys) * (HEAD_DIM + 8) * 2
     }
 }
-/// Dynamic shared memory of attn_wg_g<G> (WG_SMEM in qwen35.cu): two
-/// warpgroups' queries and two buffers of keys and values, 64 x 256 bf16 each.
-pub const WG_SMEM: usize = 6 * 64 * HEAD_DIM * 2;
+/// Dynamic shared memory of attn_ws_g<G> (WS_SMEM in qwen35.cu): two
+/// warpgroups' queries and two stages of keys and values, 64 x 256 bf16
+/// each, and the stages' mbarriers.
+pub const WS_SMEM: usize = 6 * 64 * HEAD_DIM * 2 + 64;
 /// Whether prompts take the wgmma flash kernel: Hopper, a bf16 cache and
 /// groups of 4 or 6.
 pub fn fa_wgmma(g: usize, arch: u32, kv_fp8: bool) -> bool {
@@ -423,7 +424,8 @@ struct Kernels {
     attn_flash: Kernel,
     attn_flash8: Kernel,
     fa_shape: FaShape,
-    /// On Hopper: flash attention on wgmma, for a bf16 cache.
+    /// On Hopper: flash attention on wgmma, warp-specialized with TMA loads,
+    /// for a bf16 cache.
     attn_wg: Option<Kernel>,
     /// FP8 copies of bf16 rows (the flash kernel's output, for FP8 layers).
     fp8_rows: Kernel,
@@ -703,8 +705,8 @@ impl Model {
             },
             fa_shape: fa_shape(cfg.hq / cfg.hkv, gpu.arch),
             attn_wg: if fa_wgmma(cfg.hq / cfg.hkv, gpu.arch, false) {
-                let k = gpu.kernel(&format!("attn_wg_g{}", cfg.hq / cfg.hkv))?;
-                gpu.set_smem(k, WG_SMEM)?;
+                let k = gpu.kernel(&format!("attn_ws_g{}", cfg.hq / cfg.hkv))?;
+                gpu.set_smem(k, WS_SMEM)?;
                 Some(k)
             } else {
                 None
@@ -773,6 +775,9 @@ pub struct State {
     /// With an E4M3 cache: f32 scales per [slot][kv head] of each layer.
     ks: Vec<Buf>,
     vs: Vec<Buf>,
+    /// On Hopper with a bf16 cache: TMA maps of each layer's keys and values
+    /// ([slot][kv head][256], boxes of 16 slots x 64 columns).
+    maps: Vec<(&'static TensorMap, &'static TensorMap)>,
     pub kv_fp8: bool,
     /// Recurrent state stored as bf16 (math stays f32).
     pub state_bf16: bool,
@@ -804,6 +809,7 @@ impl State {
             vc: vec![],
             ks: vec![],
             vs: vec![],
+            maps: vec![],
             kv_fp8,
             state_bf16,
             slots,
@@ -821,6 +827,23 @@ impl State {
             if kv_fp8 {
                 s.ks.push(gpu.alloc_zeroed(heads * 4)?);
                 s.vs.push(gpu.alloc_zeroed(heads * 4)?);
+            }
+        }
+        if fa_wgmma(cfg.hq / cfg.hkv, gpu.arch, kv_fp8) {
+            for (k, v) in s.kc.iter().zip(&s.vc) {
+                let map = |ptr| {
+                    gpu.tensor_map_3d(
+                        ptr,
+                        [
+                            HEAD_DIM as u64,
+                            cfg.hkv as u64,
+                            (blocks * BLOCK_SIZE) as u64,
+                        ],
+                        [(HEAD_DIM * 2) as u64, (cfg.hkv * HEAD_DIM * 2) as u64],
+                        [64, 1, BLOCK_SIZE as u32],
+                    )
+                };
+                s.maps.push((map(k.ptr)?, map(v.ptr)?));
             }
         }
         Ok(s)
@@ -1905,16 +1928,17 @@ impl Model {
                         // head and 16 queries per tile.
                         let group = c.hq / c.hkv;
                         let sh = k.fa_shape;
-                        let (kern, grid, threads, smem) = match k.attn_wg {
-                            Some(wg) if !st.kv_fp8 => (
+                        let maps = st.maps.get(*cache);
+                        let (kern, grid, threads, smem) = match (k.attn_wg, maps) {
+                            (Some(wg), Some(_)) => (
                                 wg,
                                 (
                                     (t.div_ceil(64) + s) as u32,
                                     c.hkv as u32,
                                     (group / 2) as u32,
                                 ),
-                                256,
-                                WG_SMEM,
+                                384,
+                                WS_SMEM,
                             ),
                             _ => (
                                 if st.kv_fp8 {
@@ -1952,7 +1976,16 @@ impl Model {
                                 F(1.0 / (HEAD_DIM as f32).sqrt()),
                                 outs[0],
                                 outs[1],
-                            ],
+                            ]
+                            .into_iter()
+                            .chain(maps.into_iter().flat_map(|&(km, vm)| {
+                                [
+                                    Arg::Map(km),
+                                    Arg::Map(vm),
+                                    I((st.blocks * BLOCK_SIZE) as i32),
+                                ]
+                            }))
+                            .collect::<Vec<_>>(),
                         )?;
                         if a.fp8.is_some() {
                             // FP8 copies for the output projection.

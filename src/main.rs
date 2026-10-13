@@ -732,14 +732,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (tiles, smem) = (sh.tiles, sh.smem(group));
             let (name, grid, threads, smem) = if wg {
                 (
-                    format!("attn_wg_g{group}"),
+                    format!("attn_ws_g{group}"),
                     (
                         (t.div_ceil(64) + seqs) as u32,
                         hkv as u32,
                         (group / 2) as u32,
                     ),
-                    256,
-                    pocket_engine::model::WG_SMEM,
+                    384,
+                    pocket_engine::model::WS_SMEM,
                 )
             } else {
                 (
@@ -751,34 +751,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let flash = gpu.kernel(&name)?;
             gpu.set_smem(flash, smem)?;
+            // The wgmma kernel reads the cache through TMA maps:
+            // [slot][kv head][256] in boxes of 16 slots x 64 columns.
+            let maps = if wg {
+                let map = |ptr| {
+                    gpu.tensor_map_3d(
+                        ptr,
+                        [D as u64, hkv as u64, slots as u64],
+                        [(D * 2) as u64, (hkv * D * 2) as u64],
+                        [64, 1, 16],
+                    )
+                };
+                Some((map(kc.ptr)?, map(vc.ptr)?))
+            } else {
+                None
+            };
             let run = |o: u64| {
-                gpu.launch(
-                    flash,
-                    grid,
-                    threads,
-                    smem as u32,
-                    &[
-                        Arg::P(q.ptr),
-                        Arg::P(kc.ptr),
-                        Arg::P(vc.ptr),
-                        Arg::P(0),
-                        Arg::P(0),
-                        Arg::P(proj.ptr),
-                        Arg::I(qstride as i32),
-                        Arg::I(hq as i32),
-                        Arg::I(hkv as i32),
-                        Arg::P(pos.ptr),
-                        Arg::P(cu.ptr),
-                        Arg::I(seqs as i32),
-                        Arg::P(bt.ptr),
-                        Arg::I(max_blocks as i32),
-                        Arg::I(16),
-                        Arg::P(o),
-                        Arg::F(scale),
-                        Arg::P(0),
-                        Arg::I(1),
-                    ],
-                )
+                let mut args = vec![
+                    Arg::P(q.ptr),
+                    Arg::P(kc.ptr),
+                    Arg::P(vc.ptr),
+                    Arg::P(0),
+                    Arg::P(0),
+                    Arg::P(proj.ptr),
+                    Arg::I(qstride as i32),
+                    Arg::I(hq as i32),
+                    Arg::I(hkv as i32),
+                    Arg::P(pos.ptr),
+                    Arg::P(cu.ptr),
+                    Arg::I(seqs as i32),
+                    Arg::P(bt.ptr),
+                    Arg::I(max_blocks as i32),
+                    Arg::I(16),
+                    Arg::P(o),
+                    Arg::F(scale),
+                    Arg::P(0),
+                    Arg::I(1),
+                ];
+                if let Some((km, vm)) = maps {
+                    args.extend([Arg::Map(km), Arg::Map(vm), Arg::I(slots as i32)]);
+                }
+                gpu.launch(flash, grid, threads, smem as u32, &args)
             };
             if check {
                 let reference = gpu.alloc_zeroed(t * hq * D * 2)?;

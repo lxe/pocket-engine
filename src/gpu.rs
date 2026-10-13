@@ -154,7 +154,12 @@ pub enum Arg {
     P(u64),
     I(i32),
     F(f32),
+    /// A TMA tensor map, passed by value (a `__grid_constant__ CUtensorMap`).
+    Map(&'static TensorMap),
 }
+
+/// A TMA descriptor of a device tensor (see [`Gpu::tensor_map_3d`]).
+pub struct TensorMap(cu::CUtensorMap);
 
 /// A matrix operand of [`Gpu::gemm_batched`]: column-major with leading
 /// dimension `ld`, `stride` elements between batch members, optionally
@@ -392,6 +397,42 @@ impl Gpu {
     }
 
     /// Lets a kernel use `bytes` of dynamic shared memory (above 48 KB).
+    /// A TMA descriptor of a bf16 tensor with dimensions `dims` (fastest first)
+    /// and byte strides `strides` for dimensions 1 and 2, read in boxes of
+    /// `boxes` elements into 128-byte-swizzled shared memory; reads past the
+    /// dimensions return zeros. Leaked: it lives as long as the program.
+    pub fn tensor_map_3d(
+        &self,
+        ptr: u64,
+        dims: [u64; 3],
+        strides: [u64; 2],
+        boxes: [u32; 3],
+    ) -> Result<&'static TensorMap> {
+        let mut m = Box::new(TensorMap(cu::CUtensorMap { opaque: [0; 16] }));
+        // SAFETY: the arrays hold rank (or rank - 1) entries; ptr is a live
+        // device allocation covering dims and strides.
+        check(
+            unsafe {
+                cu::cuTensorMapEncodeTiled(
+                    &mut m.0,
+                    cu::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                    3,
+                    ptr as *mut c_void,
+                    dims.as_ptr(),
+                    strides.as_ptr(),
+                    boxes.as_ptr(),
+                    [1u32; 3].as_ptr(),
+                    cu::CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+                    cu::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+                    cu::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                    cu::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+                )
+            },
+            "cuTensorMapEncodeTiled",
+        )?;
+        Ok(Box::leak(m))
+    }
+
     pub fn set_smem(&self, k: Kernel, bytes: usize) -> Result<()> {
         // SAFETY: the function handle belongs to the loaded module.
         check(
@@ -621,10 +662,14 @@ impl Gpu {
                 Arg::P(p) => p,
                 Arg::I(v) => v as u32 as u64,
                 Arg::F(v) => v.to_bits() as u64,
+                Arg::Map(_) => 0,
             };
         }
-        for i in 0..args.len() {
-            ptrs[i] = (&mut vals[i] as *mut u64).cast();
+        for (i, a) in args.iter().enumerate() {
+            ptrs[i] = match *a {
+                Arg::Map(m) => (&m.0 as *const cu::CUtensorMap).cast_mut().cast(),
+                _ => (&mut vals[i] as *mut u64).cast(),
+            };
         }
         // SAFETY: argument count and types match the kernel signatures in
         // qwen35.cu; the driver copies the values at launch.

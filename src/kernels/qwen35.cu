@@ -82,6 +82,7 @@ __device__ __forceinline__ uint4 pack8(const float* f) {
     return u;
 }
 
+#include <cuda.h>
 #include <type_traits>
 #include "fp8.cuh"
 
@@ -1400,14 +1401,12 @@ ATTN_GROUP_V(2, 1, 32)
 
 // ---------------------------------------------------------------------------
 // Flash attention for prompts on Hopper's wgmma (sm_90a). A block takes 64
-// query tokens of two heads of one key/value group, a warpgroup per head, so
-// each 64-key tile serves 128 query rows. Q K^T runs as m64n64k16 from
-// shared memory, P V as m64n256k16 with P in registers (the score
+// query tokens of two heads of one key/value group, a consumer warpgroup per
+// head, so each 64-key tile serves 128 query rows. Q K^T runs as m64n64k16
+// from shared memory, P V as m64n256k16 with P in registers (the score
 // accumulators' layout is the A fragments') and V read transposed. Tiles of
-// 64 rows x 256 bf16 are four 128-byte-swizzled atoms of 64 columns, written
-// by cp.async (K and V, double-buffered) and plain stores (Q, scaled).
+// 64 rows x 256 bf16 are four 128-byte-swizzled atoms of 64 columns.
 #define WG_TILE (64 * HEAD_DIM * 2)
-#define WG_SMEM (6 * WG_TILE)
 
 // Byte offset of 16-byte chunk c (0..31) of row r in such a tile.
 __device__ __forceinline__ uint32_t wg_off(int r, int c) {
@@ -1457,16 +1456,62 @@ __device__ __forceinline__ void wg_o(float* d, const uint32_t* a, uint64_t db) {
 }
 #endif
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+__device__ __forceinline__ void mbar_init(uint32_t bar, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar), "r"(count));
+}
+__device__ __forceinline__ void mbar_arrive(uint32_t bar) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(bar) : "memory");
+}
+// Arrives on bar once all of this thread's earlier cp.async copies land.
+__device__ __forceinline__ void mbar_arrive_cp(uint32_t bar) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(bar) : "memory");
+}
+__device__ __forceinline__ void mbar_expect(uint32_t bar, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar), "r"(bytes) : "memory");
+}
+// A TMA box of a 3-D tensor map into shared memory, completing bytes on bar.
+__device__ __forceinline__ void tma3(uint32_t dst, const CUtensorMap* map, int c0, int c1, int c2, uint32_t bar) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(
+            dst),
+        "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(bar)
+        : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint32_t bar, int parity) {
+    asm volatile(
+        "{\n.reg .pred p;\nWAIT_%=:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@!p bra WAIT_%=;\n}\n" ::"r"(bar),
+        "r"(parity)
+        : "memory");
+}
+#endif
+
+// Warp-specialized as FlashAttention 3 is: warpgroup 0
+// produces (queries once, then each 64-key tile's keys and values into one
+// of two stages by TMA: per 16-token page and 64-column swizzle atom one box
+// of the cache's tensor map, [slot][kv head][256]) and keeps 40 registers;
+// warpgroups 1 and 2 consume, a head each, with 232. Stages pass between
+// them through mbarriers (full: the tile's bytes landed; empty: both
+// consumers finished its P V). Pages past the context read past the map's
+// slots, which TMA fills with zeros.
+#define WS_SMEM (6 * WG_TILE + 64)
+#define ATTN_WS_ARGS                                                                                    \
+    ATTN_FLASH_ARGS, const __grid_constant__ CUtensorMap kmap, const __grid_constant__ CUtensorMap vmap, \
+        int nslots
 template <int G>
-__device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
+__device__ __forceinline__ void attn_ws_body(ATTN_FLASH_ARGS, const CUtensorMap* kmap, const CUtensorMap* vmap,
+                                             int nslots) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
     extern __shared__ __align__(1024) unsigned char wsm[];
     const uint32_t base = (uint32_t)__cvta_generic_to_shared(wsm);
-    unsigned char* sQ = wsm;               // [2][WG_TILE]: the warpgroups' queries
-    unsigned char* sK = wsm + 2 * WG_TILE;  // [2][WG_TILE]
-    unsigned char* sV = wsm + 4 * WG_TILE;  // [2][WG_TILE]
-    const int tid = threadIdx.x, wg = tid >> 7, w = (tid >> 5) & 3, lane = tid & 31;
-    const int kvh = blockIdx.y, h = kvh * G + 2 * blockIdx.z + wg;
+    unsigned char* sQ = wsm;                // [2][WG_TILE]
+    // Then two stages of keys (2 + stage) and values (4 + stage).
+    // Barriers: q, full[2], empty[2].
+    const uint32_t bars = base + 6 * WG_TILE, qbar = bars, full0 = bars + 8, empty0 = bars + 24;
+    const int tid = threadIdx.x, wg = tid >> 7, w = (tid >> 5) & 3, lane = tid & 31, pt = tid & 127;
+    const int kvh = blockIdx.y;
     int s = -1, tile = blockIdx.x;
     for (int i = 0; i < seqs; i++) {
         const int n = cu[i + 1] - cu[i];
@@ -1480,52 +1525,71 @@ __device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
     }
     if (s < 0) return;
     const int tb = cu[s] + tile * 64, nb = min(64, cu[s + 1] - tb);
-    const int p0 = pos[tb], L = p0 + nb;
-    const int* bt = block_table + (size_t)s * max_blocks;
-    for (int e = tid; e < 2 * 64 * 32; e += 256) {
-        const int hw = e >> 11, r = (e >> 5) & 63, c = e & 31;
-        uint4 v = make_uint4(0, 0, 0, 0);
-        if (r < nb) {
-            float f[8];
-            unpack8(*reinterpret_cast<const uint4*>(
-                        q + ((size_t)(tb + r) * Hq + kvh * G + 2 * blockIdx.z + hw) * HEAD_DIM + c * 8),
-                    f);
-#pragma unroll
-            for (int i = 0; i < 8; i++) f[i] *= scale * LOG2E;  // scores in log2 units
-            v = pack8(f);
+    const int p0 = pos[tb], L = p0 + nb, T = (L + 63) / 64;
+    if (tid == 0) {
+        mbar_init(qbar, 128);
+        for (int i = 0; i < 2; i++) {
+            mbar_init(full0 + 8 * i, 1);
+            mbar_init(empty0 + 8 * i, 256);
         }
-        *reinterpret_cast<uint4*>(sQ + hw * WG_TILE + wg_off(r, c)) = v;
+        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     }
-    auto load = [&](int k0, int buf) {
-        for (int e = tid; e < 64 * 32; e += 256) {
-            const int j = e >> 5, c = e & 31, kp = k0 + j;
-            unsigned char* dk = sK + buf * WG_TILE + wg_off(j, c);
-            unsigned char* dv = sV + buf * WG_TILE + wg_off(j, c);
-            if (kp >= L) {
-                *reinterpret_cast<uint4*>(dk) = make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4*>(dv) = make_uint4(0, 0, 0, 0);
-                continue;
+    __syncthreads();
+    if (wg == 0) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n");
+        const int* bt = block_table + (size_t)s * max_blocks;
+        for (int e = pt; e < 2 * 64 * 32; e += 128) {
+            const int hw = e >> 11, r = (e >> 5) & 63, c = e & 31;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (r < nb) {
+                float f[8];
+                unpack8(*reinterpret_cast<const uint4*>(
+                            q + ((size_t)(tb + r) * Hq + kvh * G + 2 * blockIdx.z + hw) * HEAD_DIM + c * 8),
+                        f);
+#pragma unroll
+                for (int i = 0; i < 8; i++) f[i] *= scale * LOG2E;  // scores in log2 units
+                v = pack8(f);
             }
-            const size_t slot = (size_t)bt[kp / block_size] * block_size + kp % block_size;
-            const size_t at = (slot * Hkv + kvh) * HEAD_DIM + c * 8;
-            cp_async16(dk, (const bf16*)kcache + at);
-            cp_async16(dv, (const bf16*)vcache + at);
+            *reinterpret_cast<uint4*>(sQ + hw * WG_TILE + wg_off(r, c)) = v;
         }
-        cp_async_commit();
-    };
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        mbar_arrive(qbar);
+        if (pt == 0) {
+            for (int k = 0; k < T; k++) {
+                const int st = k & 1, k0 = 64 * k;
+                if (k >= 2) mbar_wait(empty0 + 8 * st, ((k >> 1) - 1) & 1);
+                const uint32_t full = full0 + 8 * st;
+                mbar_expect(full, 2 * WG_TILE);
+                const uint32_t dk = base + (2 + st) * WG_TILE, dv = base + (4 + st) * WG_TILE;
+#pragma unroll
+                for (int pg = 0; pg < 4; pg++) {
+                    const int kp = k0 + 16 * pg;
+                    const int slot = kp < L ? bt[kp / block_size] * block_size : nslots;
+#pragma unroll
+                    for (int a = 0; a < 4; a++) {
+                        tma3(dk + a * 8192 + pg * 2048, kmap, 64 * a, kvh, slot, full);
+                        tma3(dv + a * 8192 + pg * 2048, vmap, 64 * a, kvh, slot, full);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n");
+    const int c_wg = wg - 1, h = kvh * G + 2 * blockIdx.z + c_wg;
     float o[128];
 #pragma unroll
     for (int i = 0; i < 128; i++) o[i] = 0.f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
-    // This thread's rows: tokens r0 and r0 + 8 of the 64.
     const int r0 = 16 * w + (lane >> 2), q0 = p0 + r0, q1 = q0 + 8;
-    const uint32_t qa = base + wg * WG_TILE;
-    const int T = (L + 63) / 64;  // key tiles
+    const uint32_t qa = base + c_wg * WG_TILE;
     float sc[32];
-    // P of tiles k (even) and k + 1 (odd): tile k's feeds its P V while the
-    // softmax writes tile k + 1's.
     uint32_t pa[2][4][4];
-    // S = Q K^T for tile k (buffer k & 1), issued and committed.
+    // Waits for tile k's stage (cp.async writes, then read by wgmma).
+    auto ready = [&](int k) {
+        mbar_wait(full0 + 8 * (k & 1), (k >> 1) & 1);
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    };
     auto issue_s = [&](int k) {
         const uint32_t ka = base + (2 + (k & 1)) * WG_TILE;
         wg_pin<32>(sc);
@@ -1537,13 +1601,9 @@ __device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
         }
         wg_commit();
     };
-    // The online softmax of tile k's scores into pa[k & 1]; returns the
-    // factors the outputs so far take (c0, c1).
     auto softmax = [&](int k, auto par, float& c0, float& c1) {
         constexpr int P = decltype(par)::value;
         const int k0 = 64 * k;
-        // Only tiles reaching past the block's first query or the context's
-        // end need the mask.
         if (k0 + 63 > p0 || k0 + 64 > L) {
 #pragma unroll
             for (int j = 0; j < 8; j++)
@@ -1563,7 +1623,6 @@ __device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
         mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
-        // A row with no key yet keeps -inf; it subtracts 0 so exp2 gives 0.
         const float b0 = mx0 == -INFINITY ? 0.f : mx0, b1 = mx1 == -INFINITY ? 0.f : mx1;
         c0 = fast_exp2(m0 - b0);
         c1 = fast_exp2(m1 - b1);
@@ -1590,25 +1649,6 @@ __device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
             pa[P][kk][3] = fa_bf2(sc[8 * kk + 6], sc[8 * kk + 7]);
         }
     };
-    auto ready = [&]() {
-        __syncthreads();
-        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-    };
-    // Tiles k + 1's scores are computed while tile k's P V runs, and the
-    // softmax of tile k + 1 overlaps that P V on the tensor cores.
-    load(0, 0);
-    if (T > 1) load(64, 1);
-    if (T > 1) cp_async_wait1();
-    else cp_async_wait0();
-    ready();
-    issue_s(0);
-    wg_wait0();
-    wg_pin<32>(sc);
-    {
-        float c0, c1;
-        softmax(0, std::integral_constant<int, 0>{}, c0, c1);
-    }
-    // O += P V for tile k (its P in pa[k & 1]), issued and committed.
     auto issue_pv = [&](int k, auto par) {
         constexpr int P = decltype(par)::value;
         const uint32_t va = base + (4 + (k & 1)) * WG_TILE;
@@ -1618,12 +1658,9 @@ __device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
         for (int kk = 0; kk < 4; kk++) wg_o(o, pa[P][kk], wg_desc(va + kk * 2048, 8192, 1024));
         wg_commit();
     };
-    // One step: tile k + 1's scores and tile k's P V together, then tile
-    // k + 1's softmax while the P V runs.
     auto step = [&](int k, auto par) {
         constexpr int P = decltype(par)::value;
-        cp_async_wait0();
-        ready();
+        ready(k + 1);
         issue_s(k + 1);
         issue_pv(k, par);
         asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
@@ -1632,13 +1669,21 @@ __device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
         softmax(k + 1, std::integral_constant<int, 1 - P>{}, c0, c1);
         wg_wait0();
         wg_pin<128>(o);
+        mbar_arrive(empty0 + 8 * (k & 1));  // tile k's stage is free
         if (__any_sync(0xffffffffu, c0 != 1.f || c1 != 1.f)) {
 #pragma unroll
             for (int i = 0; i < 128; i++) o[i] *= (i & 2) ? c1 : c0;
         }
-        __syncthreads();  // tile k's buffers are free
-        if (k + 2 < T) load(64 * (k + 2), k & 1);
     };
+    mbar_wait(qbar, 0);
+    ready(0);
+    issue_s(0);
+    wg_wait0();
+    wg_pin<32>(sc);
+    {
+        float c0, c1;
+        softmax(0, std::integral_constant<int, 0>{}, c0, c1);
+    }
     int k = 0;
     for (; k + 2 < T; k += 2) {
         step(k, std::integral_constant<int, 0>{});
@@ -1675,9 +1720,11 @@ __device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
     }
 #endif
 }
-// attn_wg_g<G>: grid (64-token tiles + sequences, key/value heads, G / 2).
-extern "C" __global__ void __launch_bounds__(256, 1) attn_wg_g4(ATTN_FLASH_ARGS) { attn_wg_body<4>(ATTN_FLASH_PASS); }
-extern "C" __global__ void __launch_bounds__(256, 1) attn_wg_g6(ATTN_FLASH_ARGS) { attn_wg_body<6>(ATTN_FLASH_PASS); }
+// attn_ws_g<G>: grid (64-token tiles + sequences, key/value heads, G / 2), 384 threads.
+#define ATTN_WS_PASS ATTN_FLASH_PASS, &kmap, &vmap, nslots
+extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g4(ATTN_WS_ARGS) { attn_ws_body<4>(ATTN_WS_PASS); }
+extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g6(ATTN_WS_ARGS) { attn_ws_body<6>(ATTN_WS_PASS); }
+
 
 // Combines the key ranges of split decode attention (attn_body with `part`)
 // in range order, then gates as attn_body does: a block of 256 threads per

@@ -1,16 +1,16 @@
 # pocket-engine
 
-An inference server for small Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine, and is ready 5 seconds after launch ([design and measurements](docs/design.md)).
+An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine, and is ready 5 seconds after launch ([design and measurements](docs/design.md)).
 
 ## Supported
 
 | | |
 |---|---|
-| Models | Qwen3.5 0.8B, 2B and 4B, with images |
+| Models | Qwen3.5 0.8B, 2B, 4B and 9B, with images. The 27B shapes (Qwen3.5, 3.6 and 3.8-27B) load but are not yet checked |
 | Architecture | Dense. Mixture-of-experts Qwen3.5 models are not supported |
-| Weights | Hugging Face safetensors checkpoints, one file or sharded, in bf16 (f32 tensors are converted) |
+| Weights | Hugging Face safetensors checkpoints (bf16; f32 tensors are converted), or a GGUF file (text only; projector files are not read yet) |
 | Images | JPEG, PNG, WebP, GIF or BMP, as `data:` or `http(s)` URLs. Images are resized so each side is a multiple of 32 pixels, and every 32×32 block becomes one prompt token. The area is held between 65,536 and `--max-image-pixels` (default 4,194,304). |
-| Quantization | None. Weights and activations run in bf16 with f32 accumulation; recurrent state is f32 |
+| Quantization | GGUF weights stay quantized on the GPU: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely within a file. Activations run in bf16 with f32 accumulation; recurrent state is f32 |
 | Context | Up to `--max-context` tokens per request (default 4,096) |
 | Sampling | Greedy, or temperature with `top_k`, `top_p`, `min_p` and `seed`; `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`; `stop` strings |
 | GPUs | NVIDIA, built per architecture: `90a` (H100), `120a` (RTX 50-series); others via `CUDA_COMPUTE_CAP` |
@@ -36,6 +36,13 @@ hf download Qwen/Qwen3.5-2B --local-dir models/qwen3.5-2b
 ```
 
 The model directory needs `config.json`, the safetensors files, `tokenizer.json` and `chat_template.jinja`. `preprocessor_config.json` is optional: without it, Qwen's image defaults apply.
+
+A GGUF file serves on its own: its metadata carries the configuration, vocabulary and chat template.
+
+```sh
+hf download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-Q4_K_M.gguf --local-dir models
+pocket-engine serve --model models/Qwen3.5-9B-Q4_K_M.gguf --name qwen3.5-9b
+```
 
 Serve it:
 
@@ -79,7 +86,7 @@ Filters apply in order: min_p, then top_k, then top_p. Each one judges the token
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--max-seqs` | 256 | Most requests decoding at once |
+| `--max-seqs` | 256 | Most requests decoding at once; lowered at startup so their recurrent state fits in half of the free memory (49 MB per request on 9B) |
 | `--max-batch-tokens` | 4096 | Most tokens in one step, decode rows plus prompt chunks |
 | `--max-context` | 4096 | Longest prompt plus output, in tokens |
 | `--memory-fraction` | 0.9 | Share of GPU memory to use; the KV cache gets what is left after the weights |
@@ -97,7 +104,7 @@ POCKET_ENGINE_MODEL=models/qwen3.5-2b \
   CUDA_COMPUTE_CAP=120a cargo test --release --features cuda
 ```
 
-With a model directory set, `tests/gpu.rs` runs six checks against the model, which can be 0.8B, 2B or 4B:
+With a model directory set, `tests/gpu.rs` runs six checks against the model, which can be 0.8B, 2B, 4B or 9B:
 
 - its predictions match stored Transformers reference outputs;
 - image prompts tokenize exactly as Transformers' processor does, and their predictions match too;
@@ -116,6 +123,8 @@ python scripts/accuracy.py compare out.ref.json out.ours.json
 ```
 
 `scripts/image_reference.py` does the same for image prompts.
+
+`scripts/quant_check.py` checks GPU dequantization bit for bit against gguf-py (llama.cpp's reference) for every quantized format in the GGUF files it is given. `pocket-engine bench-linear` times one quantized matrix against the same matrix in bf16 on cuBLAS.
 
 `scripts/load.py URL MODEL OUT.json` is the load test behind the throughput numbers.
 

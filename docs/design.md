@@ -29,6 +29,18 @@ The vision encoder (`src/vision.rs`) runs for a request when the scheduler admit
 3. **Embedding pool.** The embeddings wait in a pool of rows, reserved at admission, until the prompt steps that read them have run. Prompt steps take image rows from the pool in place of the token embedding.
 4. **Positions.** Rotary positions in the text model become three-dimensional (time, height, width). Image tokens spread over their grid, and the text after an image resumes past the grid's longer side, as Transformers computes them.
 
+## Quantized weights
+
+GGUF weights stay in their ggml block formats on the GPU (`src/kernels/quant.cuh`). Every format has one decoder that produces 8 consecutive weights of a row. The decoders follow ggml's own dequantization, and `scripts/quant_check.py` confirms they match gguf-py bit for bit after bf16 rounding. Formats whose blocks would leave weight bytes misaligned (Q8_0, Q4_0, Q5_0, IQ4_NL, Q3_K, Q6_K) are repacked with padding at load, so decoders can use 8-byte loads.
+
+A quantized matrix multiply picks one of three paths by the number of rows in the step:
+
+- **Up to 4 rows: matrix-vector kernel.** A warp per output feature streams the row once and decodes in registers, at about 1.75 TB/s on an RTX 5090.
+- **5 to 160 rows: tensor cores, decoding into registers.** Each warp owns 16 output features and does mma.sync m16n8k16 in bf16. A dot product does not depend on the order of K, so each 32-wide step of K is assigned to fragment slots such that each lane needs 8 consecutive weights of its two rows and 8 consecutive inputs: two decodes and one 16-byte load per step. There is no shared memory and no barrier. When the grid alone would leave SMs idle, K is split across blocks into an f32 workspace.
+- **Above 160 rows (prompt chunks): cuBLAS.** The matrix is dequantized to bf16 scratch and handed to cuBLAS; one decode then serves the whole chunk.
+
+All three issue no allocation and no host synchronization, so quantized decode steps run inside CUDA graphs like bf16 ones.
+
 ## Numerics
 
 Activations are bf16 with f32 accumulation, rounded where the bf16 reference rounds them. Recurrent states are f32. Logits are f32. Sampling runs on the GPU, so only one token id per sequence returns to the host each step.
@@ -42,6 +54,7 @@ Activations are bf16 with f32 accumulation, rounded where the bf16 reference rou
 | Qwen3.5-0.8B | 222 | 213 | 9 of 9 | 0.0032, 0.056 |
 | Qwen3.5-2B | 217 | 214 | 3 of 3 | 0.0015, 0.043 |
 | Qwen3.5-4B | 210 | 209 | 1 of 1 | 0.0004, 0.032 |
+| Qwen3.5-9B | 220 | 219 | 1 of 1 | 0.0003, 0.032 |
 
 These ran on an RTX 5090. An H100 build of the 2B model agreed on 215 of 217.
 
@@ -52,6 +65,9 @@ The same comparison with image prompts covers three images. Two keep their sides
 | Qwen3.5-0.8B | 87 | 85 | 2 of 2 | 0.0007, 0.054 |
 | Qwen3.5-2B | 87 | 87 | none | 0.0003, 0.088 |
 | Qwen3.5-4B | 62 | 62 | none | 0.0005, 0.043 |
+| Qwen3.5-9B | 85 | 85 | none | 0.0000, 0.040 |
+
+GGUF quantizations are measured against the same bf16 references, so they show the quantization's own error. For 0.8B: Q8_0 agrees on 217 of 222 positions (every miss within one bf16 step), Q4_K_M on 199 and Q4_0 on 195.
 
 ## Throughput
 
@@ -67,3 +83,16 @@ The same comparison with image prompts covers three images. Two keep their sides
 | burst of 64 | 4,939 | 4,299 | 4,593 |
 
 The model was Qwen3.5-2B. Both H100 runs used the same RunPod H100 SXM (driver 580.126.09), one after the other. pocket-engine was ready 5 seconds after launch and vLLM after 79. The H100 numbers come from the code before it moved to this repository (Switchyard commit b4b3d7c). Back-to-back RTX 5090 runs of that build and this one measure the same.
+
+### Quantized weights, RTX 5090
+
+Qwen3.5-9B under the same load, output tokens per second and median time to first token at 64 in flight. With `--max-seqs` lowered to fit the recurrent state, 53 requests fit beside the bf16 weights and 192 beside Q4_K_M.
+
+| In flight | bf16 (safetensors) | Q4_K_M (GGUF) | Q8_0 (GGUF) |
+|---:|---|---|---|
+| 1 | 87 | 175 | 135 |
+| 8 | 546 | 607 | 402 |
+| 16 | 909 | 903 | 660 |
+| 32 | 1,284 | 1,285 | 982 |
+| 64 | 1,519, 0.34 s | 1,562, 0.15 s | 1,301, 0.17 s |
+| burst of 64 | 1,294 | 1,546 | 1,150 |

@@ -130,7 +130,7 @@ python scripts/accuracy.py compare out.ref.json out.ours.json
 
 `accuracy.py long` makes reference data over three prompts of about 3,300 tokens, for checking the KV cache at length. `scripts/image_reference.py` does the same for image prompts.
 
-`scripts/quant_check.py` checks GPU dequantization bit for bit against gguf-py (llama.cpp's reference) for every quantized format in the GGUF files it is given. `pocket-engine bench-linear` times one quantized matrix against the same matrix in bf16 on cuBLAS.
+`scripts/quant_check.py` checks GPU dequantization bit for bit against gguf-py (llama.cpp's reference) for every quantized format in the GGUF files it is given. `pocket-engine bench-linear` times one quantized matrix (and, for Q4_0 and Q4_K, its tiled layout) against the same matrix in bf16 on cuBLAS, with the L2 cache cold.
 
 `scripts/load.py URL MODEL OUT.json` is the load test behind the throughput numbers.
 

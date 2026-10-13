@@ -286,6 +286,49 @@ pub fn upload_tensor(gpu: &Gpu, g: &Gguf, name: &str) -> Result<Buf> {
     b
 }
 
+/// A GGUF tensor in the tiled layout of its format, by its GGUF name; None
+/// when the format or shape has none.
+pub fn upload_tiled(gpu: &Gpu, g: &Gguf, name: &str) -> Result<Option<Buf>> {
+    let (t, _) = g
+        .tensor(name)
+        .ok_or_else(|| Error::Config(format!("missing tensor {name}")))?;
+    let (cols, rows) = (t.dims[0], t.numel() / t.dims[0]);
+    let Some(chunk) = t.ty.tile_chunk() else {
+        return Ok(None);
+    };
+    if !rows.is_multiple_of(16) || !cols.is_multiple_of(256) {
+        return Ok(None);
+    }
+    let (offset, len) = g.file_range(name).expect("found above");
+    let started = gpu.begin_uploads()?;
+    let raw = gpu.temp(0, len)?;
+    gpu.put(
+        raw,
+        &Piece::File {
+            file: &g.file,
+            offset,
+            len,
+        },
+    )?;
+    let out = gpu.alloc(rows / 16 * (cols / 256) * chunk)?;
+    gpu.launch(
+        gpu.kernel(&format!("tile_{}", t.ty.name()))?,
+        ((rows * cols / 32).div_ceil(256).min(65_535) as u32, 1, 1),
+        256,
+        0,
+        &[
+            Arg::P(raw),
+            Arg::I(rows as i32),
+            Arg::I(cols as i32),
+            Arg::P(out.ptr),
+        ],
+    )?;
+    if started {
+        gpu.end_uploads()?;
+    }
+    Ok(Some(out))
+}
+
 impl Mat<'_> {
     /// The matrix on the device, in its kind's device layout (FP8 scales are
     /// left to the caller).
@@ -601,7 +644,7 @@ impl Source {
         for &(name, rows) in parts {
             let m = self.matrix(name, rows, cols)?;
             let target = match m.kind {
-                Kind::Quant(ty) => {
+                Kind::Quant(ty) | Kind::Tiled(ty) => {
                     quants.get(gpu, ty)?;
                     Target::Quant(ty)
                 }
@@ -686,6 +729,29 @@ impl Source {
         };
         let grid = |n: usize| ((n.div_ceil(256)).min(65_535) as u32, 1, 1);
         Ok(match target {
+            Target::Quant(ty)
+                if ty.tile_chunk().is_some()
+                    && rows.is_multiple_of(16)
+                    && cols.is_multiple_of(256) =>
+            {
+                // Rewritten for the tensor-core path, from the raw blocks.
+                let raw = to_temp(0, &pieces)?;
+                let chunk = ty.tile_chunk().expect("checked");
+                let out = gpu.alloc(rows / 16 * (cols / 256) * chunk)?;
+                gpu.launch(
+                    gpu.kernel(&format!("tile_{}", ty.name()))?,
+                    grid(rows * cols / 32),
+                    256,
+                    0,
+                    &[
+                        Arg::P(raw),
+                        Arg::I(rows as i32),
+                        Arg::I(cols as i32),
+                        Arg::P(out.ptr),
+                    ],
+                )?;
+                part(out, Kind::Tiled(ty), None)
+            }
             Target::Bf16 | Target::Quant(_) => part(upload_kind(gpu, kind, &pieces)?, kind, None),
             Target::Fp8Checkpoint => {
                 let mode = load.fp8.ok_or_else(|| {

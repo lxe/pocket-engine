@@ -13,6 +13,8 @@ use std::rc::Rc;
 pub enum Kind {
     Bf16,
     Quant(GgmlType),
+    /// A 4-bit format rewritten in 16 x 256 tiles (see `GgmlType::tile_chunk`).
+    Tiled(GgmlType),
     /// E4M3 weights with scales in the given layout (see `Part::scales`).
     Fp8(Fp8Mode),
 }
@@ -71,6 +73,16 @@ pub struct QuantKernels {
     pub mma: [Kernel; 4],
     /// Matrix-vector kernels for 1 to 8 rows.
     pub gemv: [Kernel; 8],
+    /// The tiled layout's kernels, for formats that have it.
+    pub tiled: Option<TiledKernels>,
+}
+
+#[derive(Clone)]
+pub struct TiledKernels {
+    /// Rewrites ggml blocks in the tiled layout.
+    pub tile: Kernel,
+    pub dequant: Kernel,
+    pub mma: [Kernel; 4],
 }
 
 const MMA_TILES: [usize; 4] = [8, 16, 32, 64];
@@ -144,7 +156,22 @@ impl Quants {
             self.finish = Some(gpu.kernel("qmma_finish")?);
             self.sms = gpu.sms;
         }
+        let tiled = match ty.tile_chunk() {
+            Some(_) => {
+                let mut mma = Vec::with_capacity(4);
+                for t in MMA_TILES {
+                    mma.push(gpu.kernel(&format!("qtile_{name}_{t}"))?);
+                }
+                Some(TiledKernels {
+                    tile: gpu.kernel(&format!("tile_{name}"))?,
+                    dequant: gpu.kernel(&format!("dequant_tiled_{name}"))?,
+                    mma: mma.try_into().unwrap_or_else(|_| unreachable!()),
+                })
+            }
+            None => None,
+        };
         let k = QuantKernels {
+            tiled,
             dequant: gpu.kernel(&format!("dequant_{name}"))?,
             embed: gpu.kernel(&format!("embed_{name}"))?,
             mma: mma.try_into().unwrap_or_else(|_| unreachable!()),
@@ -239,10 +266,23 @@ impl Linear {
                     ldy,
                     f32_out,
                 )?,
-                Kind::Quant(ty) => {
+                Kind::Quant(ty) | Kind::Tiled(ty) => {
                     let k = q.loaded(ty).ok_or_else(|| {
                         Error::Config(format!("kernels for {} not loaded", ty.name()))
                     })?;
+                    // The tiled layout has its own dequantization and
+                    // tensor-core kernels, splits K by chunks of 256 and
+                    // serves single rows on tensor cores too.
+                    let tiled = match p.kind {
+                        Kind::Tiled(_) => Some(k.tiled.as_ref().ok_or_else(|| {
+                            Error::Config(format!("{} has no tiled kernels", ty.name()))
+                        })?),
+                        _ => None,
+                    };
+                    let (dequant, mma, k_unit) = match tiled {
+                        Some(tk) => (tk.dequant, &tk.mma, 256),
+                        None => (k.dequant, &k.mma, 32),
+                    };
                     let args = |extra: &[Arg]| -> Vec<Arg> {
                         let mut v = vec![
                             P(p.buf.ptr),
@@ -264,12 +304,15 @@ impl Linear {
                         && let Some(sc) = &q.scratch
                     {
                         // Dequantize slices of rows into scratch, then cuBLAS.
-                        let per = (sc.bytes / 2 / self.cols).min(p.rows).max(1);
+                        let mut per = (sc.bytes / 2 / self.cols).min(p.rows).max(1);
+                        if tiled.is_some() {
+                            per = (per / 16 * 16).max(16);
+                        }
                         let mut r0 = 0;
                         while r0 < p.rows {
                             let n = per.min(p.rows - r0);
                             gpu.launch(
-                                k.dequant,
+                                dequant,
                                 ((n * self.cols / 8).div_ceil(256).min(65_535) as u32, 1, 1),
                                 256,
                                 0,
@@ -293,7 +336,7 @@ impl Linear {
                             )?;
                             r0 += n;
                         }
-                    } else if rows <= gemv_rows() {
+                    } else if tiled.is_none() && rows <= gemv_rows() {
                         gpu.launch(
                             k.gemv[rows - 1],
                             (p.rows.div_ceil(4) as u32, 1, 1),
@@ -307,16 +350,23 @@ impl Linear {
                         let warps = p.rows.div_ceil(16) * rows.div_ceil(tile);
                         // Split K until about 32 warps per SM stream weights,
                         // keeping at least 8 steps of 32 per slice.
-                        let steps = self.cols / 32;
+                        let steps = self.cols / k_unit;
                         let (target, min_steps) = split_tuning();
+                        // A tiled chunk is 8 steps of 32.
+                        let min_steps = if tiled.is_some() {
+                            min_steps.div_ceil(8).max(1)
+                        } else {
+                            min_steps
+                        };
                         let mut split = (target * q.sms)
                             .div_ceil(warps)
                             .clamp(1, (steps / min_steps).clamp(1, 32));
                         // Every slice keeps its own partial sums.
                         split = split.min(SPLIT_WORKSPACE / (rows * p.rows * 4)).max(1);
                         let ws = q.workspace.as_ref().map_or(0, |b| b.ptr);
+                        let margs = args_mma(&args(&[I(rows as i32)]), ws, split);
                         gpu.launch(
-                            k.mma[ti],
+                            mma[ti],
                             (
                                 p.rows.div_ceil(64) as u32,
                                 rows.div_ceil(tile) as u32,
@@ -324,7 +374,7 @@ impl Linear {
                             ),
                             128,
                             0,
-                            &args_mma(&args(&[I(rows as i32)]), ws, split),
+                            &margs,
                         )?;
                         if split > 1 {
                             let n = rows * p.rows;

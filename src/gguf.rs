@@ -94,6 +94,16 @@ impl GgmlType {
         }
     }
 
+    /// Bytes per chunk of 16 rows x 256 inputs in the tiled layout the
+    /// tensor-core path reads (quant.cuh), for the formats that have one.
+    pub fn tile_chunk(self) -> Option<usize> {
+        match self.0 {
+            2 => Some(2304),
+            12 => Some(2368),
+            _ => None,
+        }
+    }
+
     pub fn is_quantized(self) -> bool {
         !matches!(self.0, 0 | 1 | 30)
     }

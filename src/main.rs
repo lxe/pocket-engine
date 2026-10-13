@@ -209,6 +209,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut host = gpu.pinned(n * cols * 2)?;
             gpu.dtoh(&mut host, out.ptr, n * cols * 2)?;
             gpu.sync()?;
+            // The tiled layout must decode to exactly the same bits.
+            if let (Some(t), Some(tk)) = (
+                pocket_engine::source::upload_tiled(&gpu, &g, &tensor)?,
+                k.tiled.as_ref(),
+            ) {
+                let n16 = n / 16 * 16;
+                let out2 = gpu.alloc(n16.max(16) * cols * 2)?;
+                gpu.launch(
+                    tk.dequant,
+                    (((n16 * cols / 8).div_ceil(256)) as u32, 1, 1),
+                    256,
+                    0,
+                    &[
+                        Arg::P(t.ptr),
+                        Arg::I(0),
+                        Arg::I(n16 as i32),
+                        Arg::I(cols as i32),
+                        Arg::P(out2.ptr),
+                    ],
+                )?;
+                let mut h2 = gpu.pinned(n16.max(16) * cols * 2)?;
+                gpu.dtoh(&mut h2, out2.ptr, n16 * cols * 2)?;
+                gpu.sync()?;
+                let same =
+                    host.as_slice::<u16>()[..n16 * cols] == h2.as_slice::<u16>()[..n16 * cols];
+                eprintln!(
+                    "tiled layout: {}",
+                    if same { "identical" } else { "DIFFERS" }
+                );
+                if !same {
+                    let (a, b) = (host.as_slice::<u16>(), h2.as_slice::<u16>());
+                    let i = (0..n16 * cols).find(|&i| a[i] != b[i]).unwrap_or(0);
+                    let f = |v: u16| half::bf16::from_bits(v).to_f32();
+                    return Err(format!(
+                        "tiled dequantization differs from the plain decoder: row {}, column {}: {} vs {}",
+                        i / cols,
+                        i % cols,
+                        f(a[i]),
+                        f(b[i])
+                    )
+                    .into());
+                }
+            }
             let f: Vec<u8> = host
                 .as_slice::<u16>()
                 .iter()
@@ -232,41 +275,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut quants = Quants::default();
             let qk = quants.get(&gpu, info.ty)?;
             quants.prepare(&gpu, n * k)?;
-            let w = Rc::new(pocket_engine::source::upload_tensor(&gpu, &g, &tensor)?);
-            let wb = Rc::new(gpu.alloc(n * k * 2)?);
-            gpu.launch(
-                qk.dequant,
-                (((n * k / 8).div_ceil(256)) as u32, 1, 1),
-                256,
-                0,
-                &[
-                    Arg::P(w.ptr),
-                    Arg::I(0),
-                    Arg::I(n as i32),
-                    Arg::I(k as i32),
-                    Arg::P(wb.ptr),
-                ],
-            )?;
-            let quant = Linear {
+            // Weights stream from memory when serving, so each format cycles
+            // through copies that together exceed the L2 cache several times.
+            let copies = |bytes: usize| (512usize << 20).div_ceil(bytes).clamp(2, 32);
+            let one = |buf: pocket_engine::gpu::Buf, kind: Kind| Linear {
                 parts: vec![Part {
-                    buf: w,
-                    kind: Kind::Quant(info.ty),
+                    buf: Rc::new(buf),
+                    kind,
                     scales: None,
                     rows: n,
                     off: 0,
                 }],
                 cols: k,
             };
-            let dense = Linear {
-                parts: vec![Part {
-                    buf: wb,
-                    kind: Kind::Bf16,
-                    scales: None,
-                    rows: n,
-                    off: 0,
-                }],
-                cols: k,
-            };
+            let mut quant = Vec::new();
+            for _ in 0..copies(data.len()) {
+                quant.push(one(
+                    pocket_engine::source::upload_tensor(&gpu, &g, &tensor)?,
+                    Kind::Quant(info.ty),
+                ));
+            }
+            let mut tiled = Vec::new();
+            if info.ty.tile_chunk().is_some() {
+                for _ in 0..copies(data.len()) {
+                    match pocket_engine::source::upload_tiled(&gpu, &g, &tensor)? {
+                        Some(t) => tiled.push(one(t, Kind::Tiled(info.ty))),
+                        None => break,
+                    }
+                }
+            }
+            let mut dense = Vec::new();
+            for _ in 0..copies(n * k * 2) {
+                let wb = gpu.alloc(n * k * 2)?;
+                gpu.launch(
+                    qk.dequant,
+                    (((n * k / 8).div_ceil(256)) as u32, 1, 1),
+                    256,
+                    0,
+                    &[
+                        Arg::P(quant[0].parts[0].buf.ptr),
+                        Arg::I(0),
+                        Arg::I(n as i32),
+                        Arg::I(k as i32),
+                        Arg::P(wb.ptr),
+                    ],
+                )?;
+                dense.push(one(wb, Kind::Bf16));
+            }
             let max = *rows.iter().max().unwrap_or(&1);
             let x: Vec<u8> = (0..max * k)
                 .flat_map(|i| {
@@ -275,26 +330,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
             let x = gpu.upload(&x)?;
-            let (ya, yb) = (gpu.alloc(max * n * 4)?, gpu.alloc(max * n * 4)?);
+            let (ya, yb, yt) = (
+                gpu.alloc(max * n * 4)?,
+                gpu.alloc(max * n * 4)?,
+                gpu.alloc(max * n * 4)?,
+            );
             println!(
-                "{tensor}: {n} x {k} {}, {:.1} MB",
+                "{tensor}: {n} x {k} {}, {:.1} MB; weights cycle through copies (L2 cold)",
                 info.ty.name(),
                 data.len() as f64 / 1e6
             );
             for &m in &rows {
-                let time = |l: &Linear, y: u64| -> Result<f64, Box<dyn std::error::Error>> {
-                    l.forward(
-                        &gpu,
-                        &quants,
-                        pocket_engine::linear::Input::bf16(x.ptr),
-                        m,
-                        y,
-                        n,
-                        true,
-                    )?;
-                    gpu.sync()?;
-                    let t0 = std::time::Instant::now();
-                    for _ in 0..20 {
+                let time = |ls: &[Linear], y: u64| -> Result<f64, Box<dyn std::error::Error>> {
+                    let run = |l: &Linear| {
                         l.forward(
                             &gpu,
                             &quants,
@@ -303,23 +351,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             y,
                             n,
                             true,
-                        )?;
+                        )
+                    };
+                    for l in ls {
+                        run(l)?;
                     }
                     gpu.sync()?;
-                    Ok(t0.elapsed().as_secs_f64() / 20.0)
+                    let iters = 4 * ls.len();
+                    let t0 = std::time::Instant::now();
+                    for i in 0..iters {
+                        run(&ls[i % ls.len()])?;
+                    }
+                    gpu.sync()?;
+                    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+                };
+                let rel = |p: u64, q: u64| -> Result<f32, Box<dyn std::error::Error>> {
+                    let (mut ha, mut hb) = (gpu.pinned(m * n * 4)?, gpu.pinned(m * n * 4)?);
+                    gpu.dtoh(&mut ha, p, m * n * 4)?;
+                    gpu.dtoh(&mut hb, q, m * n * 4)?;
+                    gpu.sync()?;
+                    let (a, b) = (ha.as_slice::<f32>(), hb.as_slice::<f32>());
+                    let scale = b.iter().fold(0f32, |s, v| s.max(v.abs()));
+                    Ok(a.iter().zip(b).fold(0f32, |s, (p, q)| s.max((p - q).abs()))
+                        / scale.max(1e-9))
                 };
                 let (tq, tb) = (time(&quant, ya.ptr)?, time(&dense, yb.ptr)?);
-                let mut ha = gpu.pinned(m * n * 4)?;
-                let mut hb = gpu.pinned(m * n * 4)?;
-                gpu.dtoh(&mut ha, ya.ptr, m * n * 4)?;
-                gpu.dtoh(&mut hb, yb.ptr, m * n * 4)?;
-                gpu.sync()?;
-                let (a, b) = (ha.as_slice::<f32>(), hb.as_slice::<f32>());
-                let scale = b.iter().fold(0f32, |s, v| s.max(v.abs()));
-                let err =
-                    a.iter().zip(b).fold(0f32, |s, (p, q)| s.max((p - q).abs())) / scale.max(1e-9);
+                let err = rel(ya.ptr, yb.ptr)?;
+                let tt = if tiled.is_empty() {
+                    String::new()
+                } else {
+                    let t = time(&tiled, yt.ptr)?;
+                    format!(
+                        "  tiled {:8.1} us ({:6.0} GB/s, diff {:.1e})",
+                        t * 1e6,
+                        data.len() as f64 / t / 1e9,
+                        rel(yt.ptr, yb.ptr)?
+                    )
+                };
                 println!(
-                    "rows {m:4}: quant {:8.1} us ({:6.0} GB/s of weights)  bf16 cuBLAS {:8.1} us  max rel diff {err:.1e}",
+                    "rows {m:4}: quant {:8.1} us ({:6.0} GB/s of weights)  bf16 cuBLAS {:8.1} us  max rel diff {err:.1e}{tt}",
                     tq * 1e6,
                     data.len() as f64 / tq / 1e9,
                     tb * 1e6

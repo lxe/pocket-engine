@@ -156,11 +156,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             use pocket_engine::gpu::{Arg, Gpu};
             let g = pocket_engine::gguf::Gguf::open(&model)?;
-            let (info, data) = g.tensor(&tensor).ok_or("no such tensor")?;
+            let (info, _) = g.tensor(&tensor).ok_or("no such tensor")?;
             let (cols, n) = (info.dims[0], rows.min(info.numel() / info.dims[0]));
             let gpu = Gpu::new(0)?;
             let k = pocket_engine::linear::Quants::default().get(&gpu, info.ty)?;
-            let w = gpu.upload(&pocket_engine::gguf::repack(info.ty, data))?;
+            // The loader's own path: file to device, repacked on the GPU.
+            let w = pocket_engine::source::upload_tensor(&gpu, &g, &tensor)?;
             let out = gpu.alloc(n * cols * 2)?;
             gpu.launch(
                 k.dequant,
@@ -201,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut quants = Quants::default();
             let qk = quants.get(&gpu, info.ty)?;
             quants.prepare(&gpu, n * k)?;
-            let w = Rc::new(gpu.upload(&pocket_engine::gguf::repack(info.ty, data))?);
+            let w = Rc::new(pocket_engine::source::upload_tensor(&gpu, &g, &tensor)?);
             let wb = Rc::new(gpu.alloc(n * k * 2)?);
             gpu.launch(
                 qk.dequant,

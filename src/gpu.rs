@@ -6,6 +6,7 @@
 use crate::{Error, Result};
 use cudarc::cublas::sys as cb;
 use cudarc::driver::sys as cu;
+use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_void};
 
 fn check(r: cu::CUresult, what: &'static str) -> Result<()> {
@@ -77,6 +78,71 @@ impl Drop for Pinned {
     }
 }
 
+/// Bytes to upload: a range of a file, read straight into pinned staging, or
+/// host memory.
+pub enum Piece<'a> {
+    File {
+        file: &'a std::fs::File,
+        offset: u64,
+        len: usize,
+    },
+    Mem(&'a [u8]),
+}
+
+impl Piece<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Piece::File { len, .. } => *len,
+            Piece::Mem(m) => m.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Pinned buffers that loading cycles through: threads fill one from the
+/// files while the copy engine drains the others.
+struct Staging {
+    bufs: Vec<(Pinned, cu::CUevent)>,
+    next: usize,
+    threads: usize,
+    /// Device scratch the loader converts from, grown on demand.
+    temp: [Option<Buf>; 2],
+}
+
+const STAGE_BYTES: usize = 64 << 20;
+const STAGES: usize = 4;
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        for (_, e) in &self.bufs {
+            // SAFETY: each event was created once and is destroyed once, after the
+            // owner synchronized the stream.
+            unsafe { cu::cuEventDestroy_v2(*e) };
+        }
+    }
+}
+
+/// Fills `dst` from `file` at `offset`, splitting the read across threads.
+fn read_parallel(file: &std::fs::File, offset: u64, dst: &mut [u8], threads: usize) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let per = dst.len().div_ceil(threads).max(4 << 20);
+    if per >= dst.len() {
+        return Ok(file.read_exact_at(dst, offset)?);
+    }
+    std::thread::scope(|s| {
+        let jobs: Vec<_> = dst
+            .chunks_mut(per)
+            .enumerate()
+            .map(|(i, c)| s.spawn(move || file.read_exact_at(c, offset + (i * per) as u64)))
+            .collect();
+        jobs.into_iter()
+            .try_for_each(|j| j.join().expect("reader thread panicked"))
+    })?;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 pub struct Kernel(cu::CUfunction);
 
@@ -122,6 +188,7 @@ pub struct Gpu {
     blas: cb::cublasHandle_t,
     module: cu::CUmodule,
     _workspace: Buf,
+    staging: RefCell<Option<Staging>>,
     pub name: String,
 }
 
@@ -204,6 +271,7 @@ impl Gpu {
                 blas,
                 module,
                 _workspace: workspace,
+                staging: RefCell::new(None),
                 name,
             })
         }
@@ -264,7 +332,111 @@ impl Gpu {
         })
     }
 
+    /// Starts loading: uploads go through pinned staging, ordered on the
+    /// stream, until [`Gpu::end_uploads`]. Returns false, changing nothing,
+    /// when uploads have already begun.
+    pub fn begin_uploads(&self) -> Result<bool> {
+        if self.staging.borrow().is_some() {
+            return Ok(false);
+        }
+        let mut bufs = Vec::with_capacity(STAGES);
+        for _ in 0..STAGES {
+            let mut e = std::ptr::null_mut();
+            // SAFETY: out-parameter; the event is owned by Staging.
+            check(
+                unsafe {
+                    cu::cuEventCreate(&mut e, cu::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32)
+                },
+                "cuEventCreate",
+            )?;
+            bufs.push((self.pinned(STAGE_BYTES)?, e));
+        }
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+        *self.staging.borrow_mut() = Some(Staging {
+            bufs,
+            next: 0,
+            threads,
+            temp: [None, None],
+        });
+        Ok(true)
+    }
+
+    /// Waits for every staged upload and frees the staging buffers.
+    pub fn end_uploads(&self) -> Result<()> {
+        self.sync()?;
+        *self.staging.borrow_mut() = None;
+        Ok(())
+    }
+
+    /// Copies `piece` to device address `dst`, ordered on the stream. Needs
+    /// [`Gpu::begin_uploads`]; the piece's bytes may be dropped on return.
+    pub fn put(&self, dst: u64, piece: &Piece) -> Result<()> {
+        let mut guard = self.staging.borrow_mut();
+        let st = guard
+            .as_mut()
+            .ok_or_else(|| Error::Config("put outside begin_uploads".into()))?;
+        let mut done = 0;
+        while done < piece.len() {
+            let n = (piece.len() - done).min(STAGE_BYTES);
+            let (buf, ev) = &mut st.bufs[st.next];
+            // SAFETY: the event was recorded after this buffer's last copy.
+            check(unsafe { cu::cuEventSynchronize(*ev) }, "cuEventSynchronize")?;
+            let dst_host = &mut buf.as_mut_slice::<u8>()[..n];
+            match piece {
+                Piece::File { file, offset, .. } => {
+                    read_parallel(file, offset + done as u64, dst_host, st.threads)?
+                }
+                Piece::Mem(m) => dst_host.copy_from_slice(&m[done..done + n]),
+            }
+            // SAFETY: the pinned buffer stays untouched until the event fires.
+            check(
+                unsafe {
+                    cu::cuMemcpyHtoDAsync_v2(dst + done as u64, buf.ptr.cast(), n, self.stream)
+                },
+                "cuMemcpyHtoDAsync",
+            )?;
+            // SAFETY: the event and stream are owned by self.
+            check(
+                unsafe { cu::cuEventRecord(*ev, self.stream) },
+                "cuEventRecord",
+            )?;
+            st.next = (st.next + 1) % st.bufs.len();
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// A buffer holding the pieces back to back.
+    pub fn upload_pieces(&self, pieces: &[Piece]) -> Result<Buf> {
+        let b = self.alloc(pieces.iter().map(Piece::len).sum())?;
+        let mut at = 0;
+        for p in pieces {
+            self.put(b.ptr + at as u64, p)?;
+            at += p.len();
+        }
+        Ok(b)
+    }
+
+    /// Device scratch of at least `bytes` in one of two slots, valid until the
+    /// next call for the same slot; stream-ordered like the uploads.
+    pub fn temp(&self, slot: usize, bytes: usize) -> Result<u64> {
+        let mut guard = self.staging.borrow_mut();
+        let st = guard
+            .as_mut()
+            .ok_or_else(|| Error::Config("temp outside begin_uploads".into()))?;
+        if st.temp[slot].as_ref().is_none_or(|b| b.bytes < bytes) {
+            // Pending work may still read the old buffer.
+            self.sync()?;
+            st.temp[slot] = None;
+            st.temp[slot] = Some(self.alloc(bytes)?);
+        }
+        Ok(st.temp[slot].as_ref().map_or(0, |b| b.ptr))
+    }
+
     pub fn upload(&self, data: &[u8]) -> Result<Buf> {
+        if self.staging.borrow().is_some() {
+            return self.upload_pieces(&[Piece::Mem(data)]);
+        }
         let b = self.alloc(data.len())?;
         // SAFETY: synchronous copy into an allocation of the same size.
         check(

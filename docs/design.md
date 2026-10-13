@@ -41,6 +41,19 @@ A quantized matrix multiply picks one of three paths by the number of rows in th
 
 All three issue no allocation and no host synchronization, so quantized decode steps run inside CUDA graphs like bf16 ones.
 
+## Loading
+
+Weights go from the file to the GPU without passing through mapped memory. Tensor ranges are read with parallel `pread` calls into four 64 MB pinned buffers, and the copy engine drains each buffer while the next one fills. GGUF blocks that need padding are repacked on the GPU. All of this is ordered on one stream, so loading never waits for the device. From the page cache on the RTX 5090 machine:
+
+| Model | Weights | Ready (to serving) |
+|---|---|---|
+| Qwen3.5-2B, bf16 | 3.8 GB | 1.5 s |
+| Qwen3.5-9B, bf16 | 17.9 GB | 1.8 s |
+| Qwen3.5-9B, Q4_K_M | 5.7 GB | 2.0 s |
+| Qwen3.8-27B, Q4_K_M | 19.4 GB | 1.9 s |
+
+Copying through mapped pages took 8.8 s for the 9B model and 24.7 s for the 27B one.
+
 ## Numerics
 
 Activations are bf16 with f32 accumulation, rounded where the bf16 reference rounds them. Recurrent states are f32. Logits are f32. Sampling runs on the GPU, so only one token id per sequence returns to the host each step.

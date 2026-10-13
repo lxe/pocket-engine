@@ -117,17 +117,24 @@ fn wait_for(path: &std::path::Path) {
 
 impl Engine {
     pub fn new(mut cfg: EngineConfig) -> Result<Self> {
+        let started = Instant::now();
         let gpu = Gpu::new(cfg.device)?;
+        let t_gpu = started.elapsed().as_secs_f64();
         if let Some(path) = &cfg.wait_for {
             wait_for(path);
         }
+        let t_wait = started.elapsed().as_secs_f64();
+        // One set of staging buffers serves the model and the vision tower.
+        gpu.begin_uploads()?;
         let model = Model::load(&gpu, &cfg.model)?;
+        let t_model = started.elapsed().as_secs_f64();
         let mc = model.cfg.clone();
         let vision = if cfg.vision {
             Vision::load(&gpu, &cfg.model, cfg.max_image_pixels / 256)?
         } else {
             None
         };
+        gpu.end_uploads()?;
         let pool_rows = if vision.is_some() { cfg.image_pool } else { 0 };
         // Each sequence holds a recurrent state slot (tens of MB on larger
         // models). Keep slots within half of what is left after the weights,
@@ -187,9 +194,19 @@ impl Engine {
             stats: Stats::default(),
             cfg,
         };
+        let t_alloc = started.elapsed().as_secs_f64();
         if e.cfg.graphs {
             e.capture()?;
         }
+        eprintln!(
+            "ready in {:.2}s: GPU {:.2}s, model {:.2}s ({:.1} GB), vision and buffers {:.2}s, graphs {:.2}s",
+            started.elapsed().as_secs_f64(),
+            t_gpu,
+            t_model - t_wait,
+            e.model.weight_bytes as f64 / 1e9,
+            t_alloc - t_model,
+            started.elapsed().as_secs_f64() - t_alloc
+        );
         Ok(e)
     }
 

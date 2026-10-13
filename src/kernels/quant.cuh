@@ -523,6 +523,23 @@ __device__ void qembed(const int* __restrict__ ids, const uint8_t* __restrict__ 
     }
 }
 
+// Rewrites ggml blocks of `bs` bytes as device blocks of `dbs`: the first
+// `head` bytes stay, then dbs - bs zero bytes, then the rest of the block.
+extern "C" __global__ void repack_blocks(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst,
+                                         int blocks, int bs, int dbs, int head) {
+    const int pad = dbs - bs;
+    const long long n = (long long)blocks * dbs;
+    for (long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x; i < n;
+         i += (long long)gridDim.x * blockDim.x) {
+        const long long b = i / dbs;
+        const int j = (int)(i - b * dbs);
+        uint8_t v = 0;
+        if (j < head) v = src[b * bs + j];
+        else if (j >= head + pad) v = src[b * bs + j - pad];
+        dst[i] = v;
+    }
+}
+
 #define QUANT_KERNELS(T, name)                                                                         \
     extern "C" __global__ void dequant_##name(const uint8_t* W, int r0, int rows, int cols, bf16* out) { \
         qdequant<T>(W, r0, rows, cols, out);                                                           \

@@ -72,7 +72,8 @@ impl GgmlType {
     }
 
     /// Bytes per block on the device. Formats whose blocks would leave the
-    /// weight bytes misaligned are repacked with padding (see [`repack`]).
+    /// weight bytes misaligned are repacked with padding at load: the first
+    /// [`GgmlType::repack_head`] bytes stay, padding follows, then the rest.
     pub fn device_block(self) -> Option<usize> {
         Some(match self.0 {
             8 => 36,   // q8_0: d, pad, qs
@@ -83,6 +84,14 @@ impl GgmlType {
             11 => 112, // q3_k: hmask, qs, scales, d, pad
             _ => return self.block().map(|b| b.1),
         })
+    }
+
+    /// Bytes of a block kept in place before the device padding.
+    pub fn repack_head(self) -> usize {
+        match self.0 {
+            8 | 2 | 20 | 6 => 2,
+            _ => self.block().map_or(0, |b| b.1),
+        }
     }
 
     pub fn is_quantized(self) -> bool {
@@ -148,6 +157,7 @@ impl TensorInfo {
 
 pub struct Gguf {
     map: memmap2::Mmap,
+    pub file: std::fs::File,
     pub meta: HashMap<String, Value>,
     pub tensors: HashMap<String, TensorInfo>,
     data: usize,
@@ -206,15 +216,15 @@ impl Reader<'_> {
 }
 
 #[allow(unsafe_code)]
-fn map(path: &Path) -> Result<memmap2::Mmap> {
-    let file = std::fs::File::open(path)?;
+fn map(file: &std::fs::File) -> Result<memmap2::Mmap> {
     // SAFETY: the model file is read-only while the engine runs.
-    Ok(unsafe { memmap2::Mmap::map(&file)? })
+    Ok(unsafe { memmap2::Mmap::map(file)? })
 }
 
 impl Gguf {
     pub fn open(path: &Path) -> Result<Self> {
-        let map = map(path)?;
+        let file = std::fs::File::open(path)?;
+        let map = map(&file)?;
         let mut r = Reader { b: &map, at: 0 };
         if r.take(4)? != b"GGUF" {
             return Err(Error::Config(format!(
@@ -252,6 +262,7 @@ impl Gguf {
         let data = r.at.next_multiple_of(align);
         let g = Self {
             map,
+            file,
             meta,
             tensors,
             data,
@@ -281,31 +292,10 @@ impl Gguf {
         let start = self.data + t.offset;
         Some((t, &self.map[start..start + t.bytes()]))
     }
-}
 
-/// Rearranges a quantized matrix's blocks into the device layout: blocks of
-/// formats listed in [`GgmlType::device_block`] gain padding so the weight
-/// bytes start on 4- or 8-byte boundaries; others are copied as they are.
-pub fn repack(ty: GgmlType, data: &[u8]) -> Vec<u8> {
-    let (Some((_, bs)), Some(dbs)) = (ty.block(), ty.device_block()) else {
-        return data.to_vec();
-    };
-    if bs == dbs {
-        return data.to_vec();
+    /// A tensor's data as a range of the file, for reading it in place.
+    pub fn file_range(&self, name: &str) -> Option<(u64, usize)> {
+        let t = self.tensors.get(name)?;
+        Some(((self.data + t.offset) as u64, t.bytes()))
     }
-    let n = data.len() / bs;
-    let mut out = vec![0u8; n * dbs];
-    for (src, dst) in data.chunks_exact(bs).zip(out.chunks_exact_mut(dbs)) {
-        match ty.0 {
-            // [d(2) | rest] -> [d(2) | pad(2) | rest]
-            8 | 2 | 20 | 6 => {
-                dst[..2].copy_from_slice(&src[..2]);
-                dst[4..4 + bs - 2].copy_from_slice(&src[2..]);
-            }
-            // Same field order, padding at the end.
-            14 | 11 => dst[..bs].copy_from_slice(src),
-            _ => unreachable!(),
-        }
-    }
-    out
 }

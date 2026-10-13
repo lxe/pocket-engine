@@ -115,6 +115,15 @@ fn staging_per_patch() -> usize {
 
 impl Vision {
     pub fn load(gpu: &Gpu, dir: &Path, max_patches: usize) -> Result<Option<Self>> {
+        let started = gpu.begin_uploads()?;
+        let v = Self::load_weights(gpu, dir, max_patches);
+        if started {
+            gpu.end_uploads()?;
+        }
+        v
+    }
+
+    fn load_weights(gpu: &Gpu, dir: &Path, max_patches: usize) -> Result<Option<Self>> {
         if crate::source::gguf_path(dir).is_some() {
             return Ok(None); // GGUF text models; projector files are not read yet
         }
@@ -129,7 +138,8 @@ impl Vision {
         }
         let (d, i) = (cfg.hidden, cfg.inter);
         let w = |name: &str, n: usize| -> Result<Buf> {
-            gpu.upload(&ck.bf16(&format!("/model.visual.{name}"), n)?)
+            let b = ck.bf16_bytes(&format!("/model.visual.{name}"), n)?;
+            gpu.upload_pieces(&[b.piece()])
         };
         let f = |name: &str, n: usize| -> Result<Buf> {
             gpu.upload(&f32_bytes(&ck.f32(&format!("/model.visual.{name}"), n)?))

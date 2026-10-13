@@ -5,7 +5,7 @@
 //! stored as -exp(A_log)) are undone in one place.
 
 use crate::gguf::{GgmlType, Gguf};
-use crate::gpu::{Buf, Gpu};
+use crate::gpu::{Arg, Buf, Gpu, Piece};
 use crate::linear::{Kind, Linear, Part, Quants};
 use crate::{Error, Result};
 use half::{bf16, f16};
@@ -14,40 +14,57 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+/// A tensor's place in a checkpoint file.
+struct Entry {
+    file: usize,
+    dtype: Dtype,
+    shape: Vec<usize>,
+    /// Byte range in the file.
+    start: usize,
+    end: usize,
+}
+
 pub struct Checkpoint {
+    files: Vec<std::fs::File>,
     maps: Vec<memmap2::Mmap>,
-    index: HashMap<String, usize>,
+    index: HashMap<String, Entry>,
     prefix: String,
 }
 
 impl Checkpoint {
     pub(crate) fn open(dir: &Path) -> Result<Self> {
-        let mut files: Vec<String> = std::fs::read_dir(dir)?
+        let mut names: Vec<String> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .filter(|n| n.ends_with(".safetensors"))
             .collect();
-        files.sort();
-        if files.is_empty() {
+        names.sort();
+        if names.is_empty() {
             return Err(Error::Config(format!(
                 "no safetensors in {}",
                 dir.display()
             )));
         }
-        let mut maps = Vec::new();
+        let (mut files, mut maps) = (Vec::new(), Vec::new());
         let mut index = HashMap::new();
-        for (i, f) in files.iter().enumerate() {
+        for (i, f) in names.iter().enumerate() {
             let file = std::fs::File::open(dir.join(f))?;
-            // SAFETY-free: memmap2::Mmap::map is unsafe only for concurrent file
-            // mutation, which the model directory does not see while serving.
             let map = map_file(&file)?;
-            let names: Vec<String> = SafeTensors::deserialize(&map)?
-                .names()
-                .into_iter()
-                .map(String::from)
-                .collect();
-            for n in names {
-                index.insert(n, i);
+            // Headers are parsed once; tensors are then found by offset.
+            let (n, meta) = SafeTensors::read_metadata(&map)?;
+            for (name, t) in meta.tensors() {
+                let base = 8 + n;
+                index.insert(
+                    name,
+                    Entry {
+                        file: i,
+                        dtype: t.dtype,
+                        shape: t.shape.clone(),
+                        start: base + t.data_offsets.0,
+                        end: base + t.data_offsets.1,
+                    },
+                );
             }
+            files.push(file);
             maps.push(map);
         }
         let prefix = if index.contains_key("model.language_model.embed_tokens.weight") {
@@ -56,6 +73,7 @@ impl Checkpoint {
             "model."
         };
         Ok(Self {
+            files,
             maps,
             index,
             prefix: prefix.into(),
@@ -67,20 +85,37 @@ impl Checkpoint {
         self.index.contains_key(full)
     }
 
-    fn view(&self, name: &str) -> Result<(Dtype, Vec<usize>, &[u8])> {
+    fn entry(&self, name: &str) -> Result<&Entry> {
         let full = match name.strip_prefix('/') {
             Some(full) => full.to_string(),
             None => format!("{}{name}", self.prefix),
         };
-        let i = *self
-            .index
+        self.index
             .get(&full)
-            .ok_or_else(|| Error::Config(format!("missing tensor {full}")))?;
-        let st = SafeTensors::deserialize(&self.maps[i])?;
-        let v = st.tensor(&full)?;
-        let (dtype, shape) = (v.dtype(), v.shape().to_vec());
-        let offset = v.data().as_ptr() as usize - self.maps[i].as_ptr() as usize;
-        Ok((dtype, shape, &self.maps[i][offset..offset + v.data().len()]))
+            .ok_or_else(|| Error::Config(format!("missing tensor {full}")))
+    }
+
+    fn view(&self, name: &str) -> Result<(Dtype, Vec<usize>, &[u8])> {
+        let e = self.entry(name)?;
+        let data = self.maps[e.file]
+            .get(e.start..e.end)
+            .ok_or_else(|| Error::Config(format!("{name} runs past the end of its file")))?;
+        Ok((e.dtype, e.shape.clone(), data))
+    }
+
+    /// A tensor in a form ready to upload: bf16 read in place from the file,
+    /// or converted from f32. Same naming as [`Checkpoint::bf16`].
+    pub(crate) fn bf16_bytes(&self, name: &str, numel: usize) -> Result<Bytes<'_>> {
+        let e = self.entry(name)?;
+        if e.dtype == Dtype::BF16 && e.shape.iter().product::<usize>() == numel {
+            self.view(name)?;
+            return Ok(Bytes::File {
+                file: &self.files[e.file],
+                offset: e.start as u64,
+                len: e.end - e.start,
+            });
+        }
+        Ok(Bytes::Owned(self.bf16(name, numel)?))
     }
 
     /// A tensor as bf16 bytes. Names are relative to the text model; a leading
@@ -140,10 +175,120 @@ pub enum Source {
     Gguf(Gguf),
 }
 
-/// A matrix in device-ready form: bf16 bytes, or a quantized format's raw blocks.
-pub struct Mat {
+/// A matrix: bf16 bytes, or a quantized format's blocks.
+pub struct Mat<'a> {
     pub kind: Kind,
-    pub bytes: Vec<u8>,
+    /// As stored: quantized formats are repacked for the device on upload.
+    pub bytes: Bytes<'a>,
+}
+
+/// Tensor bytes: a range of a model file, read straight into pinned staging
+/// at upload, or bytes converted on the host.
+pub enum Bytes<'a> {
+    File {
+        file: &'a std::fs::File,
+        offset: u64,
+        len: usize,
+    },
+    Owned(Vec<u8>),
+}
+
+impl Bytes<'_> {
+    pub fn piece(&self) -> Piece<'_> {
+        match self {
+            Bytes::File { file, offset, len } => Piece::File {
+                file,
+                offset: *offset,
+                len: *len,
+            },
+            Bytes::Owned(v) => Piece::Mem(v),
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.piece().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Uploads matrices stored back to back as one buffer of `kind`, repacking
+/// quantized blocks into the device layout on the GPU.
+fn upload_kind(gpu: &Gpu, kind: Kind, pieces: &[Piece]) -> Result<Buf> {
+    let Kind::Quant(ty) = kind else {
+        return gpu.upload_pieces(pieces);
+    };
+    let (Some((_, bs)), Some(dbs)) = (ty.block(), ty.device_block()) else {
+        return gpu.upload_pieces(pieces);
+    };
+    if bs == dbs {
+        return gpu.upload_pieces(pieces);
+    }
+    let raw: usize = pieces.iter().map(Piece::len).sum();
+    let tmp = gpu.temp(0, raw)?;
+    let mut at = 0;
+    for p in pieces {
+        gpu.put(tmp + at as u64, p)?;
+        at += p.len();
+    }
+    let blocks = raw / bs;
+    let out = gpu.alloc(blocks * dbs)?;
+    gpu.launch(
+        gpu.kernel("repack_blocks")?,
+        ((blocks * dbs).div_ceil(256).min(65_535) as u32, 1, 1),
+        256,
+        0,
+        &[
+            Arg::P(tmp),
+            Arg::P(out.ptr),
+            Arg::I(blocks as i32),
+            Arg::I(bs as i32),
+            Arg::I(dbs as i32),
+            Arg::I(ty.repack_head() as i32),
+        ],
+    )?;
+    Ok(out)
+}
+
+/// A GGUF tensor on the device in its device layout, by its GGUF name.
+pub fn upload_tensor(gpu: &Gpu, g: &Gguf, name: &str) -> Result<Buf> {
+    let (t, _) = g
+        .tensor(name)
+        .ok_or_else(|| Error::Config(format!("missing tensor {name}")))?;
+    let kind = if t.ty.is_quantized() {
+        Kind::Quant(t.ty)
+    } else {
+        Kind::Bf16
+    };
+    if !t.ty.is_quantized() && t.ty != GgmlType::BF16 {
+        return Err(Error::Config(format!(
+            "{name}: {} is not uploaded as is",
+            t.ty.name()
+        )));
+    }
+    let (offset, len) = g.file_range(name).expect("found above");
+    let started = gpu.begin_uploads()?;
+    let b = upload_kind(
+        gpu,
+        kind,
+        &[Piece::File {
+            file: &g.file,
+            offset,
+            len,
+        }],
+    );
+    if started {
+        gpu.end_uploads()?;
+    }
+    b
+}
+
+impl Mat<'_> {
+    /// The matrix on the device, in its kind's device layout (FP8 scales are
+    /// left to the caller).
+    pub fn upload(&self, gpu: &Gpu) -> Result<Buf> {
+        upload_kind(gpu, self.kind, &[self.bytes.piece()])
+    }
 }
 
 /// The GGUF file a model path names: the path itself, or the single .gguf
@@ -258,12 +403,12 @@ impl Source {
         }
     }
 
-    fn gguf_tensor(
+    fn gguf_tensor<'g>(
         &self,
-        g: &Gguf,
+        g: &'g Gguf,
         name: &str,
         numel: usize,
-    ) -> Result<(GgmlType, Vec<usize>, Vec<u8>)> {
+    ) -> Result<(GgmlType, Vec<usize>, &'g [u8])> {
         let gname = gguf_name(name);
         let (t, data) = g
             .tensor(&gname)
@@ -274,7 +419,7 @@ impl Source {
                 t.dims
             )));
         }
-        Ok((t.ty, t.dims.clone(), data.to_vec()))
+        Ok((t.ty, t.dims.clone(), data))
     }
 
     /// A small tensor as f32, from any float format.
@@ -283,7 +428,7 @@ impl Source {
             Source::Safetensors(ck) => ck.f32(name, n),
             Source::Gguf(g) => {
                 let (ty, _, data) = self.gguf_tensor(g, name, n)?;
-                to_f32(ty, &data).ok_or_else(|| {
+                to_f32(ty, data).ok_or_else(|| {
                     Error::Config(format!(
                         "{name}: expected a float tensor, found {}",
                         ty.name()
@@ -319,11 +464,11 @@ impl Source {
     }
 
     /// A `rows x cols` matrix (output features x input features).
-    pub fn matrix(&self, name: &str, rows: usize, cols: usize) -> Result<Mat> {
+    pub fn matrix(&self, name: &str, rows: usize, cols: usize) -> Result<Mat<'_>> {
         match self {
             Source::Safetensors(ck) => Ok(Mat {
                 kind: Kind::Bf16,
-                bytes: ck.bf16(name, rows * cols)?,
+                bytes: ck.bf16_bytes(name, rows * cols)?,
             }),
             Source::Gguf(g) => {
                 let (ty, dims, data) = self.gguf_tensor(g, name, rows * cols)?;
@@ -333,19 +478,29 @@ impl Source {
                         gguf_name(name)
                     )));
                 }
-                if ty.is_quantized() {
+                if ty.is_quantized() || ty == GgmlType::BF16 {
+                    let (offset, len) = g.file_range(&gguf_name(name)).expect("found above");
                     Ok(Mat {
-                        kind: Kind::Quant(ty),
-                        bytes: crate::gguf::repack(ty, &data),
+                        kind: if ty == GgmlType::BF16 {
+                            Kind::Bf16
+                        } else {
+                            Kind::Quant(ty)
+                        },
+                        bytes: Bytes::File {
+                            file: &g.file,
+                            offset,
+                            len,
+                        },
                     })
                 } else {
-                    let v = to_f32(ty, &data).expect("float type");
+                    let v = to_f32(ty, data).expect("float type");
                     Ok(Mat {
                         kind: Kind::Bf16,
-                        bytes: v
-                            .iter()
-                            .flat_map(|x| bf16::from_f32(*x).to_le_bytes())
-                            .collect(),
+                        bytes: Bytes::Owned(
+                            v.iter()
+                                .flat_map(|x| bf16::from_f32(*x).to_le_bytes())
+                                .collect(),
+                        ),
                     })
                 }
             }
@@ -362,19 +517,21 @@ impl Source {
         cols: usize,
     ) -> Result<Linear> {
         let mut out: Vec<Part> = Vec::new();
-        let mut pending: Option<(Kind, Vec<u8>, usize, usize)> = None; // kind, bytes, rows, off
+        let mut pending: Option<(Kind, Vec<Bytes>, usize, usize)> = None; // kind, bytes, rows, off
         let mut off = 0;
-        let flush = |p: Option<(Kind, Vec<u8>, usize, usize)>, out: &mut Vec<Part>| -> Result<()> {
-            if let Some((kind, bytes, rows, off)) = p {
-                out.push(Part {
-                    buf: Rc::new(gpu.upload(&bytes)?),
-                    kind,
-                    rows,
-                    off,
-                });
-            }
-            Ok(())
-        };
+        let flush =
+            |p: Option<(Kind, Vec<Bytes>, usize, usize)>, out: &mut Vec<Part>| -> Result<()> {
+                if let Some((kind, bytes, rows, off)) = p {
+                    let pieces: Vec<Piece> = bytes.iter().map(Bytes::piece).collect();
+                    out.push(Part {
+                        buf: Rc::new(upload_kind(gpu, kind, &pieces)?),
+                        kind,
+                        rows,
+                        off,
+                    });
+                }
+                Ok(())
+            };
         for &(name, rows) in parts {
             let m = self.matrix(name, rows, cols)?;
             if let Kind::Quant(ty) = m.kind {
@@ -382,12 +539,12 @@ impl Source {
             }
             match &mut pending {
                 Some((kind, bytes, r, _)) if *kind == m.kind => {
-                    bytes.extend(m.bytes);
+                    bytes.push(m.bytes);
                     *r += rows;
                 }
                 _ => {
                     flush(pending.take(), &mut out)?;
-                    pending = Some((m.kind, m.bytes, rows, off));
+                    pending = Some((m.kind, vec![m.bytes], rows, off));
                 }
             }
             off += rows;
@@ -409,6 +566,6 @@ impl Source {
         if let Kind::Quant(ty) = m.kind {
             quants.get(gpu, ty)?;
         }
-        Ok((Rc::new(gpu.upload(&m.bytes)?), m.kind))
+        Ok((Rc::new(m.upload(gpu)?), m.kind))
     }
 }

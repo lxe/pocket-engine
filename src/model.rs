@@ -319,6 +319,15 @@ pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
 impl Model {
     /// Loads a Hugging Face directory or a GGUF file (or a directory holding one).
     pub fn load(gpu: &Gpu, path: &Path) -> Result<Self> {
+        let started = gpu.begin_uploads()?;
+        let m = Self::load_weights(gpu, path);
+        if started {
+            gpu.end_uploads()?;
+        }
+        m
+    }
+
+    fn load_weights(gpu: &Gpu, path: &Path) -> Result<Self> {
         let src = Source::open(path)?;
         let mut cfg = match &src {
             Source::Gguf(g) => Config::from_gguf(g)?,

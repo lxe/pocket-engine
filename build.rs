@@ -1,7 +1,9 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    println!("cargo:rerun-if-changed=src/kernels/qwen35.cu");
+    for f in ["qwen35.cu", "quant.cuh", "ggml-common.h"] {
+        println!("cargo:rerun-if-changed=src/kernels/{f}");
+    }
     for name in ["CUDA_ROOT", "CUDA_COMPUTE_CAP", "NVCC"] {
         println!("cargo:rerun-if-env-changed={name}");
     }

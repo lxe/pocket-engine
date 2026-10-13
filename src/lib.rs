@@ -3,8 +3,10 @@
 //! an OpenAI-compatible server.
 
 pub mod engine;
+pub mod gguf;
 pub mod gpu;
 pub mod image;
+pub mod linear;
 pub mod model;
 pub mod sched;
 pub mod server;

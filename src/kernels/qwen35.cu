@@ -723,3 +723,5 @@ extern "C" __global__ void vit_bias(const float* __restrict__ y, const float* __
         out[e] = f2b(r);
     }
 }
+
+#include "quant.cuh"

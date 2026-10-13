@@ -116,6 +116,8 @@ impl Drop for Graph {
 }
 
 pub struct Gpu {
+    /// Streaming multiprocessors on the device.
+    pub sms: usize,
     stream: cu::CUstream,
     blas: cb::cublasHandle_t,
     module: cu::CUmodule,
@@ -149,6 +151,15 @@ impl Gpu {
                 "cuDeviceGetName",
             )?;
             let name = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
+            let mut sms = 0;
+            check(
+                cu::cuDeviceGetAttribute(
+                    &mut sms,
+                    cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                    dev,
+                ),
+                "cuDeviceGetAttribute",
+            )?;
             let mut stream = std::ptr::null_mut();
             check(
                 cu::cuStreamCreate(
@@ -188,6 +199,7 @@ impl Gpu {
                 "cublasSetWorkspace",
             )?;
             Ok(Self {
+                sms: sms as usize,
                 stream,
                 blas,
                 module,
@@ -206,6 +218,21 @@ impl Gpu {
             "cuModuleGetFunction",
         )?;
         Ok(Kernel(f))
+    }
+
+    /// Lets a kernel use `bytes` of dynamic shared memory (above 48 KB).
+    pub fn set_smem(&self, k: Kernel, bytes: usize) -> Result<()> {
+        // SAFETY: the function handle belongs to the loaded module.
+        check(
+            unsafe {
+                cu::cuFuncSetAttribute(
+                    k.0,
+                    cu::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    bytes as i32,
+                )
+            },
+            "cuFuncSetAttribute",
+        )
     }
 
     pub fn alloc(&self, bytes: usize) -> Result<Buf> {
@@ -359,6 +386,22 @@ impl Gpu {
         out: usize,
         f32_out: bool,
     ) -> Result<()> {
+        self.gemm_ld(x, w, y, rows, inp, out, out, f32_out)
+    }
+
+    /// As [`Gpu::gemm`], with output rows `ldy` elements apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_ld(
+        &self,
+        x: u64,
+        w: u64,
+        y: u64,
+        rows: usize,
+        inp: usize,
+        out: usize,
+        ldy: usize,
+        f32_out: bool,
+    ) -> Result<()> {
         let (alpha, beta) = (1f32, 0f32);
         let c_type = if f32_out {
             cb::cudaDataType_t::CUDA_R_32F
@@ -386,7 +429,7 @@ impl Gpu {
                     (&beta as *const f32).cast(),
                     y as *mut c_void,
                     c_type,
-                    out as i32,
+                    ldy as i32,
                     cb::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                     cb::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
                 )

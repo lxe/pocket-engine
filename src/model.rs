@@ -454,9 +454,9 @@ impl Model {
         let embed_kernel = match embed_kind {
             Kind::Bf16 => gpu.kernel("embed")?,
             Kind::Quant(ty) => quants.get(gpu, ty)?.embed,
-            Kind::Fp8(_) | Kind::Tiled(_) => {
+            Kind::Fp8(_) | Kind::Tiled(_) | Kind::Fp4 => {
                 return Err(Error::Config(
-                    "FP8 and tiled embeddings are not supported".into(),
+                    "FP8, FP4 and tiled embeddings are not supported".into(),
                 ));
             }
         };
@@ -692,6 +692,9 @@ struct Fp8Acts {
     act: (Buf, Buf),
     core: (Buf, Buf),
     ao: (Buf, Buf),
+    /// The final norm's output, one row per sequence, for an FP8 or FP4
+    /// output layer.
+    fin: (Buf, Buf),
 }
 
 impl Act {
@@ -716,12 +719,17 @@ impl Act {
                         gpu.alloc_zeroed(mode.act_scale_bytes(rows, k))?,
                     ))
                 };
+                let fin_rows = (s + 4).next_multiple_of(128);
                 Some(Fp8Acts {
                     mode,
                     xn: pair(cfg.hidden)?,
                     act: pair(cfg.inter)?,
                     core: pair(cfg.lin_v_heads * GDN_DIM)?,
                     ao: pair(cfg.hq * HEAD_DIM)?,
+                    fin: (
+                        gpu.alloc_zeroed(fin_rows * cfg.hidden)?,
+                        gpu.alloc_zeroed(mode.act_scale_bytes(fin_rows, cfg.hidden))?,
+                    ),
                 })
             }
         };
@@ -1019,16 +1027,15 @@ impl Model {
                 F(eps),
                 I(1),
                 I(0),
-                P(0),
-                P(0),
-                I(0),
-                I(0),
-            ],
+            ]
+            .into_iter()
+            .chain(a.fp8_args(|f| &f.fin, s))
+            .collect::<Vec<_>>(),
         )?;
         self.lm_head.forward(
             gpu,
             q,
-            Input::bf16(a.fin.ptr),
+            a.input(&a.fin, |f| &f.fin),
             s,
             a.logits.ptr,
             c.vocab,

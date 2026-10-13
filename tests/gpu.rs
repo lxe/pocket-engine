@@ -29,6 +29,7 @@ fn config(model: PathBuf) -> EngineConfig {
         image_pool: 4096,
         max_image_pixels: 1 << 20,
         fp8: fp8(),
+        fp4: fp4(),
         kv_fp8: kv_fp8(),
         state_bf16: !std::env::var("POCKET_ENGINE_STATE_F32").is_ok_and(|v| v == "1"),
         ..EngineConfig::new(model)
@@ -92,8 +93,8 @@ fn matches_transformers_teacher_forced() {
         )
         .unwrap();
     assert!(reference.iter().map(Vec::len).sum::<usize>() > 200);
-    if gguf {
-        // Quantized weights carry their own error against the bf16 reference.
+    if gguf || fp4() {
+        // 4-bit weights carry their own error against the bf16 reference.
         close_enough(&reference, &got, 85, 0.1);
     } else if fp8() {
         close_enough(&reference, &got, 93, 0.03);
@@ -132,6 +133,12 @@ fn close_enough(
 /// POCKET_ENGINE_FP8=1 runs the suite with weights quantized to FP8 at load.
 fn fp8() -> bool {
     std::env::var("POCKET_ENGINE_FP8").is_ok_and(|v| v == "1")
+}
+
+/// POCKET_ENGINE_FP4=1 runs the suite with MLP weights quantized to FP4 at
+/// load and the other projections to FP8 (Blackwell).
+fn fp4() -> bool {
+    std::env::var("POCKET_ENGINE_FP4").is_ok_and(|v| v == "1")
 }
 
 /// POCKET_ENGINE_KV_FP8=1 runs the suite with an FP8 KV cache.
@@ -217,6 +224,10 @@ fn images_match_transformers() {
     }
     let mut e = Engine::new(config(dir)).unwrap();
     let got = e.score(items).unwrap();
+    if fp4() {
+        close_enough(&reference, &got, 90, 0.05);
+        return;
+    }
     if fp8() {
         // Image tokens pass through every FP8 projection.
         close_enough(&reference, &got, 95, 0.01);
@@ -264,7 +275,7 @@ fn batching_does_not_change_greedy_output() {
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let pairs: Vec<Pair> = fixture(&format!("{}.pairs.json", size(&dir)));
     let mut e = Engine::new(config(dir)).unwrap();
-    if fp8() {
+    if fp8() || fp4() {
         // FP8 rounding of activations magnifies the last-bit differences
         // that come from GEMM kernels chosen by batch size, about as much as
         // FP8's own error against bf16, so greedy output may part. Hold the

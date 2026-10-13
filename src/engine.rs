@@ -36,6 +36,8 @@ pub struct EngineConfig {
     pub image_pool: usize,
     /// Quantize bf16 weights to FP8 at load.
     pub fp8: bool,
+    /// Quantize bf16 MLP weights to FP4 at load, the rest to FP8 (Blackwell).
+    pub fp4: bool,
     /// Store the KV cache as E4M3 with a scale per token and head.
     pub kv_fp8: bool,
     /// Store the recurrent state as bf16 (math stays f32).
@@ -57,6 +59,7 @@ impl EngineConfig {
             max_image_pixels: 4 << 20,
             image_pool: 16_384,
             fp8: false,
+            fp4: false,
             kv_fp8: false,
             state_bf16: true,
         }
@@ -134,8 +137,14 @@ impl Engine {
         }
         let load = crate::source::Load {
             fp8: gpu.fp8_mode(),
-            quantize: cfg.fp8,
+            quantize: cfg.fp8 || cfg.fp4,
+            fp4: cfg.fp4,
         };
+        if cfg.fp4 && load.fp8 != Some(crate::gpu::Fp8Mode::Mx32) {
+            return Err(Error::Config(
+                "--fp4 needs a Blackwell GPU (RTX 50-series)".into(),
+            ));
+        }
         if cfg.fp8 && load.fp8.is_none() {
             return Err(Error::Config(
                 "--fp8 needs a GPU with FP8 matmuls (Hopper or Blackwell)".into(),

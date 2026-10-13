@@ -95,6 +95,32 @@ Accuracy against Transformers, with prompts of about 3,300 tokens (`scripts/accu
 
 On the short fixture prompts, the 0.8B, 2B and 9B models pass the bf16 accuracy bar unchanged with an FP8 cache.
 
+## FP4
+
+On the RTX 5090, FP4 layers run `mma.sync … kind::mxf8f6f4.block_scale` at m16n8k32. The instruction takes E2M1 weights and the MXFP8 activations the norm kernels already write. Its scales must be UE8M0 (powers of two), one per 32 values.
+
+- **Weights.** They use the tiled order of the 4-bit GGUF formats (16 rows × 256 inputs). Each lane holds 8 inputs of a row as one 32-bit word, arranged so that two masks put four E2M1 codes in the middle bits of four bytes, where the instruction reads them. Decoding costs two operations per four weights. Each row adds one scale byte per 32 inputs, for 4.25 bits per weight.
+- **Scale operands.** Each lane passes A's scale for row `g + 8 × (lane & 1)` and B's scale for its token `g`, the layout CUTLASS uses for SM120.
+- **Prompt chunks.** Above 160 rows, tiles expand to MXFP8 for cuBLASLt. E2M1 values under the same power-of-two scale are exact in E4M3.
+
+NVIDIA's NVFP4 checkpoints scale every 16 values by an E4M3 factor, which this instruction cannot take. The NVFP4-native instruction (`kind::mxf4nvf4`) needs FP4 activations too. So NVFP4 weights are re-quantized at load: each 32 values get the smallest power-of-two scale that keeps their largest within E2M1's 6, then round to the nearest code. Clipping to `floor(log2 amax) - 2`, the OCP rule, measured worse. The checkpoint's per-tensor FP8 layers load like Qwen's FP8 ones, with the scalar spread over the block-scale grid.
+
+| Qwen3.8-27B on the RTX 5090 | Top-1 agreement (213) | Median, p95 log-prob difference |
+|---|---|---|
+| NVFP4 checkpoint, as MXFP4 | 197 | 0.0053, 0.42 |
+| Q4_K_M (GGUF) | 207 | 0.0019, 0.17 |
+| Qwen3.8-27B-FP8 (H100) | 209 | 0.0009, 0.088 |
+
+| In flight | NVFP4 as MXFP4 | Q4_K_M |
+|---:|---|---|
+| 1 | 56 | 52 |
+| 8 | 304 | 182 |
+| 16 | 455 | 250 |
+| 32 | 571 | 321 |
+| 64 | 551, 1.9 s | 335, 1.8 s |
+
+Both ran with `--memory-fraction 0.96` on a card that also drives a desktop; 27 requests fit beside the NVFP4 weights (19.8 GB) and 41 beside Q4_K_M. Qwen3.5-9B with `--fp4` agrees on 201 of 220 and serves 149, 858, 1,337, 1,837 and 2,477 tok/s at 1, 8, 16, 32 and 64 in flight. With `--fp8` the same figures are 100, 684, 1,171, 1,785 and 2,457.
+
 ## Loading
 
 Weights go from the file to the GPU without passing through mapped memory. Tensor ranges are read with parallel `pread` calls into four 64 MB pinned buffers, and the copy engine drains each buffer while the next one fills. GGUF blocks that need padding are repacked on the GPU, and FP8 conversions run on the GPU too. All of this is ordered on one stream, so loading never waits for the device. From the page cache on the RTX 5090 machine:

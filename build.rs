@@ -1,7 +1,13 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    for f in ["qwen35.cu", "quant.cuh", "fp8.cuh", "ggml-common.h"] {
+    for f in [
+        "qwen35.cu",
+        "quant.cuh",
+        "fp8.cuh",
+        "fp4.cuh",
+        "ggml-common.h",
+    ] {
         println!("cargo:rerun-if-changed=src/kernels/{f}");
     }
     for name in ["CUDA_ROOT", "CUDA_COMPUTE_CAP", "NVCC"] {

@@ -344,6 +344,9 @@ pub struct Load {
     pub fp8: Option<Fp8Mode>,
     /// Quantize bf16 matrices to FP8 at load.
     pub quantize: bool,
+    /// Quantize bf16 MLP matrices to FP4 at load (the rest to FP8, so
+    /// `quantize` is set too). Blackwell only.
+    pub fp4: bool,
 }
 
 /// What a part of a layer becomes on the device.
@@ -355,6 +358,10 @@ enum Target {
     Fp8Checkpoint,
     /// bf16 from the checkpoint, quantized to FP8 on the GPU.
     Fp8Quantized,
+    /// NVFP4 from the checkpoint, re-quantized to MXFP4 tiles.
+    Fp4Checkpoint,
+    /// bf16 from the checkpoint, quantized to MXFP4 tiles.
+    Fp4Quantized,
 }
 
 /// Matrices Qwen's FP8 checkpoints keep in bf16, kept so when quantizing.
@@ -555,6 +562,51 @@ impl Source {
         match self {
             Source::Safetensors(ck) => {
                 let (dtype, shape, _) = ck.view(name)?;
+                let has = |suffix: &str| match name.strip_prefix('/') {
+                    Some(full) => ck.has(&format!("{full}{suffix}")),
+                    None => ck.has(&format!("{}{name}{suffix}", ck.prefix)),
+                };
+                if dtype == Dtype::U8 && has("_scale_2") {
+                    // NVFP4 (ModelOpt): two E2M1 per byte, an E4M3 scale per
+                    // 16 and a global scale.
+                    if shape.iter().product::<usize>() * 2 != rows * cols {
+                        return Err(Error::Config(format!(
+                            "{name}: shape {shape:?}, expected {rows} x {cols} FP4"
+                        )));
+                    }
+                    let e = ck.entry(name)?;
+                    let (_, _, ws) = ck.view(&format!("{name}_scale"))?;
+                    if ws.len() != rows * cols / 16 {
+                        return Err(Error::Config(format!("{name}_scale: expected one per 16")));
+                    }
+                    let global = ck.f32(&format!("{name}_scale_2"), 1)?[0];
+                    let mut scales = ws.to_vec();
+                    scales.extend(global.to_le_bytes());
+                    return Ok(Mat {
+                        kind: Kind::Fp4,
+                        bytes: Bytes::File {
+                            file: &ck.files[e.file],
+                            offset: e.start as u64,
+                            len: e.end - e.start,
+                        },
+                        scales,
+                    });
+                }
+                if dtype == Dtype::F8_E4M3 && !has("_scale_inv") && has("_scale") {
+                    // FP8 with one scale per tensor: as block scales, all equal.
+                    let e = ck.entry(name)?;
+                    let sc = ck.f32(&format!("{name}_scale"), 1)?[0];
+                    let n = rows.div_ceil(128) * cols.div_ceil(128);
+                    return Ok(Mat {
+                        kind: Kind::Fp8(Fp8Mode::Block128),
+                        bytes: Bytes::File {
+                            file: &ck.files[e.file],
+                            offset: e.start as u64,
+                            len: e.end - e.start,
+                        },
+                        scales: f32_bytes(&vec![sc; n]),
+                    });
+                }
                 if dtype == Dtype::F8_E4M3 {
                     if shape.iter().product::<usize>() != rows * cols {
                         return Err(Error::Config(format!(
@@ -649,6 +701,19 @@ impl Source {
                     Target::Quant(ty)
                 }
                 Kind::Fp8(_) => Target::Fp8Checkpoint,
+                Kind::Fp4 => {
+                    quants.fp4(gpu)?;
+                    Target::Fp4Checkpoint
+                }
+                Kind::Bf16
+                    if load.fp4
+                        && name.contains("mlp.")
+                        && rows.is_multiple_of(16)
+                        && cols.is_multiple_of(256) =>
+                {
+                    quants.fp4(gpu)?;
+                    Target::Fp4Quantized
+                }
                 Kind::Bf16
                     if load.quantize
                         && load.fp8.is_some()
@@ -660,8 +725,10 @@ impl Source {
                 Kind::Bf16 => Target::Bf16,
             };
             // Block scales stack only in whole 128-row tiles.
-            let stacks = target != Target::Fp8Checkpoint
-                || pending.as_ref().is_some_and(|p| p.rows.is_multiple_of(128));
+            // NVFP4 matrices each carry their own global scale.
+            let stacks = target != Target::Fp4Checkpoint
+                && (target != Target::Fp8Checkpoint
+                    || pending.as_ref().is_some_and(|p| p.rows.is_multiple_of(128)));
             match &mut pending {
                 Some(p) if p.target == target && stacks => {
                     p.bytes.push(m.bytes);
@@ -787,6 +854,48 @@ impl Source {
                         part(q, Kind::Fp8(mode), Some(sx))
                     }
                 }
+            }
+            Target::Fp4Checkpoint | Target::Fp4Quantized => {
+                if load.fp8 != Some(Fp8Mode::Mx32) {
+                    return Err(Error::Config(
+                        "FP4 weights need a Blackwell GPU (RTX 50-series)".into(),
+                    ));
+                }
+                let out = gpu.alloc(rows / 16 * (cols / 256) * 2176)?;
+                let w = to_temp(0, &pieces)?;
+                if target == Target::Fp4Checkpoint {
+                    let (ws, global) = scales.split_at(scales.len() - 4);
+                    let global = f32::from_le_bytes(global.try_into().expect("4 bytes"));
+                    let s = to_temp(1, &[Piece::Mem(ws)])?;
+                    gpu.launch(
+                        gpu.kernel("nvfp4_to_tiles")?,
+                        grid(rows * cols / 32),
+                        256,
+                        0,
+                        &[
+                            Arg::P(w),
+                            Arg::P(s),
+                            Arg::F(global),
+                            Arg::I(rows as i32),
+                            Arg::I(cols as i32),
+                            Arg::P(out.ptr),
+                        ],
+                    )?;
+                } else {
+                    gpu.launch(
+                        gpu.kernel("bf16_to_fp4_tiles")?,
+                        grid(rows * cols / 32),
+                        256,
+                        0,
+                        &[
+                            Arg::P(w),
+                            Arg::I(rows as i32),
+                            Arg::I(cols as i32),
+                            Arg::P(out.ptr),
+                        ],
+                    )?;
+                }
+                part(out, Kind::Fp4, None)
             }
             Target::Fp8Quantized => {
                 let mode = load.fp8.expect("checked when chosen");

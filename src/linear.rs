@@ -15,6 +15,9 @@ pub enum Kind {
     Quant(GgmlType),
     /// A 4-bit format rewritten in 16 x 256 tiles (see `GgmlType::tile_chunk`).
     Tiled(GgmlType),
+    /// MXFP4 weights in 16 x 256 tiles, multiplied with MXFP8 activations on
+    /// Blackwell's block-scaled tensor cores (fp4.cuh).
+    Fp4,
     /// E4M3 weights with scales in the given layout (see `Part::scales`).
     Fp8(Fp8Mode),
 }
@@ -118,6 +121,10 @@ fn split_tuning() -> (usize, usize) {
 #[derive(Default)]
 pub struct Quants {
     kernels: HashMap<GgmlType, QuantKernels>,
+    /// MXFP4 kernels for tiles of 8, 16, 32 and 64 rows.
+    fp4: Option<[Kernel; 4]>,
+    /// Expands MXFP4 tiles to MXFP8 rows for cuBLASLt.
+    fp4_expand: Option<Kernel>,
     finish: Option<Kernel>,
     workspace: Option<Buf>,
     sms: usize,
@@ -181,10 +188,28 @@ impl Quants {
         Ok(k)
     }
 
+    /// Loads the MXFP4 kernels and the split-K workspace.
+    pub fn fp4(&mut self, gpu: &Gpu) -> Result<()> {
+        if self.fp4.is_none() {
+            let mut k = Vec::with_capacity(4);
+            for t in MMA_TILES {
+                k.push(gpu.kernel(&format!("qfp4_{t}"))?);
+            }
+            self.fp4 = Some(k.try_into().unwrap_or_else(|_| unreachable!()));
+            self.fp4_expand = Some(gpu.kernel("fp4_to_mx8")?);
+        }
+        if self.workspace.is_none() {
+            self.workspace = Some(gpu.alloc(SPLIT_WORKSPACE)?);
+            self.finish = Some(gpu.kernel("qmma_finish")?);
+            self.sms = gpu.sms;
+        }
+        Ok(())
+    }
+
     /// Allocates the dequantization scratch once any quantized layer exists.
     /// Call after loading, before running (allocation cannot be captured).
     pub fn prepare(&mut self, gpu: &Gpu, largest: usize) -> Result<()> {
-        if !self.kernels.is_empty() && self.scratch.is_none() {
+        if (!self.kernels.is_empty() || self.fp4.is_some()) && self.scratch.is_none() {
             self.scratch = Some(gpu.alloc(largest.min(SCRATCH_WEIGHTS) * 2)?);
         }
         Ok(())
@@ -208,10 +233,11 @@ impl Linear {
             .sum()
     }
 
-    /// The FP8 layout of this layer's FP8 parts, if any.
+    /// The FP8 activation layout this layer's FP8 or FP4 parts read, if any.
     pub fn fp8(&self) -> Option<Fp8Mode> {
         self.parts.iter().find_map(|p| match p.kind {
             Kind::Fp8(m) => Some(m),
+            Kind::Fp4 => Some(Fp8Mode::Mx32),
             _ => None,
         })
     }
@@ -255,6 +281,114 @@ impl Linear {
                         ldy,
                         f32_out,
                     )?;
+                }
+                Kind::Fp4 => {
+                    if input.fp8 == 0 {
+                        return Err(Error::Config("an FP4 layer got no FP8 input".into()));
+                    }
+                    let ks = q
+                        .fp4
+                        .as_ref()
+                        .ok_or_else(|| Error::Config("FP4 kernels not loaded".into()))?;
+                    if rows > DENSE_ROWS
+                        && let Some(sc) = &q.scratch
+                    {
+                        // Prompt chunks: expand slices of rows to MXFP8 (exactly)
+                        // and run cuBLASLt's block-scaled FP8 GEMM.
+                        let k = self.cols;
+                        let per_row = k + k / 32;
+                        let per = ((sc.bytes / per_row) / 128 * 128)
+                            .clamp(128, p.rows.next_multiple_of(128));
+                        let mut r0 = 0;
+                        while r0 < p.rows {
+                            let n = per.min(p.rows - r0);
+                            let sx = sc.ptr + (per * k) as u64;
+                            gpu.launch(
+                                q.fp4_expand.expect("loaded with the FP4 kernels"),
+                                ((n * k / 8).div_ceil(256).min(65_535) as u32, 1, 1),
+                                256,
+                                0,
+                                &[
+                                    P(p.buf.ptr),
+                                    I(r0 as i32),
+                                    I(n as i32),
+                                    I(k as i32),
+                                    P(sc.ptr),
+                                    P(sx),
+                                ],
+                            )?;
+                            gpu.fp8_matmul(
+                                Fp8Mode::Mx32,
+                                sc.ptr,
+                                sx,
+                                input.fp8,
+                                input.scales,
+                                y + ((p.off + r0) * elem) as u64,
+                                n,
+                                k,
+                                rows,
+                                ldy,
+                                f32_out,
+                            )?;
+                            r0 += n;
+                        }
+                        continue;
+                    }
+                    // Up to 64 rows in one tile row; more rows take more tiles.
+                    let ti = MMA_TILES.iter().position(|&t| rows <= t).unwrap_or(3);
+                    let tile = MMA_TILES[ti];
+                    let warps = p.rows.div_ceil(16) * rows.div_ceil(tile);
+                    let (target, _) = split_tuning();
+                    let chunks = self.cols / 256;
+                    let mut split = (target * q.sms)
+                        .div_ceil(warps)
+                        .clamp(1, chunks.clamp(1, 32));
+                    split = split.min(SPLIT_WORKSPACE / (rows * p.rows * 4)).max(1);
+                    let ws = q.workspace.as_ref().map_or(0, |b| b.ptr);
+                    gpu.launch(
+                        ks[ti],
+                        (
+                            p.rows.div_ceil(64) as u32,
+                            rows.div_ceil(tile) as u32,
+                            split as u32,
+                        ),
+                        128,
+                        0,
+                        &[
+                            P(p.buf.ptr),
+                            I(p.rows as i32),
+                            I(self.cols as i32),
+                            P(input.fp8),
+                            I(self.cols as i32),
+                            P(input.scales),
+                            I(rows as i32),
+                            P(y),
+                            I(ldy as i32),
+                            I(p.off as i32),
+                            I(f32_out as i32),
+                            P(ws),
+                            I(split as i32),
+                        ],
+                    )?;
+                    if split > 1 {
+                        let n = rows * p.rows;
+                        gpu.launch(
+                            q.finish.expect("loaded with the workspace"),
+                            (n.div_ceil(256).min(4096) as u32, 1, 1),
+                            256,
+                            0,
+                            &[
+                                P(ws),
+                                I(rows as i32),
+                                I(p.rows as i32),
+                                I(split as i32),
+                                P(y),
+                                I(ldy as i32),
+                                I(p.off as i32),
+                                I(f32_out as i32),
+                            ],
+                        )?;
+                    }
                 }
                 Kind::Bf16 => gpu.gemm_ld(
                     x,

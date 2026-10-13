@@ -48,6 +48,10 @@ struct EngineArgs {
     /// checkpoints load as FP8 without it.
     #[arg(long)]
     fp8: bool,
+    /// Quantize bf16 MLP weights to FP4 (MXFP4) at load and the other
+    /// projections to FP8 (RTX 50-series). NVFP4 checkpoints need no flag.
+    #[arg(long)]
+    fp4: bool,
     /// Store the KV cache as FP8 (E4M3, a scale per token and head): about
     /// twice the tokens in the same memory.
     #[arg(long)]
@@ -72,6 +76,7 @@ impl EngineArgs {
             max_image_pixels: self.max_image_pixels,
             image_pool: self.image_pool,
             fp8: self.fp8,
+            fp4: self.fp4,
             kv_fp8: self.kv_fp8,
             state_bf16: !self.state_f32,
             ..EngineConfig::new(self.model.clone())

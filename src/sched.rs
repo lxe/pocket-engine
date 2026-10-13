@@ -472,10 +472,9 @@ impl Scheduler {
             };
             let total_blocks = (seq.req.prompt.len() + seq.req.max_new).div_ceil(BLOCK_SIZE);
             let rows: usize = seq.req.images.iter().map(Image::tokens).sum();
-            // Plain text prompts may reuse and leave cached prefixes; images
-            // and teacher-forced scoring do not.
+            // Text prompts may reuse and leave cached prefixes; prompts with
+            // images do not.
             let cacheable = rows == 0
-                && seq.forced.is_none()
                 && (!self.prefixes.free_snaps.is_empty() || !self.prefixes.entries.is_empty());
             let hit = if cacheable {
                 self.lookup(&seq.req.prompt)

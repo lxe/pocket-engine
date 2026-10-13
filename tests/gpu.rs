@@ -445,22 +445,45 @@ fn prefix_cache_reuses_without_changing_output() {
     assert_eq!(with, without);
     drop(plain);
     // With whole prompts in one step, the state at a boundary inside the
-    // step is written by the step itself. Prompts now split differently with
-    // and without the cache, so matmul rounding may differ; the first tokens
-    // agree.
+    // step is written by the step itself. Prompts then split differently
+    // with and without the cache, so matmuls round differently: the scores
+    // of the same continuation agree as batching's do.
     let big = |prefix_cache| EngineConfig {
         max_batch_tokens: 1024,
         prefix_cache,
         ..config(dir.clone())
     };
-    let mut cached = Engine::new(big(None)).unwrap();
-    generate(&mut cached, std::slice::from_ref(&first), 8);
-    let with = generate(&mut cached, std::slice::from_ref(&second), 8);
-    assert!(cached.sched.counters.cached_tokens >= pocket_engine::sched::CACHE_UNIT as u64);
-    drop(cached);
+    let scoring = |prompt: &Vec<u32>, forced: &Vec<u32>| Scoring {
+        prompt: prompt.clone(),
+        forced: forced.clone(),
+        images: vec![],
+        rope: None,
+    };
     let mut plain = Engine::new(big(Some(0))).unwrap();
-    let without = generate(&mut plain, std::slice::from_ref(&second), 8);
-    assert_eq!(with, without);
+    let cont = generate(&mut plain, std::slice::from_ref(&second), 16).remove(0);
+    let reference: Vec<Vec<Reference>> = plain
+        .score(vec![scoring(&second, &cont)])
+        .unwrap()
+        .into_iter()
+        .map(|seq| {
+            seq.into_iter()
+                .map(|s| Reference {
+                    argmax: s.argmax,
+                    top: s.top,
+                })
+                .collect()
+        })
+        .collect();
+    drop(plain);
+    let mut cached = Engine::new(big(None)).unwrap();
+    cached.score(vec![scoring(&first, &vec![cont[0]])]).unwrap();
+    let got = cached.score(vec![scoring(&second, &cont)]).unwrap();
+    assert!(cached.sched.counters.cached_tokens >= pocket_engine::sched::CACHE_UNIT as u64);
+    if fp8() || fp4() || kv_fp8() {
+        close_enough(&reference, &got, 90, 0.03);
+    } else {
+        assert!(agree(&reference, &got) < 0.01);
+    }
 }
 
 /// Draws one token `n` times from the first position of a prompt.

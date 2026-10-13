@@ -43,6 +43,29 @@ Startup and time to first token, one request at a time, bf16 ([receipt](docs/rec
 
 ³ Weights in the page cache; vLLM's time counts from its first log line, after Python's imports. Prompts run on a FlashAttention-3-style warp-specialized flash kernel and a two-pass chunked linear-attention recurrence, both written for this engine ([long contexts](docs/design.md#long-contexts)).
 
+### Across GPUs
+
+Each cell is pocket-engine / vLLM 0.31.0, both run on the same rented GPU, bf16. Startup is launch to serving; first tokens are a 60-to-200-token prompt (median) and a 64k-token one; decoding is output tokens per second for one stream, for 64 requests in flight (`scripts/load.py`), and for one stream drafting two tokens a step. Receipts: [H100](docs/receipts/h100-mtp-ttft.json), [H200](docs/receipts/h200-gauntlet.json), [B200](docs/receipts/b200-gauntlet.json), [RTX 5090](docs/receipts/rtx5090-gauntlet.json).
+
+Qwen3.5-9B:
+
+| GPU | Startup | First token, short | First token, 64k | One stream | 64 in flight | One stream, 2 drafts |
+|---|---|---|---|---|---|---|
+| H100 | **2.6–3.5 s** / 89–165 s | **13.5** / 57.5 ms | 2.29 / **2.28** s | **150** / 143 | **3,534** / 2,567 | **293** / 253 |
+| H200 | **2.4–3.5 s** / 70–108 s | **13.9** / 41.0 ms | 2.24 / **2.15** s | **197** / 189 | **4,065** / 3,382 | **376** / 332 |
+| B200 | **1.7–5.1 s** / 61–132 s | **7.4** / 19.0 ms | 2.86 / **1.12** s | **253** / 242 | **5,457** / 4,782 | **469** / 426 |
+| RTX 5090 | **1.9–2.9 s** / 62–178 s | **19.1** / 56.7 ms | **6.53** / 6.57 s | **97** / 95 | **2,030** / 1,872 | **185** / 153 |
+
+Qwen3.8-27B (it does not fit an RTX 5090 in bf16):
+
+| GPU | Startup | First token, short | First token, 64k | One stream | 64 in flight | One stream, 2 drafts |
+|---|---|---|---|---|---|---|
+| H100 | **5.1–6.1 s** / 96–180 s | **36.5** / 97.4 ms | 7.27 / **6.93** s | **49** / 48 | **1,037** / 1,029 | **111** / 100 |
+| H200 | **3.7–6.5 s** / 93–136 s | **26.5** / 56.2 ms | 6.91 / **6.61** s | **69** / 67 | 1,200 / **1,254** | **146** / 136 |
+| B200 | **3.3–8.7 s** / 68–174 s | **18.7** / 26.9 ms | 7.94 / **3.54** s | **93** / 92 | 1,698 / **1,803** | **197** / 178 |
+
+On a B200, prompts run on the engine's generic tensor-core kernels; it has no Blackwell-specific attention or recurrence yet, which is why long prompts take about 2.5 times vLLM's time there.
+
 ## Supported
 
 | | |
@@ -58,7 +81,7 @@ Startup and time to first token, one request at a time, bf16 ([receipt](docs/rec
 | Prefix cache | Prompts that share a beginning (a system prompt, or a conversation's earlier turns) reuse its KV cache and recurrent state. On by default |
 | Speculative decoding | `--mtp` drafts tokens with the checkpoint's multi-token-prediction layer and verifies them in the next step, for greedy and sampled requests alike (not with penalties or `logit_bias`). Qwen3.5-9B with two drafts: 293 tok/s for one stream instead of 150 on an H100 (vLLM's MTP: 253), 152 instead of 85 on an RTX 5090 |
 | Sampling | Greedy, or temperature with `top_k`, `top_p`, `min_p` and `seed`; `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`; `stop` strings |
-| GPUs | NVIDIA, built per architecture: `90a` (H100), `120a` (RTX 50-series); others via `CUDA_COMPUTE_CAP` |
+| GPUs | NVIDIA, built per architecture: `90a` (H100, H200), `100a` (B200), `120a` (RTX 50-series); others via `CUDA_COMPUTE_CAP` |
 | Driver | CUDA 13 (driver 580 or newer); cuBLAS 13 at run time |
 
 ## Install
@@ -67,7 +90,7 @@ You need Rust 1.98 or newer and the CUDA 13 toolkit (`nvcc`).
 
 ```sh
 git clone https://github.com/lxe/pocket-engine && cd pocket-engine
-CUDA_COMPUTE_CAP=90a cargo build --release --features cuda   # 120a for an RTX 5090
+CUDA_COMPUTE_CAP=90a cargo build --release --features cuda   # 100a for a B200, 120a for an RTX 5090
 ```
 
 The binary is `target/release/pocket-engine`. It loads `libcuda`, `libcublas.so.13` and `libcublasLt.so.13` at run time, so they must be on the library path.

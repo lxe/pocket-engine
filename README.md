@@ -20,9 +20,9 @@ Output tokens per second with 64 requests in flight on one H100, from `scripts/l
 | Qwen3.5-9B | Q4_K_M | **2,315** | does not load | 395 |
 | Qwen3.8-27B | Q4_K_M | **675** | does not load | 156 |
 
-¹ Retested on 2026-10-13 after the chunked linear attention, grouped flash attention and multi-token prediction; the other rows are from 2026-10-12. ² Later on 2026-10-13, both engines with their multi-token prediction drafting two tokens (pocket-engine `--mtp 2`, vLLM's `mtp` method with 2 speculative tokens); [all loads and draft counts](docs/design.md#multi-token-prediction).
+¹ From [a separate H100 run](docs/h100-comparison.md#27b-multi-token-prediction-shared-prefixes-and-long-prompts), with vLLM at `--max-num-seqs 256`. ² Both engines drafting two tokens a step with their multi-token prediction (pocket-engine `--mtp 2`, vLLM's `mtp` method with 2 speculative tokens); [all loads and draft counts](docs/design.md#multi-token-prediction).
 
-pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. On long prompts vLLM still prefills faster: level at 8k, 1.1 times as fast at 32k and 1.25 at 64k; [the retest](docs/h100-comparison.md#retest-2026-10-13-27b-prefix-cache-long-contexts-multi-token-prediction) has long prompts and shared prefixes.
+pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. On long prompts vLLM prefills faster: level at 8k, 1.1 times as fast at 32k and 1.25 at 64k; [the comparison](docs/h100-comparison.md#27b-multi-token-prediction-shared-prefixes-and-long-prompts) has long prompts and shared prefixes.
 
 ## Supported
 
@@ -30,7 +30,7 @@ pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. On long pr
 |---|---|
 | Models | Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B (Qwen3.5- and 3.6-27B share its architecture), with images. All dense |
 | Not supported | Mixture-of-experts models (Qwen3.5-35B-A3B and larger), video, GPTQ and AWQ checkpoints |
-| Weights | Hugging Face safetensors checkpoints in bf16 (f32 tensors are converted), Qwen's FP8 (`Qwen3.8-27B-FP8`, `Qwen3.5-27B-FP8`) or NVIDIA ModelOpt's NVFP4 and per-tensor FP8, or a GGUF file (text only; projector files are not read yet). GGUF files with a multi-token-prediction layer load; the layer is skipped (`--mtp` needs a safetensors checkpoint) |
+| Weights | Hugging Face safetensors checkpoints in bf16 (f32 tensors are converted), Qwen's FP8 (`Qwen3.8-27B-FP8`, `Qwen3.5-27B-FP8`) or NVIDIA ModelOpt's NVFP4 and per-tensor FP8, or a GGUF file (text only; projector files are not read). GGUF files with a multi-token-prediction layer load; the layer is skipped (`--mtp` needs a safetensors checkpoint) |
 | Images | JPEG, PNG, WebP, GIF or BMP, as `data:` or `http(s)` URLs. Images are resized so each side is a multiple of 32 pixels, and every 32×32 block becomes one prompt token. The area is held between 65,536 and `--max-image-pixels` (default 4,194,304). |
 | Quantization | GGUF weights stay quantized on the GPU: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely within a file. Their activations run in bf16 with f32 accumulation |
 | FP8 | E4M3 weights and activations on H100, H200 and RTX 50-series: Qwen's FP8 checkpoints, or any bf16 checkpoint with `--fp8`. Block scales of 128×128 per weight tile and 128 per activation row on Hopper; MXFP8 (a scale per 32 values) on Blackwell. Images, samplers and CUDA graphs work with it. The KV cache can be FP8 too (`--kv-fp8`) |

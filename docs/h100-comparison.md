@@ -1,9 +1,9 @@
 # pocket-engine, vLLM and llama.cpp on one H100
 
-All runs used one RunPod H100 80GB SXM (driver 580.126.09), one after another, on 2026-10-12. Each engine served Qwen3.5 0.8B, 2B, 4B and 9B and Qwen3.8-27B under `scripts/load.py`: streamed chat completions with prompts of about 60 to 200 tokens and outputs of 16 to 64 tokens, decoded greedily with thinking off. The tables give output tokens per second at 1, 8, 16, 32 and 64 requests in flight and for a burst of 64, the time from launch to serving, and the median time to first token at 64 in flight. [Receipt](receipts/h100-engines.json).
+Measured on one H100 80GB SXM (driver 580.126.09), 2026-10-12, one engine after another. Each engine served Qwen3.5 0.8B, 2B, 4B and 9B and Qwen3.8-27B under `scripts/load.py`: streamed chat completions with prompts of about 60 to 200 tokens and outputs of 16 to 64 tokens, decoded greedily with thinking off. The tables give output tokens per second at 1, 8, 16, 32 and 64 requests in flight and for a burst of 64, the time from launch to serving, and the median time to first token at 64 in flight. [Receipt](receipts/h100-engines.json).
 
-- **pocket-engine** ran with its defaults. FP8 is `--fp8` (block-scaled weights and activations, quantized at load) for 0.8B to 9B and the `Qwen3.8-27B-FP8` checkpoint for 27B. Q4_K_M ran on the build with tiled Q4_K weights, before Q6_K was tiled too.
-- **vLLM 0.31.0** (the official image) ran with `--max-model-len 4096 --gpu-memory-utilization 0.9`. FP8 is `--quantization fp8` and the same 27B checkpoint. `load.py` repeats prompts across buckets, and vLLM's prefix cache skips their prefill, which pocket-engine cannot do. So the first vLLM rows have the cache off, and the "+ prefix cache" rows use vLLM's default. vLLM 0.31.0 does not load Qwen3.5 GGUF files, so it has no Q4_K_M rows. 27B needed `--max-num-seqs 256`, and its FP8 needed `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0` because the image's FlashInfer FP8 kernel is missing a cubin.
+- **pocket-engine** (dada4ed) ran with its defaults, without a prefix cache. FP8 is `--fp8` (block-scaled weights and activations, quantized at load) for 0.8B to 9B and the `Qwen3.8-27B-FP8` checkpoint for 27B. Q4_K_M ran 099dd9a, with Q4_K weights tiled and Q6_K weights in plain blocks; the "plain blocks" rows ran dada4ed, with every matrix in plain blocks.
+- **vLLM 0.31.0** (the official image) ran with `--max-model-len 4096 --gpu-memory-utilization 0.9`. FP8 is `--quantization fp8` and the same 27B checkpoint. `load.py` repeats prompts across buckets, and vLLM's prefix cache skips their prefill. So the first vLLM rows have the cache off, and the "+ prefix cache" rows use vLLM's default. vLLM 0.31.0 does not load Qwen3.5 GGUF files, so it has no Q4_K_M rows. 27B ran with `--max-num-seqs 256`, and its FP8 with `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0`, since the image's FlashInfer FP8 kernel is missing a cubin.
 - **llama.cpp** (8f574b0, `llama-server -ngl 999 -c 65536 -np 64 -fa on`) ran the GGUF files: unsloth's BF16 and Q4_K_M for 0.8B to 9B, ggml-org's for 27B. Its host prompt cache and per-slot context checkpoints snapshot the recurrent state of these hybrid models, several hundred MB per request on 27B. The main rows turn them off (`--cache-ram 0 --ctx-checkpoints 0`); the "default cache" rows keep them.
 
 ### bf16
@@ -60,22 +60,22 @@ All runs used one RunPod H100 80GB SXM (driver 580.126.09), one after another, o
 | Model | Engine | Ready | 1 | 8 | 16 | 32 | 64 | burst 64 | TTFT p50 at 64 |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | 0.8b | pocket-engine | 2 s | 459 | 2,512 | 3,963 | 5,594 | 7,439 | 4,924 | 0.062 s |
-| 0.8b | pocket-engine, before tiling | 2 s | 539 | 2,429 | 3,696 | 5,854 | 7,461 | 4,276 | 0.071 s |
+| 0.8b | pocket-engine, plain blocks | 2 s | 539 | 2,429 | 3,696 | 5,854 | 7,461 | 4,276 | 0.071 s |
 | 0.8b | llama.cpp | 2 s | 373 | 591 | 482 | 459 | 713 | 554 | 0.206 s |
 | 0.8b | llama.cpp, default cache | 2 s | 280 | 359 | 354 | 326 | 456 | 351 | 0.921 s |
 | 2b | pocket-engine | 2 s | 400 | 1,890 | 3,078 | 4,514 | 5,902 | 4,334 | 0.059 s |
-| 2b | pocket-engine, before tiling | 3 s | 379 | 1,820 | 2,970 | 4,312 | 5,559 | 4,040 | 0.051 s |
+| 2b | pocket-engine, plain blocks | 3 s | 379 | 1,820 | 2,970 | 4,312 | 5,559 | 4,040 | 0.051 s |
 | 2b | llama.cpp | 2 s | 323 | 481 | 412 | 405 | 630 | 533 | 0.178 s |
 | 2b | llama.cpp, default cache | 2 s | 252 | 361 | 337 | 327 | 443 | 378 | 0.814 s |
 | 4b | pocket-engine | 3 s | 220 | 908 | 1,410 | 1,980 | 2,786 | 2,373 | 0.065 s |
-| 4b | pocket-engine, before tiling | 3 s | 198 | 815 | 1,246 | 1,807 | 2,573 | 2,213 | 0.062 s |
+| 4b | pocket-engine, plain blocks | 3 s | 198 | 815 | 1,246 | 1,807 | 2,573 | 2,213 | 0.062 s |
 | 4b | llama.cpp | 2 s | 198 | 296 | 260 | 265 | 426 | 357 | 0.217 s |
 | 9b | pocket-engine | 3 s | 157 | 749 | 1,150 | 1,666 | 2,315 | 2,159 | 0.083 s |
-| 9b | pocket-engine, before tiling | 3 s | 130 | 614 | 985 | 1,528 | 2,073 | 1,880 | 0.086 s |
+| 9b | pocket-engine, plain blocks | 3 s | 130 | 614 | 985 | 1,528 | 2,073 | 1,880 | 0.086 s |
 | 9b | llama.cpp | 3 s | 167 | 257 | 218 | 223 | 395 | 309 | 0.311 s |
 | 9b | llama.cpp, default cache | 3 s | 129 | 163 | 159 | 148 | 206 | 179 | 1.237 s |
 | 27b | pocket-engine | 5 s | 64 | 241 | 358 | 523 | 675 | 644 | 0.217 s |
-| 27b | pocket-engine, before tiling | 4 s | 48 | 187 | 276 | 445 | 595 | 526 | 0.226 s |
+| 27b | pocket-engine, plain blocks | 4 s | 48 | 187 | 276 | 445 | 595 | 526 | 0.226 s |
 | 27b | llama.cpp | 5 s | 62 | 95 | 87 | 91 | 156 | 138 | 0.645 s |
 
 
@@ -86,15 +86,15 @@ All runs used one RunPod H100 80GB SXM (driver 580.126.09), one after another, o
 - **Startup.** pocket-engine is ready in 2 to 5 seconds. vLLM takes 61 to 170, compiling and capturing graphs on every launch.
 - **Time to first token.** pocket-engine's median at 64 in flight is 0.06 to 0.07 s up to 9B, against vLLM's 0.12 to 0.17 s.
 - **llama.cpp** barely gains from concurrency on these hybrid models. Its best is 752 tok/s, on 0.8B at 64 in flight, where pocket-engine serves 7,439 from Q4_K_M. Its default cache roughly halves even that.
-- **Tiled Q4 weights** raised pocket-engine's Q4_K_M throughput 10 to 29% from 8 in flight. A single request on 0.8B got slower (459 against 539 tok/s), because its matrices are too small for the tiled kernel to hide latency. On the H100 the tiled kernel also falls behind bf16 cuBLAS above 8 rows (57 against 39 µs at 64 rows on 9B `ffn_up`), because it reaches only about 1 TB/s of the H100's 3.35.
+- **Tiled Q4 weights** give pocket-engine 10 to 29% more Q4_K_M throughput than plain blocks from 8 in flight. A single request on 0.8B is slower with them (459 against 539 tok/s), because its matrices are too small for the tiled kernel to hide latency. On the H100 the tiled kernel also falls behind bf16 cuBLAS above 8 rows (57 against 39 µs at 64 rows on 9B `ffn_up`), because it reaches only about 1 TB/s of the H100's 3.35.
 
-## Retest, 2026-10-13: 27B, prefix cache, long contexts, multi-token prediction
+## 27B, multi-token prediction, shared prefixes and long prompts
 
-A second RunPod H100 80GB SXM (driver 580.126.09) and the same vLLM 0.31.0 image, one engine after the other. pocket-engine was at 42b6977: chunked tensor-core linear attention for prompts, flash attention sharing key and value tiles across each query group, and the prefix cache. The multi-token-prediction rows ran 7da5da0. vLLM ran with `--max-num-seqs 256` (128 for the 70,000-token runs) and, for FP8, `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0`. [Receipt](receipts/h100-retest.json).
+Measured on another H100 80GB SXM (driver 580.126.09), 2026-10-13, one engine after the other, with pocket-engine 42b6977 (7da5da0 for the multi-token-prediction rows) and the same vLLM 0.31.0 image. vLLM ran with `--max-num-seqs 256` (128 for the 70,000-token runs) and, for FP8, `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0`. [Receipt](receipts/h100-retest.json).
 
 ### Under `scripts/load.py`
 
-Output tokens per second, and the median time to first token at 64 in flight. vLLM's prefix cache is off, as in the main rows above.
+Output tokens per second, and the median time to first token at 64 in flight. vLLM's prefix cache is off, as in the first tables.
 
 | Model | Engine | 1 | 8 | 16 | 32 | 64 | burst 64 | TTFT p50 at 64 |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
@@ -138,9 +138,9 @@ One request at a time, bf16, servers started with a 70,000-token context; time t
 | 64k | 4.88 s | 2.25 s | 12.7 s | 6.86 s |
 | 4 × 32k at once (median) | 3.82 s | 1.48 s | 9.80 s | 4.71 s |
 
-### What the retest shows
+### What these runs show
 
-- **27B.** In FP8, pocket-engine now matches vLLM at 64 in flight (1,314 against 1,302) and leads from 8 to 32; vLLM keeps the burst (1,075 against 889). In bf16 the two are within 7% up to 32 in flight, and vLLM leads at 64 (1,088 against 978).
+- **27B.** In FP8, pocket-engine matches vLLM at 64 in flight (1,314 against 1,302) and leads from 8 to 32; vLLM keeps the burst (1,075 against 889). In bf16 the two are within 7% up to 32 in flight, and vLLM leads at 64 (1,088 against 978).
 - **Multi-token prediction.** pocket-engine leads at every steady load on both models: a single 9B request decodes at 252 tok/s against vLLM's 200, and 27B reaches 1,092 at 64 in flight against vLLM's 989. The 9B burst goes to vLLM (2,797 against 2,609). With drafting, 27B in bf16 matches vLLM's best without it.
 - **Shared prefixes.** First tokens come 1.9 to 3.5 times sooner. Throughput leads on a shared system prompt and is level on multi-turn 27B.
-- **Long prompts are vLLM's.** Its prefill is about twice as fast from 32k: FlashAttention 3 on Hopper's wgmma against pocket-engine's mma.sync flash kernel, whose share of prefill grows with the context. Decoding speeds in these runs came from about 25 tokens each, too few to compare; they predate 0a9a982, which splits decode attention by the GPU's size. Since the retest, flash attention on wgmma and a two-pass recurrence brought 9B's 64k prompt to 3.2 s and 27B's to 9.6 s ([design notes](design.md#long-contexts)).
+- **Long prompts are vLLM's.** In these runs its prefill is about twice as fast from 32k: FlashAttention 3 on Hopper's wgmma against the mma.sync flash kernel of pocket-engine 42b6977, whose share of prefill grows with the context. The receipt's decoding speeds come from about 25 tokens per request, too few to compare. The design notes have [time to first token](design.md#long-contexts) with the wgmma flash kernel and two-pass recurrence against vLLM.

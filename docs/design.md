@@ -26,7 +26,7 @@ Each layer runs three or four cuBLAS GEMMs over all of the step's tokens, plus a
 A request whose prompt begins like an earlier one skips the shared part. Attention needs only the earlier keys and values, but linear attention needs its recurrent state as it stood at the end of the prefix, and that state is overwritten token by token. So the cache keeps snapshots:
 
 - **Where.** Prompts are hashed in units of 64 tokens, each unit's hash chained to the one before. A prompt can leave up to two prefixes: the end of the last whole unit before its final message (the last `<|im_start|>`), which the next turn of a conversation or another question under the same system prompt shares, and the last whole unit before its final token.
-- **What.** The scheduler ends a prompt chunk at each of those points. Before the next step the engine copies the sequence's recurrent and convolution state into a spare state slot (`--prefix-cache` of them), and the prefix's full KV blocks gain a reference.
+- **What.** At a point on the recurrence's 32-token chunk grid (or at the end of a prompt chunk), the prompt step itself writes the sequence's recurrent and convolution state into a spare state slot (`--prefix-cache` of them). At any other point the scheduler ends the prompt chunk, and the engine copies the state into a spare slot before the next step. Either way the prefix's full KV blocks gain a reference.
 - **Reuse.** At admission the scheduler finds the longest cached prefix, copies the snapshot into the new sequence's slot, points its block table at the shared blocks and starts the prompt after them. Blocks are refcounted; the least recently used prefix is evicted when slots or blocks run short.
 
 Output with a cached prefix is identical to output without one (`tests/gpu.rs`). On an RTX 5090 with Qwen3.5-9B (bf16, `scripts/workloads.py`):
@@ -40,33 +40,33 @@ Without the cache, time to first token in the conversations grows from 0.34 s to
 
 ## Long contexts
 
-Three changes made long prompts and long-context decoding fast: the chunked recurrence above (the per-token recurrence ran a 64k prompt's linear attention one token at a time), flash attention for prompt tokens, and split-key decode attention, which spreads one long sequence's keys over the whole GPU instead of one block per head. The split runs inside CUDA graphs: each graph has a fixed token count, which fixes the number of ranges, and each sequence divides its keys among as many of them as its length fills.
+Long prompts run on the chunked recurrence above and flash attention for prompt tokens. Long-context decoding runs split-key decode attention, which spreads one long sequence's keys over the whole GPU instead of one block per head. The split runs inside CUDA graphs: each graph has a fixed token count, which fixes the number of ranges, and each sequence divides its keys among as many of them as its length fills.
 
 Qwen3.5-9B, bf16, one request at a time on an RTX 5090, 128 output tokens (`scripts/workloads.py long`):
 
-| Prompt | First token, before | First token, now | Prefill | Decode, before | Decode, now |
-|---:|---:|---:|---:|---:|---:|
-| 8k | 0.95 s | 0.70 s | 11,700 tok/s | 57 tok/s | 84 tok/s |
-| 32k | 7.2 s | 3.2 s | 10,300 tok/s | 28 tok/s | 81 tok/s |
-| 64k | 24.1 s | 7.6 s | 8,600 tok/s | 17 tok/s | 78 tok/s |
+| Prompt | First token | Prefill | Decode |
+|---:|---:|---:|---:|
+| 8k | 0.70 s | 11,700 tok/s | 84 tok/s |
+| 32k | 3.2 s | 10,300 tok/s | 81 tok/s |
+| 64k | 7.6 s | 8,600 tok/s | 78 tok/s |
 
 Decoding with a short context runs at 89 tok/s; at 64k, reading the 2 GB of cached keys and values each step accounts for the rest. Four 32k prompts at once share the GPU at 9,400 prompt tokens per second.
 
-Flash attention runs at 115 TFLOPS on the 5090 (cuBLAS's bf16 matmuls reach 211), after blocks took eight warps of queries instead of four: with one 68 KB block per SM there were too few warps to hide any latency. The convolution splits each sequence into 64-token chunks rather than walking it in one thread per channel.
+Flash attention runs at 115 TFLOPS on the 5090 (cuBLAS's bf16 matmuls reach 211). Its blocks take eight warps of queries: only one block fits per SM, and four warps are too few to hide latency. The convolution splits each sequence into 64-token chunks rather than walking it in one thread per channel.
 
-On an H100, prompts with a bf16 cache run a flash kernel on Hopper's wgmma instead, warp-specialized as FlashAttention 3 is. A block takes 64 query tokens of two heads of one key/value group. A producer warpgroup (40 registers) loads each 64-key tile into one of two shared-memory stages by TMA, one 16-slot by 64-column box of the cache's tensor map per page and swizzle atom; two consumer warpgroups (232 registers), a head each, compute. mbarriers pass the stages between them. Q Kᵀ runs as m64n64k16 from shared memory and P V as m64n256k16 with P in registers; each consumer issues the next tile's scores with this tile's P V and runs the next softmax while P V is on the tensor cores. Scores are kept in log₂ units for `ex2.approx`, and only tiles reaching past the block's first query apply the causal mask. It reaches 330 TFLOPS for groups of 4 and 336 for groups of 6. Before TMA, consumers loading their own tiles reached 288; a producer gathering the pages with cp.async reached only 218, and FlashAttention 3's ping-pong between the two consumers added nothing here.
+On an H100, prompts with a bf16 cache run a flash kernel on Hopper's wgmma instead, warp-specialized as FlashAttention 3 is. A block takes 64 query tokens of two heads of one key/value group. A producer warpgroup (40 registers) loads each 64-key tile into one of two shared-memory stages by TMA, one 16-slot by 64-column box of the cache's tensor map per page and swizzle atom; two consumer warpgroups (232 registers), a head each, compute. mbarriers pass the stages between them. Q Kᵀ runs as m64n64k16 from shared memory and P V as m64n256k16 with P in registers; each consumer issues the next tile's scores with this tile's P V and runs the next softmax while P V is on the tensor cores. Scores are kept in log₂ units for `ex2.approx`, and only tiles reaching past the block's first query apply the causal mask. It reaches 330 TFLOPS for groups of 4 and 336 for groups of 6.
 
-The chunked recurrence runs in two passes, as FLA's does. `gdn_prep` computes every chunk's local terms at once: normalized q and k, the decay, P, and the WY form U = T βV, W = T β e^G K with T = (I + A)⁻¹. `gdn_scan` then walks the chunks with only D = U − W S, the outputs and the state update, which are separable by value column, so up to four blocks share a head when a step has few sequences. A 4,096-token chunk of 9B's recurrence takes 0.65 ms on an RTX 5090 instead of 1.41.
+The chunked recurrence runs in two passes, as FLA's does. `gdn_prep` computes every chunk's local terms at once: normalized q and k, the decay, P, and the WY form U = T βV, W = T β e^G K with T = (I + A)⁻¹. `gdn_scan` then walks the chunks with only D = U − W S, the outputs and the state update, which are separable by value column, so up to four blocks share a head when a step has few sequences. A 4,096-token chunk of 9B's recurrence takes 0.65 ms on an RTX 5090.
 
-Time to first token, one request at a time, on an H100 against vLLM 0.31.0 run on the same machine ("retest" is the build of the [retest](h100-comparison.md#long-prompts), on another H100):
+Time to first token, one request at a time, on an H100 against vLLM 0.31.0 run on the same machine:
 
-| Prompt | 9B, retest | 9B, now | 9B, vLLM | 27B, retest | 27B, now | 27B, vLLM |
-|---:|---:|---:|---:|---:|---:|---:|
-| 8k | 0.37 s | 0.26 s | 0.26 s | 0.98 s | 0.80 s | 0.73 s |
-| 32k | 1.86 s | 1.12 s | 1.04 s | 4.96 s | 3.57 s | 3.12 s |
-| 64k | 4.88 s | 2.70 s | 2.17 s | 12.7 s | 8.31 s | 6.83 s |
+| Prompt | 9B | 9B, vLLM | 27B | 27B, vLLM |
+|---:|---:|---:|---:|---:|
+| 8k | 0.26 s | 0.26 s | 0.80 s | 0.73 s |
+| 32k | 1.12 s | 1.04 s | 3.57 s | 3.12 s |
+| 64k | 2.70 s | 2.17 s | 8.31 s | 6.83 s |
 
-The remaining gap is vLLM's two prefill kernels, which run on Hopper's TMA and wgmma. Each kernel alone on the same shapes (4,096 new tokens after 28,672 cached for attention; 4,096 tokens with a carried state for the recurrence):
+The gap is in two prefill kernels, attention and the recurrence. Each kernel alone on the same shapes (4,096 new tokens after 28,672 cached for attention; 4,096 tokens with a carried state for the recurrence):
 
 | Kernel | H100, pocket-engine | H100, vLLM | RTX 5090, pocket-engine | RTX 5090, vLLM |
 |---|---:|---:|---:|---:|
@@ -79,18 +79,18 @@ At 64k on 27B the attention alone is about 840 TFLOP: 2.5 s at this kernel's rat
 
 ## Time to first token
 
-A short prompt's first token waits for one prompt step. Two things delayed it:
+A short prompt's first token waits for one prompt step. Two details keep it from waiting longer:
 
-- **Nagle's algorithm.** Streamed tokens are small writes; without `TCP_NODELAY` the first token waited for the previous write's acknowledgement, which Linux delays by up to 40 ms.
-- **Prefix-cache boundaries.** The prefix cache stopped a prompt chunk at each boundary to copy the state there, so a 150-token prompt ran as two prompt steps, each reading every weight. The recurrence now writes its state at a boundary on its 32-token chunk grid straight into the snapshot slot, and the prompt runs whole.
+- **`TCP_NODELAY`.** Streamed tokens are small writes; with Nagle's algorithm the first token would wait for the previous write's acknowledgement, which Linux delays by up to 40 ms.
+- **Prefix-cache boundaries.** The recurrence writes its state at a boundary on its 32-token chunk grid straight into the snapshot slot ([Prefix cache](#prefix-cache)), so a 150-token prompt runs whole as one prompt step rather than two, each reading every weight.
 
 Median time to first token for single short prompts (60 to 200 words, chat template):
 
-| | pocket-engine before | pocket-engine now | vLLM |
-|---|---:|---:|---:|
-| RTX 5090, Qwen3.5-9B | 43.7 ms | 19.6 ms | 22 ms (0.30) |
-| H100, Qwen3.5-9B | | 12.4 ms | 43.8 ms (0.31.0) |
-| H100, Qwen3.8-27B | | 32.6 ms | 73.7 ms (0.31.0) |
+| | pocket-engine | vLLM |
+|---|---:|---:|
+| RTX 5090, Qwen3.5-9B | 19.6 ms | 22 ms (0.30) |
+| H100, Qwen3.5-9B | 12.4 ms | 43.8 ms (0.31.0) |
+| H100, Qwen3.8-27B | 32.6 ms | 73.7 ms (0.31.0) |
 
 ## Multi-token prediction
 
@@ -109,7 +109,7 @@ Qwen3.5-9B, bf16, RTX 5090, `scripts/load.py`, output tokens per second:
 | `--mtp 2` | 152 | 824 | 1,274 | 1,497 | 1,797 |
 | `--mtp 3` | 151 | 820 | 1,286 | 1,264 | 1,743 |
 
-(The `--mtp 3` row predates the 96-row limit, which now stops drafting at 32 in flight.) Over longer answers, one request runs at 89 tok/s plainly, 144 with one draft (74% accepted), 170 with two (62%), 181 with three (52%) and 182 with four (44%).
+(The `--mtp 3` row ran without the 96-row limit, which stops drafting at 32 in flight.) Over longer answers, one request runs at 89 tok/s plainly, 144 with one draft (74% accepted), 170 with two (62%), 181 with three (52%) and 182 with four (44%).
 
 On an H100 against vLLM 0.31.0's MTP (`--speculative-config '{"method":"mtp","num_speculative_tokens":N}'`), on the same machine. Output tokens per second: one stream of four 512-token answers, then `scripts/load.py` by requests in flight. [Receipt](receipts/h100-mtp-ttft.json).
 
@@ -156,7 +156,7 @@ A quantized matrix multiply picks one of three paths by the number of rows in th
 
 - **Up to 4 rows: matrix-vector kernel.** A warp per output feature streams the row once and decodes in registers, at about 1.75 TB/s on an RTX 5090.
 - **5 to 160 rows: tensor cores, decoding into registers.** Each warp owns 16 output features and does mma.sync m16n8k16 in bf16. A dot product does not depend on the order of K, so each 32-wide step of K is assigned to fragment slots such that each lane needs 8 consecutive weights of its two rows and 8 consecutive inputs: two decodes and one 16-byte load per step. There is no shared memory and no barrier. When the grid alone would leave SMs idle, K is split across blocks into an f32 workspace.
-- **Q4_0, Q4_K and Q6_K: a tiled layout, 1 to 160 rows on tensor cores.** At load these two formats are rewritten in chunks of 16 rows × 256 inputs, in the order the tensor-core loop consumes them. One 16-byte load per lane fetches its nibbles for two steps, and a warp's load covers 512 contiguous bytes. Q4_K's packed 6-bit scales are unpacked to bytes, which costs 4.6 bits per weight instead of 4.5; Q4_0 stays at 4.5. Q6_K adds a word of high bits per lane and step, at 6.6 bits instead of 6.56. A nibble becomes an exact float without an integer conversion (`bits(0x4B000000 | q) - 2^23`), then one FMA (or, for Q4_0, a subtract and a multiply). That is the same arithmetic as the decoders, so tiled and plain dequantization agree bit for bit, and `dequant` checks it. Each warp loads the next two chunks while it computes the current one.
+- **Q4_0, Q4_K and Q6_K: a tiled layout, 1 to 160 rows on tensor cores.** At load these formats are rewritten in chunks of 16 rows × 256 inputs, in the order the tensor-core loop consumes them. One 16-byte load per lane fetches its nibbles for two steps, and a warp's load covers 512 contiguous bytes. Q4_K's packed 6-bit scales are unpacked to bytes, which costs 4.6 bits per weight instead of 4.5; Q4_0 stays at 4.5. Q6_K adds a word of high bits per lane and step, at 6.6 bits instead of 6.56. A nibble becomes an exact float without an integer conversion (`bits(0x4B000000 | q) - 2^23`), then one FMA (or, for Q4_0, a subtract and a multiply). That is the same arithmetic as the decoders, so tiled and plain dequantization agree bit for bit, and `dequant` checks it. Each warp loads the next two chunks while it computes the current one.
 - **Above 160 rows (prompt chunks): cuBLAS.** The matrix is dequantized to bf16 scratch and handed to cuBLAS; one decode then serves the whole chunk.
 
 All three issue no allocation and no host synchronization, so quantized decode steps run inside CUDA graphs like bf16 ones.
@@ -179,7 +179,7 @@ The larger Qwen3.8-27B `ffn_gate` (17408 × 5120) at 8 rows takes 34 µs tiled, 
 | Q4_K tiled | 166 | 680 | 978 | 1,361 | 1,598 |
 | Q4_K and Q6_K tiled | 170 | 782 | 1,087 | 1,444 | 1,666 |
 
-Qwen3.8-27B Q4_K_M rises from 155 to 183 tok/s at 8 in flight. The tiles are about 2% larger, so 29 requests fit beside it instead of 33.
+Qwen3.8-27B Q4_K_M serves 183 tok/s at 8 in flight tiled, against 155 in plain blocks. The tiles are about 2% larger, so 29 requests fit beside it instead of 33.
 
 ## FP8
 
@@ -252,7 +252,7 @@ Weights go from the file to the GPU without passing through mapped memory. Tenso
 | Qwen3.5-9B, Q4_K_M | 5.7 GB | 2.0 s |
 | Qwen3.8-27B, Q4_K_M | 19.4 GB | 1.9 s |
 
-Copying through mapped pages took 8.8 s for the 9B model and 24.7 s for the 27B one.
+Copying through mapped pages takes 8.8 s for the 9B model and 24.7 s for the 27B one.
 
 ## Numerics
 
@@ -290,7 +290,7 @@ One request alone runs at the same speed either way.
 | Qwen3.5-9B | 220 | 219 | 1 of 1 | 0.0003, 0.032 |
 | Qwen3.8-27B | 213 | 211 | 2 of 2 | 0.0004, 0.035 |
 
-The small models ran on an RTX 5090. Qwen3.8-27B in bf16 does not fit there, so its reference and run used a rented H100. An H100 build of the 2B model agreed on 215 of 217.
+The small models ran on an RTX 5090. Qwen3.8-27B in bf16 does not fit there, so its reference and run used an H100. An H100 build of the 2B model agreed on 215 of 217.
 
 The same comparison with image prompts covers three images. Two keep their sides; the third (300×211) is resized. Prompt tokens match Transformers' processor exactly for all three models:
 
@@ -339,7 +339,7 @@ FP8 against the same bf16 references. The 27B checkpoints ran on an H100; `--fp8
 | 64 | 7,502, 0.056 s | 5,467, 0.13 s | 5,554, 0.051 s |
 | burst of 64 | 4,939 | 4,299 | 4,593 |
 
-The model was Qwen3.5-2B. Both H100 runs used the same RunPod H100 SXM (driver 580.126.09), one after the other. pocket-engine was ready 5 seconds after launch and vLLM after 79. The H100 numbers come from the code before it moved to this repository (Switchyard commit b4b3d7c). Back-to-back RTX 5090 runs of that build and this one measure the same.
+The model was Qwen3.5-2B. Both H100 runs used the same H100 SXM (driver 580.126.09), one after the other, on 2026-10-12. pocket-engine was ready 5 seconds after launch and vLLM after 79. The H100 runs built the engine from Switchyard commit b4b3d7c, which measures the same as this repository's build on an RTX 5090.
 
 ### Quantized weights, RTX 5090
 
@@ -366,4 +366,4 @@ Output tokens per second under the same load, and median time to first token. [R
 | 32 | 241, 1.6 s | 662, 0.10 s | 810, 0.10 s |
 | 64 | 231, 4.7 s | 898, 0.15 s | 1,107, 0.14 s |
 
-These runs kept the recurrent state in f32: 146 MB per request (48 linear-attention layers × 48 heads × 128 × 128), plus 64 KB of KV cache per token (16 attention layers). On the 5090, the Q4_K_M weights (19 GB) left room for 17 requests at once, so throughput levelled off from 16 in flight. With the state in bf16 (now the default) 33 fit, and 32 in flight reach 318 tok/s. The H100 holds 63 beside the bf16 weights and 142 beside the FP8 ones (`Qwen3.8-27B-FP8`, about 30 GB).
+These runs kept the recurrent state in f32: 146 MB per request (48 linear-attention layers × 48 heads × 128 × 128), plus 64 KB of KV cache per token (16 attention layers). On the 5090, the Q4_K_M weights (19 GB) left room for 17 requests at once, so throughput levelled off from 16 in flight. With the state in bf16 (the default) 33 fit, and 32 in flight reach 318 tok/s. The H100 holds 63 beside the bf16 weights and 142 beside the FP8 ones (`Qwen3.8-27B-FP8`, about 30 GB).

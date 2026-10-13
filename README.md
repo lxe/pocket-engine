@@ -1,6 +1,6 @@
 # pocket-engine
 
-An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine. With the checkpoint's multi-token-prediction layer drafting tokens (`--mtp`), one Qwen3.5-9B request decodes at 252 tokens per second, against vLLM's 200 with the same drafting. It is ready 5 seconds after launch, and a 27B model reaches serving in about 2 seconds from the page cache ([design and measurements](docs/design.md); [against vLLM and llama.cpp on an H100](docs/h100-comparison.md)).
+An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine. With the checkpoint's multi-token-prediction layer drafting two tokens a step (`--mtp`), one Qwen3.5-9B stream decodes at 290 tokens per second, against vLLM's 254 with the same drafting, and a short prompt's first token arrives in 12 ms against vLLM's 44. It is ready 5 seconds after launch, and a 27B model reaches serving in about 2 seconds from the page cache ([design and measurements](docs/design.md); [against vLLM and llama.cpp on an H100](docs/h100-comparison.md)).
 
 ## Performance
 
@@ -15,14 +15,14 @@ Output tokens per second with 64 requests in flight on one H100, from `scripts/l
 | Qwen3.8-27B | bf16 | 978¹ | **1,088**¹ | 158 |
 | Qwen3.5-9B | FP8 | **3,523** | 3,460 | — |
 | Qwen3.8-27B | FP8 | **1,314**¹ | 1,302¹ | — |
-| Qwen3.5-9B | bf16, 2 drafts a step | **3,458**¹ | 3,180¹ | — |
-| Qwen3.8-27B | bf16, 2 drafts a step | **1,092**¹ | 989¹ | — |
+| Qwen3.5-9B | bf16, 2 drafts a step | **4,190**² | 3,516² | — |
+| Qwen3.8-27B | bf16, 2 drafts a step | **1,114**² | 1,052² | — |
 | Qwen3.5-9B | Q4_K_M | **2,315** | does not load | 395 |
 | Qwen3.8-27B | Q4_K_M | **675** | does not load | 156 |
 
-¹ Retested on 2026-10-13 after the chunked linear attention, grouped flash attention and multi-token prediction; the other rows are from 2026-10-12. Drafting rows use each engine's multi-token prediction (pocket-engine `--mtp 2`, vLLM's `mtp` method with 2 speculative tokens).
+¹ Retested on 2026-10-13 after the chunked linear attention, grouped flash attention and multi-token prediction; the other rows are from 2026-10-12. ² Later on 2026-10-13, both engines with their multi-token prediction drafting two tokens (pocket-engine `--mtp 2`, vLLM's `mtp` method with 2 speculative tokens); [all loads and draft counts](docs/design.md#multi-token-prediction).
 
-pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. vLLM's prefill is 1.2 to 1.4 times as fast on prompts of 8k to 64k tokens; [the retest](docs/h100-comparison.md#retest-2026-10-13-27b-prefix-cache-long-contexts-multi-token-prediction) has long prompts and shared prefixes.
+pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. On long prompts vLLM still prefills faster: level at 8k, 1.1 times as fast at 32k and 1.25 at 64k; [the retest](docs/h100-comparison.md#retest-2026-10-13-27b-prefix-cache-long-contexts-multi-token-prediction) has long prompts and shared prefixes.
 
 ## Supported
 
@@ -35,9 +35,9 @@ pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. vLLM's pre
 | Quantization | GGUF weights stay quantized on the GPU: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely within a file. Their activations run in bf16 with f32 accumulation |
 | FP8 | E4M3 weights and activations on H100, H200 and RTX 50-series: Qwen's FP8 checkpoints, or any bf16 checkpoint with `--fp8`. Block scales of 128×128 per weight tile and 128 per activation row on Hopper; MXFP8 (a scale per 32 values) on Blackwell. Images, samplers and CUDA graphs work with it. The KV cache can be FP8 too (`--kv-fp8`) |
 | FP4 | RTX 50-series only: MXFP4 weights (E2M1, a power-of-two scale per 32) times MXFP8 activations on block-scaled tensor cores. NVIDIA's NVFP4 checkpoints (`nvidia/Qwen3.8-27B-NVFP4`) are re-quantized to MXFP4 at load; `--fp4` quantizes a bf16 checkpoint's MLP to FP4 and the rest to FP8 |
-| Context | Up to `--max-context` tokens per request (default 4,096). On an RTX 5090, Qwen3.5-9B takes 0.70 s to a first token at 8k, 3.2 s at 32k and 7.6 s at 64k (on an H100: 0.30, 1.3 and 3.2 s, against vLLM's 0.27, 1.05 and 2.25), and decodes at 78 to 85 tok/s at every length |
+| Context | Up to `--max-context` tokens per request (default 4,096). On an RTX 5090, Qwen3.5-9B takes 0.70 s to a first token at 8k, 3.2 s at 32k and 7.6 s at 64k (on an H100: 0.26, 1.1 and 2.7 s, against vLLM's 0.26, 1.04 and 2.17), and decodes at 78 to 85 tok/s at every length |
 | Prefix cache | Prompts that share a beginning (a system prompt, or a conversation's earlier turns) reuse its KV cache and recurrent state. On by default |
-| Speculative decoding | `--mtp` drafts tokens with the checkpoint's multi-token-prediction layer and verifies them in the next step, for greedy and sampled requests alike (not with penalties or `logit_bias`). Qwen3.5-9B on an RTX 5090: 152 tok/s for one request instead of 85 |
+| Speculative decoding | `--mtp` drafts tokens with the checkpoint's multi-token-prediction layer and verifies them in the next step, for greedy and sampled requests alike (not with penalties or `logit_bias`). Qwen3.5-9B: 290 tok/s for one stream instead of 156 on an H100 (vLLM's MTP: 254), 152 instead of 85 on an RTX 5090 |
 | Sampling | Greedy, or temperature with `top_k`, `top_p`, `min_p` and `seed`; `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`; `stop` strings |
 | GPUs | NVIDIA, built per architecture: `90a` (H100), `120a` (RTX 50-series); others via `CUDA_COMPUTE_CAP` |
 | Driver | CUDA 13 (driver 580 or newer); cuBLAS 13 at run time |
@@ -116,7 +116,7 @@ Filters apply in order: min_p, then top_k, then top_p. Each one judges the token
 | `--max-batch-tokens` | 4096 | Most tokens in one step, decode rows plus prompt chunks |
 | `--max-context` | 4096 | Longest prompt plus output, in tokens |
 | `--prefix-cache` | a quarter of `--max-seqs`, 2 to 64 | Prompt prefixes to keep for reuse, each holding its KV blocks and a snapshot of the recurrent state; 0 turns the cache off |
-| `--mtp [N]` | off (2 when given without N) | Draft N tokens a step with the multi-token-prediction layer. Sequences verify drafts while the step stays within 96 rows and free state slots can hold the states after each draft, so drafting needs no memory of its own and stops under heavy load |
+| `--mtp [N]` | off (2 when given without N) | Draft N tokens a step with the multi-token-prediction layer. Sequences verify drafts while the step stays within 96 rows (256 on an H100) and free state slots can hold the states after each draft, so drafting needs no memory of its own and stops under heavy load |
 | `--memory-fraction` | 0.9 | Share of GPU memory to use; the KV cache gets what is left after the weights |
 | `--fp8` | off | Quantize a bf16 checkpoint's projections to FP8 at load (Hopper or Blackwell). FP8 checkpoints need no flag |
 | `--fp4` | off | Quantize a bf16 checkpoint's MLP to FP4 and its other projections to FP8 at load (RTX 50-series) |

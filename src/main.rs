@@ -166,6 +166,10 @@ enum Cmd {
         /// Compare with the paged decode kernel, token by token.
         #[arg(long)]
         check: bool,
+        /// Query tiles per block and keys per tile, as "NT,BN" (default: the
+        /// device's choice).
+        #[arg(long)]
+        shape: Option<String>,
     },
     BenchFp8 {
         #[arg(long)]
@@ -627,6 +631,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokens,
             context,
             check,
+            shape,
         } => {
             use pocket_engine::gpu::{Arg, Gpu};
             const D: usize = 256;
@@ -668,9 +673,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cu = gpu.upload(&i32s((0..=seqs).map(|i| (i * tokens) as i32).collect()))?;
             let out = gpu.alloc_zeroed(t * hq * D * 2)?;
             let scale = 1.0 / (D as f32).sqrt();
-            let smem = pocket_engine::model::fa_smem(group);
-            let tiles = pocket_engine::model::fa_tiles(group);
-            let flash = gpu.kernel(&format!("attn_group_g{group}"))?;
+            let (tiles, keys) = match shape.as_deref().and_then(|v| v.split_once(',')) {
+                Some((a, b)) => (a.parse()?, b.parse()?),
+                None => pocket_engine::model::fa_shape(group, gpu.arch),
+            };
+            let smem = pocket_engine::model::fa_smem(group, tiles, keys);
+            let flash = gpu.kernel(&format!("attn_group_g{group}_t{tiles}_k{keys}"))?;
             gpu.set_smem(flash, smem)?;
             let run = |o: u64| {
                 gpu.launch(
@@ -770,10 +778,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let s = t0.elapsed().as_secs_f64() / n as f64;
             // Each query attends to the keys up to its position: 4 flops
             // per key and dimension (QK^T and PV).
-            let keys: f64 = (0..tokens).map(|i| (context + i + 1) as f64).sum();
-            let flops = 4.0 * keys * (D * hq * seqs) as f64;
+            let attended: f64 = (0..tokens).map(|i| (context + i + 1) as f64).sum();
+            let flops = 4.0 * attended * (D * hq * seqs) as f64;
             println!(
-                "attn_group_g{group}: {seqs} x {tokens} tokens after {context}, {hq} heads: {:.2} ms, {:.1} TFLOPS",
+                "attn_group_g{group}_t{tiles}_k{keys}: {seqs} x {tokens} tokens after {context}, {hq} heads: {:.2} ms, {:.1} TFLOPS",
                 s * 1e3,
                 flops / s / 1e12
             );

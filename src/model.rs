@@ -29,15 +29,24 @@ fn split_ranges(t: usize, hkv: usize, sms: usize) -> usize {
     (4 * sms).div_ceil(t * hkv).clamp(1, SPLIT_MAX)
 }
 
-/// Query tiles of 16 tokens per block of attn_group_g<G> (fg_tiles in
-/// qwen35.cu).
-pub fn fa_tiles(g: usize) -> usize {
-    if g == 6 { 1 } else { 8 / g }
+/// Flash attention's shape for groups of `g` query heads on a device of
+/// compute capability `arch`: query tiles of 16 tokens per block and keys
+/// per tile, naming the kernel attn_group_g<G>_t<NT>_k<BN> (qwen35.cu). Up
+/// to 99 KB of shared memory (RTX 50-series): 8 warps of queries and 16-key
+/// tiles. Hopper's 227 KB take larger key tiles, and two query tiles for
+/// groups of 6 (bench-attn on an H100: groups of 4 from 123 to 158 TFLOPS,
+/// of 6 from 97 to 168).
+pub fn fa_shape(g: usize, arch: u32) -> (usize, usize) {
+    match (arch, g) {
+        (90, 4) => (2, 64),
+        (90, 6) => (2, 32),
+        _ => (if g == 6 { 1 } else { 8 / g }, 16),
+    }
 }
-/// Its dynamic shared memory (fg_smem): the tiles' queries for each of G
-/// heads and two buffers of 16 keys and values.
-pub fn fa_smem(g: usize) -> usize {
-    (g * 16 * fa_tiles(g) + 4 * 16) * (HEAD_DIM + 8) * 2
+/// Dynamic shared memory of that kernel (fg_smem): the tiles' queries for
+/// each of G heads and two buffers of BN keys and values.
+pub fn fa_smem(g: usize, tiles: usize, keys: usize) -> usize {
+    (g * 16 * tiles + 4 * keys) * (HEAD_DIM + 8) * 2
 }
 /// Dynamic shared memory of the chunked gated delta rule (GDN_CHUNK_SMEM in
 /// qwen35.cu).
@@ -363,9 +372,11 @@ struct Kernels {
     attn: Kernel,
     /// Paged attention over an E4M3 cache.
     attn8: Kernel,
-    /// Attention for prompt tokens on tensor cores, over a bf16 or E4M3 cache.
+    /// Attention for prompt tokens on tensor cores, over a bf16 or E4M3 cache,
+    /// with query tiles per block and keys per tile.
     attn_flash: Kernel,
     attn_flash8: Kernel,
+    fa_shape: (usize, usize),
     /// FP8 copies of bf16 rows (the flash kernel's output, for FP8 layers).
     fp8_rows: Kernel,
     /// Combines split decode attention's key ranges.
@@ -620,15 +631,20 @@ impl Model {
             attn: gpu.kernel(&format!("attn_paged_g{}", cfg.hq / cfg.hkv))?,
             attn8: gpu.kernel(&format!("attn_paged8_g{}", cfg.hq / cfg.hkv))?,
             attn_flash: {
-                let k = gpu.kernel(&format!("attn_group_g{}", cfg.hq / cfg.hkv))?;
-                gpu.set_smem(k, fa_smem(cfg.hq / cfg.hkv))?;
+                let g = cfg.hq / cfg.hkv;
+                let (nt, bn) = fa_shape(g, gpu.arch);
+                let k = gpu.kernel(&format!("attn_group_g{g}_t{nt}_k{bn}"))?;
+                gpu.set_smem(k, fa_smem(g, nt, bn))?;
                 k
             },
             attn_flash8: {
-                let k = gpu.kernel(&format!("attn_group8_g{}", cfg.hq / cfg.hkv))?;
-                gpu.set_smem(k, fa_smem(cfg.hq / cfg.hkv))?;
+                let g = cfg.hq / cfg.hkv;
+                let (nt, bn) = fa_shape(g, gpu.arch);
+                let k = gpu.kernel(&format!("attn_group8_g{g}_t{nt}_k{bn}"))?;
+                gpu.set_smem(k, fa_smem(g, nt, bn))?;
                 k
             },
+            fa_shape: fa_shape(cfg.hq / cfg.hkv, gpu.arch),
             fp8_rows: gpu.kernel("fp8_activations")?,
             attn_merge: gpu.kernel("attn_merge")?,
             penalize: gpu.kernel("penalize")?,
@@ -1764,7 +1780,7 @@ impl Model {
                         // Prompt sequences: flash attention, a block per KV
                         // head and 16 queries per tile.
                         let group = c.hq / c.hkv;
-                        let tiles = fa_tiles(group);
+                        let (tiles, keys) = k.fa_shape;
                         gpu.launch(
                             if st.kv_fp8 {
                                 k.attn_flash8
@@ -1773,7 +1789,7 @@ impl Model {
                             },
                             ((t.div_ceil(16 * tiles) + s) as u32, c.hkv as u32, 1),
                             (32 * group * tiles) as u32,
-                            fa_smem(group) as u32,
+                            fa_smem(group, tiles, keys) as u32,
                             &[
                                 P(a.q.ptr),
                                 P(st.kc[*cache].ptr),

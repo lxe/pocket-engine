@@ -40,12 +40,7 @@ fn split_ranges(t: usize, hkv: usize, sms: usize) -> usize {
 /// take larger key tiles, and two query tiles for groups of 6 (bench-attn on
 /// an H100: groups of 4 from 123 to 158 TFLOPS, of 6 from 97 to 168).
 pub fn fa_shape(g: usize, arch: u32, fp8: bool) -> FaShape {
-    let shape = |tiles, keys, qreg| FaShape {
-        tiles,
-        keys,
-        qreg,
-        single: false,
-    };
+    let shape = |tiles, keys, qreg| FaShape { tiles, keys, qreg };
     match (arch, g, fp8) {
         (90 | 100 | 103, 4, _) => shape(2, 64, false),
         (90 | 100 | 103, 6, _) => shape(2, 32, false),
@@ -63,37 +58,25 @@ pub struct FaShape {
     pub keys: usize,
     /// Queries in registers (attn_groupr_; bf16 caches only).
     pub qreg: bool,
-    /// Queries in registers and one buffer each of keys and values
-    /// (attn_groups_; bf16 caches only).
-    pub single: bool,
 }
 
 impl FaShape {
-    /// Parses "NT,BN", "NT,BN,r" (queries in registers) or "NT,BN,s" (and
-    /// single key and value buffers).
+    /// Parses "NT,BN" or "NT,BN,r" (queries in registers).
     pub fn parse(v: &str) -> Option<Self> {
         let mut it = v.split(',');
         let (tiles, keys) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
-        let (qreg, single) = match it.next() {
-            None => (false, false),
-            Some("r") => (true, false),
-            Some("s") => (true, true),
+        let qreg = match it.next() {
+            None => false,
+            Some("r") => true,
             Some(_) => return None,
         };
-        it.next().is_none().then_some(Self {
-            tiles,
-            keys,
-            qreg,
-            single,
-        })
+        it.next().is_none().then_some(Self { tiles, keys, qreg })
     }
     /// The kernel: attn_group_g<G>_t<NT>_k<BN>, attn_group8_ for an E4M3
     /// cache, attn_groupr_ with the queries in registers.
     pub fn kernel(&self, g: usize, fp8: bool) -> String {
         let f = if fp8 {
             "8"
-        } else if self.single {
-            "s"
         } else if self.qreg {
             "r"
         } else {
@@ -102,12 +85,10 @@ impl FaShape {
         format!("attn_group{f}_g{g}_t{}_k{}", self.tiles, self.keys)
     }
     /// Its dynamic shared memory: the tiles' queries for each of G heads and
-    /// two (or with `single` one) buffers of BN keys and values, or, with the
-    /// queries in registers, the larger of the two (the buffers reuse the
-    /// queries' space).
+    /// two buffers of BN keys and values, or, with the queries in registers,
+    /// the larger of the two (the buffers reuse the queries' space).
     pub fn smem(&self, g: usize) -> usize {
-        let q = g * 16 * self.tiles;
-        let kv = if self.single { 2 } else { 4 } * self.keys;
+        let (q, kv) = (g * 16 * self.tiles, 4 * self.keys);
         (if self.qreg { q.max(kv) } else { q + kv }) * (HEAD_DIM + 8) * 2
     }
 }

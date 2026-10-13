@@ -43,6 +43,14 @@ pub fn fa_shape(g: usize, arch: u32) -> (usize, usize) {
         _ => (if g == 6 { 1 } else { 8 / g }, 16),
     }
 }
+/// Dynamic shared memory of attn_wg_g<G> (WG_SMEM in qwen35.cu): two
+/// warpgroups' queries and two buffers of keys and values, 64 x 256 bf16 each.
+pub const WG_SMEM: usize = 6 * 64 * HEAD_DIM * 2;
+/// Whether prompts take the wgmma flash kernel: Hopper, a bf16 cache and
+/// groups of 4 or 6.
+pub fn fa_wgmma(g: usize, arch: u32, kv_fp8: bool) -> bool {
+    arch == 90 && !kv_fp8 && matches!(g, 4 | 6)
+}
 /// Dynamic shared memory of that kernel (fg_smem): the tiles' queries for
 /// each of G heads and two buffers of BN keys and values.
 pub fn fa_smem(g: usize, tiles: usize, keys: usize) -> usize {
@@ -389,6 +397,8 @@ struct Kernels {
     attn_flash: Kernel,
     attn_flash8: Kernel,
     fa_shape: (usize, usize),
+    /// On Hopper: flash attention on wgmma, for a bf16 cache.
+    attn_wg: Option<Kernel>,
     /// FP8 copies of bf16 rows (the flash kernel's output, for FP8 layers).
     fp8_rows: Kernel,
     /// Combines split decode attention's key ranges.
@@ -666,6 +676,13 @@ impl Model {
                 k
             },
             fa_shape: fa_shape(cfg.hq / cfg.hkv, gpu.arch),
+            attn_wg: if fa_wgmma(cfg.hq / cfg.hkv, gpu.arch, false) {
+                let k = gpu.kernel(&format!("attn_wg_g{}", cfg.hq / cfg.hkv))?;
+                gpu.set_smem(k, WG_SMEM)?;
+                Some(k)
+            } else {
+                None
+            },
             fp8_rows: gpu.kernel("fp8_activations")?,
             attn_merge: gpu.kernel("attn_merge")?,
             penalize: gpu.kernel("penalize")?,
@@ -1851,15 +1868,33 @@ impl Model {
                         // head and 16 queries per tile.
                         let group = c.hq / c.hkv;
                         let (tiles, keys) = k.fa_shape;
+                        let (kern, grid, threads, smem) = match k.attn_wg {
+                            Some(wg) if !st.kv_fp8 => (
+                                wg,
+                                (
+                                    (t.div_ceil(64) + s) as u32,
+                                    c.hkv as u32,
+                                    (group / 2) as u32,
+                                ),
+                                256,
+                                WG_SMEM,
+                            ),
+                            _ => (
+                                if st.kv_fp8 {
+                                    k.attn_flash8
+                                } else {
+                                    k.attn_flash
+                                },
+                                ((t.div_ceil(16 * tiles) + s) as u32, c.hkv as u32, 1),
+                                (32 * group * tiles) as u32,
+                                fa_smem(group, tiles, keys),
+                            ),
+                        };
                         gpu.launch(
-                            if st.kv_fp8 {
-                                k.attn_flash8
-                            } else {
-                                k.attn_flash
-                            },
-                            ((t.div_ceil(16 * tiles) + s) as u32, c.hkv as u32, 1),
-                            (32 * group * tiles) as u32,
-                            fa_smem(group, tiles, keys) as u32,
+                            kern,
+                            grid,
+                            threads,
+                            smem as u32,
                             &[
                                 P(a.q.ptr),
                                 P(st.kc[*cache].ptr),

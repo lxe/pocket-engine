@@ -173,6 +173,9 @@ enum Cmd {
         /// device's choice).
         #[arg(long)]
         shape: Option<String>,
+        /// The wgmma kernel (Hopper; groups of 4 or 6).
+        #[arg(long)]
+        wg: bool,
     },
     BenchFp8 {
         #[arg(long)]
@@ -679,6 +682,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             context,
             check,
             shape,
+            wg,
         } => {
             use pocket_engine::gpu::{Arg, Gpu};
             const D: usize = 256;
@@ -725,13 +729,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => pocket_engine::model::fa_shape(group, gpu.arch),
             };
             let smem = pocket_engine::model::fa_smem(group, tiles, keys);
-            let flash = gpu.kernel(&format!("attn_group_g{group}_t{tiles}_k{keys}"))?;
+            let (name, grid, threads, smem) = if wg {
+                (
+                    format!("attn_wg_g{group}"),
+                    (
+                        (t.div_ceil(64) + seqs) as u32,
+                        hkv as u32,
+                        (group / 2) as u32,
+                    ),
+                    256,
+                    pocket_engine::model::WG_SMEM,
+                )
+            } else {
+                (
+                    format!("attn_group_g{group}_t{tiles}_k{keys}"),
+                    ((t.div_ceil(16 * tiles) + seqs) as u32, hkv as u32, 1),
+                    (32 * group * tiles) as u32,
+                    smem,
+                )
+            };
+            let flash = gpu.kernel(&name)?;
             gpu.set_smem(flash, smem)?;
             let run = |o: u64| {
                 gpu.launch(
                     flash,
-                    ((t.div_ceil(16 * tiles) + seqs) as u32, hkv as u32, 1),
-                    (32 * group * tiles) as u32,
+                    grid,
+                    threads,
                     smem as u32,
                     &[
                         Arg::P(q.ptr),
@@ -828,7 +851,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let attended: f64 = (0..tokens).map(|i| (context + i + 1) as f64).sum();
             let flops = 4.0 * attended * (D * hq * seqs) as f64;
             println!(
-                "attn_group_g{group}_t{tiles}_k{keys}: {seqs} x {tokens} tokens after {context}, {hq} heads: {:.2} ms, {:.1} TFLOPS",
+                "{name}: {seqs} x {tokens} tokens after {context}, {hq} heads: {:.2} ms, {:.1} TFLOPS",
                 s * 1e3,
                 flops / s / 1e12
             );

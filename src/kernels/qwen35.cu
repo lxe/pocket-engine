@@ -82,6 +82,7 @@ __device__ __forceinline__ uint4 pack8(const float* f) {
     return u;
 }
 
+#include <type_traits>
 #include "fp8.cuh"
 
 // Speculative decoding: a sequence that verifies drafts names, in
@@ -1349,6 +1350,282 @@ ATTN_GROUP_V(8, 1, 16)
 ATTN_GROUP_V(4, 2, 64)
 ATTN_GROUP_V(6, 2, 32)
 ATTN_GROUP_V(2, 1, 32)
+
+// ---------------------------------------------------------------------------
+// Flash attention for prompts on Hopper's wgmma (sm_90a). A block takes 64
+// query tokens of two heads of one key/value group, a warpgroup per head, so
+// each 64-key tile serves 128 query rows. Q K^T runs as m64n64k16 from
+// shared memory, P V as m64n256k16 with P in registers (the score
+// accumulators' layout is the A fragments') and V read transposed. Tiles of
+// 64 rows x 256 bf16 are four 128-byte-swizzled atoms of 64 columns, written
+// by cp.async (K and V, double-buffered) and plain stores (Q, scaled).
+#define WG_TILE (64 * HEAD_DIM * 2)
+#define WG_SMEM (6 * WG_TILE)
+
+// Byte offset of 16-byte chunk c (0..31) of row r in such a tile.
+__device__ __forceinline__ uint32_t wg_off(int r, int c) {
+    return (c >> 3) * 8192 + r * 128 + (((c & 7) ^ (r & 7)) << 4);
+}
+
+// A shared-memory matrix descriptor with 128-byte swizzling.
+__device__ __forceinline__ uint64_t wg_desc(uint32_t addr, uint32_t lbo, uint32_t sbo) {
+    return (uint64_t)((addr & 0x3FFFF) >> 4) | (uint64_t)((lbo & 0x3FFFF) >> 4) << 16 |
+           (uint64_t)((sbo & 0x3FFFF) >> 4) << 32 | (uint64_t)1 << 62;
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+__device__ __forceinline__ void wg_fence() { asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory"); }
+__device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory"); }
+__device__ __forceinline__ void wg_wait0() { asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory"); }
+// Pins registers in place around a wgmma stage, so the compiler neither
+// moves their reads into it nor reuses them while it runs (CUTLASS's
+// warpgroup_fence_operand).
+template <int N>
+__device__ __forceinline__ void wg_pin(float* r) {
+#pragma unroll
+    for (int i = 0; i < N; i++) asm volatile("" : "+f"(r[i])::"memory");
+}
+template <int N>
+__device__ __forceinline__ void wg_pin(uint32_t* r) {
+#pragma unroll
+    for (int i = 0; i < N; i++) asm volatile("" : "+r"(r[i])::"memory");
+}
+
+// d (64 x 64 f32) (+)= A (64 x 16, descriptor) B (16 x 64, K-major descriptor).
+__device__ __forceinline__ void wg_s(float* d, uint64_t da, uint64_t db, int acc) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %34, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, %32, %33, p, 1, 1, 0, 0;\n}\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+        : "l"(da), "l"(db), "r"(acc));
+}
+
+// d (64 x 256 f32) += A (64 x 16, registers) B (16 x 256, transposed descriptor).
+__device__ __forceinline__ void wg_o(float* d, const uint32_t* a, uint64_t db) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %133, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63,%64,%65,%66,%67,%68,%69,%70,%71,%72,%73,%74,%75,%76,%77,%78,%79,%80,%81,%82,%83,%84,%85,%86,%87,%88,%89,%90,%91,%92,%93,%94,%95,%96,%97,%98,%99,%100,%101,%102,%103,%104,%105,%106,%107,%108,%109,%110,%111,%112,%113,%114,%115,%116,%117,%118,%119,%120,%121,%122,%123,%124,%125,%126,%127}, {%128, %129, %130, %131}, %132, p, 1, 1, 1;\n}\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]), "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]), "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]), "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]), "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]), "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]), "+f"(d[96]), "+f"(d[97]), "+f"(d[98]), "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]), "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]), "+f"(d[108]), "+f"(d[109]), "+f"(d[110]), "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]), "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]), "+f"(d[120]), "+f"(d[121]), "+f"(d[122]), "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(db), "r"(1));
+}
+#endif
+
+template <int G>
+__device__ __forceinline__ void attn_wg_body(ATTN_FLASH_ARGS) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+    extern __shared__ __align__(1024) unsigned char wsm[];
+    const uint32_t base = (uint32_t)__cvta_generic_to_shared(wsm);
+    unsigned char* sQ = wsm;               // [2][WG_TILE]: the warpgroups' queries
+    unsigned char* sK = wsm + 2 * WG_TILE;  // [2][WG_TILE]
+    unsigned char* sV = wsm + 4 * WG_TILE;  // [2][WG_TILE]
+    const int tid = threadIdx.x, wg = tid >> 7, w = (tid >> 5) & 3, lane = tid & 31;
+    const int kvh = blockIdx.y, h = kvh * G + 2 * blockIdx.z + wg;
+    int s = -1, tile = blockIdx.x;
+    for (int i = 0; i < seqs; i++) {
+        const int n = cu[i + 1] - cu[i];
+        if (n <= 1 || is_spec(outs, spec, i)) continue;
+        const int tiles = (n + 63) / 64;
+        if (tile < tiles) {
+            s = i;
+            break;
+        }
+        tile -= tiles;
+    }
+    if (s < 0) return;
+    const int tb = cu[s] + tile * 64, nb = min(64, cu[s + 1] - tb);
+    const int p0 = pos[tb], L = p0 + nb;
+    const int* bt = block_table + (size_t)s * max_blocks;
+    for (int e = tid; e < 2 * 64 * 32; e += 256) {
+        const int hw = e >> 11, r = (e >> 5) & 63, c = e & 31;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (r < nb) {
+            float f[8];
+            unpack8(*reinterpret_cast<const uint4*>(
+                        q + ((size_t)(tb + r) * Hq + kvh * G + 2 * blockIdx.z + hw) * HEAD_DIM + c * 8),
+                    f);
+#pragma unroll
+            for (int i = 0; i < 8; i++) f[i] *= scale;
+            v = pack8(f);
+        }
+        *reinterpret_cast<uint4*>(sQ + hw * WG_TILE + wg_off(r, c)) = v;
+    }
+    auto load = [&](int k0, int buf) {
+        for (int e = tid; e < 64 * 32; e += 256) {
+            const int j = e >> 5, c = e & 31, kp = k0 + j;
+            unsigned char* dk = sK + buf * WG_TILE + wg_off(j, c);
+            unsigned char* dv = sV + buf * WG_TILE + wg_off(j, c);
+            if (kp >= L) {
+                *reinterpret_cast<uint4*>(dk) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(dv) = make_uint4(0, 0, 0, 0);
+                continue;
+            }
+            const size_t slot = (size_t)bt[kp / block_size] * block_size + kp % block_size;
+            const size_t at = (slot * Hkv + kvh) * HEAD_DIM + c * 8;
+            cp_async16(dk, (const bf16*)kcache + at);
+            cp_async16(dv, (const bf16*)vcache + at);
+        }
+        cp_async_commit();
+    };
+    float o[128];
+#pragma unroll
+    for (int i = 0; i < 128; i++) o[i] = 0.f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+    // This thread's rows: tokens r0 and r0 + 8 of the 64.
+    const int r0 = 16 * w + (lane >> 2), q0 = p0 + r0, q1 = q0 + 8;
+    const uint32_t qa = base + wg * WG_TILE;
+    const int T = (L + 63) / 64;  // key tiles
+    float sc[32];
+    // P of tiles k (even) and k + 1 (odd): tile k's feeds its P V while the
+    // softmax writes tile k + 1's.
+    uint32_t pa[2][4][4];
+    // S = Q K^T for tile k (buffer k & 1), issued and committed.
+    auto issue_s = [&](int k) {
+        const uint32_t ka = base + (2 + (k & 1)) * WG_TILE;
+        wg_pin<32>(sc);
+        wg_fence();
+#pragma unroll
+        for (int kk = 0; kk < 16; kk++) {
+            const uint32_t off = (kk >> 2) * 8192 + (kk & 3) * 32;
+            wg_s(sc, wg_desc(qa + off, 16, 1024), wg_desc(ka + off, 16, 1024), kk > 0);
+        }
+        wg_commit();
+    };
+    // The online softmax of tile k's scores into pa[k & 1]; returns the
+    // factors the outputs so far take (c0, c1).
+    auto softmax = [&](int k, auto par, float& c0, float& c1) {
+        constexpr int P = decltype(par)::value;
+        const int k0 = 64 * k;
+        float mx0 = m0, mx1 = m1;
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int kp = k0 + 8 * j + 2 * (lane & 3) + (e & 1);
+                const int qp = e < 2 ? q0 : q1;
+                float& x = sc[4 * j + e];
+                if (kp > qp || kp >= L) x = -INFINITY;
+                if (e < 2) mx0 = fmaxf(mx0, x);
+                else mx1 = fmaxf(mx1, x);
+            }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        c0 = mx0 == -INFINITY ? 1.f : expf(m0 - mx0);
+        c1 = mx1 == -INFINITY ? 1.f : expf(m1 - mx1);
+        float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+        for (int i = 0; i < 32; i++) {
+            const float mm = (i & 2) ? mx1 : mx0;
+            const float pr = sc[i] == -INFINITY ? 0.f : expf(sc[i] - mm);
+            sc[i] = pr;
+            if (i & 2) s1 += pr;
+            else s0 += pr;
+        }
+        s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
+        s0 += __shfl_xor_sync(0xffffffffu, s0, 2);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, 1);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, 2);
+        l0 = l0 * c0 + s0;
+        l1 = l1 * c1 + s1;
+        m0 = mx0;
+        m1 = mx1;
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++) {
+            pa[P][kk][0] = fa_bf2(sc[8 * kk + 0], sc[8 * kk + 1]);
+            pa[P][kk][1] = fa_bf2(sc[8 * kk + 2], sc[8 * kk + 3]);
+            pa[P][kk][2] = fa_bf2(sc[8 * kk + 4], sc[8 * kk + 5]);
+            pa[P][kk][3] = fa_bf2(sc[8 * kk + 6], sc[8 * kk + 7]);
+        }
+    };
+    auto ready = [&]() {
+        __syncthreads();
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    };
+    // Tiles k + 1's scores are computed while tile k's P V runs, and the
+    // softmax of tile k + 1 overlaps that P V on the tensor cores.
+    load(0, 0);
+    if (T > 1) load(64, 1);
+    if (T > 1) cp_async_wait1();
+    else cp_async_wait0();
+    ready();
+    issue_s(0);
+    wg_wait0();
+    wg_pin<32>(sc);
+    {
+        float c0, c1;
+        softmax(0, std::integral_constant<int, 0>{}, c0, c1);
+    }
+    // O += P V for tile k (its P in pa[k & 1]), issued and committed.
+    auto issue_pv = [&](int k, auto par) {
+        constexpr int P = decltype(par)::value;
+        const uint32_t va = base + (4 + (k & 1)) * WG_TILE;
+        wg_pin<128>(o);
+        wg_fence();
+#pragma unroll
+        for (int kk = 0; kk < 4; kk++) wg_o(o, pa[P][kk], wg_desc(va + kk * 2048, 8192, 1024));
+        wg_commit();
+    };
+    // One step: tile k + 1's scores and tile k's P V together, then tile
+    // k + 1's softmax while the P V runs.
+    auto step = [&](int k, auto par) {
+        constexpr int P = decltype(par)::value;
+        cp_async_wait0();
+        ready();
+        issue_s(k + 1);
+        issue_pv(k, par);
+        asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+        wg_pin<32>(sc);
+        float c0, c1;
+        softmax(k + 1, std::integral_constant<int, 1 - P>{}, c0, c1);
+        wg_wait0();
+        wg_pin<128>(o);
+        if (__any_sync(0xffffffffu, c0 != 1.f || c1 != 1.f)) {
+#pragma unroll
+            for (int i = 0; i < 128; i++) o[i] *= (i & 2) ? c1 : c0;
+        }
+        __syncthreads();  // tile k's buffers are free
+        if (k + 2 < T) load(64 * (k + 2), k & 1);
+    };
+    int k = 0;
+    for (; k + 2 < T; k += 2) {
+        step(k, std::integral_constant<int, 0>{});
+        step(k + 1, std::integral_constant<int, 1>{});
+    }
+    if (k + 1 < T) {
+        step(k, std::integral_constant<int, 0>{});
+        k++;
+        issue_pv(k, std::integral_constant<int, 1>{});
+    } else {
+        issue_pv(k, std::integral_constant<int, 0>{});
+    }
+    wg_wait0();
+    wg_pin<128>(o);
+    const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
+#pragma unroll
+    for (int hf = 0; hf < 2; hf++) {
+        const int r = r0 + 8 * hf;
+        if (r >= nb) continue;
+        const size_t t = (size_t)tb + r;
+        const float inv = hf ? i1 : i0;
+#pragma unroll
+        for (int j = 0; j < 32; j++) {
+            const int d = 8 * j + 2 * (lane & 3);
+            float y[2];
+#pragma unroll
+            for (int e = 0; e < 2; e++) {
+                const float ov = rbf(o[4 * j + 2 * hf + e] * inv);
+                const float gate = b2f(qkv[t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d + e]);
+                y[e] = ov / (1.f + expf(-gate));
+            }
+            *reinterpret_cast<__nv_bfloat162*>(out + (t * Hq + h) * HEAD_DIM + d) = __floats2bfloat162_rn(y[0], y[1]);
+        }
+    }
+#endif
+}
+// attn_wg_g<G>: grid (64-token tiles + sequences, key/value heads, G / 2).
+extern "C" __global__ void __launch_bounds__(256, 1) attn_wg_g4(ATTN_FLASH_ARGS) { attn_wg_body<4>(ATTN_FLASH_PASS); }
+extern "C" __global__ void __launch_bounds__(256, 1) attn_wg_g6(ATTN_FLASH_ARGS) { attn_wg_body<6>(ATTN_FLASH_PASS); }
 
 // Combines the key ranges of split decode attention (attn_body with `part`)
 // in range order, then gates as attn_body does: a block of 256 threads per

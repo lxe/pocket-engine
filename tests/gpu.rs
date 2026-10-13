@@ -1,5 +1,5 @@
 //! End-to-end checks on a GPU. They run when POCKET_ENGINE_MODEL names a
-//! Qwen3.5 0.8B, 2B or 4B directory and the crate is built with `--features cuda`;
+//! Qwen3.5 0.8B, 2B, 4B or 9B directory and the crate is built with `--features cuda`;
 //! otherwise they pass without doing anything.
 
 use pocket_engine::engine::{self, Engine, EngineConfig, Scoring};
@@ -54,6 +54,7 @@ fn size(dir: &std::path::Path) -> &'static str {
         1024 => "qwen3.5-0.8b",
         2048 => "qwen3.5-2b",
         2560 => "qwen3.5-4b",
+        4096 => "qwen3.5-9b",
         h => panic!("no fixture for hidden size {h}"),
     }
 }

@@ -57,6 +57,23 @@ Activations are converted where they are produced, not in a separate pass. RMSNo
 
 FP8 output depends slightly on what shares a step. cuBLAS and cuBLASLt choose kernels by row count, so a row's sums can differ in the last bit between batch sizes. bf16 rounding usually absorbs that, but an FP8 rounding that flips carries the difference into later layers. Scored alone and among other requests, the same tokens differ by a median of 0.01 in log-probability on the 0.8B and 2B models, about FP8's own error against bf16; the 4B and 9B models produce identical greedy text either way.
 
+### FP8 KV cache
+
+With `--kv-fp8`, attention keys and values are stored as E4M3, 256 bytes per token and head, with one f32 scale each (the head's largest magnitude over 448). The kernel that applies rotary embedding writes them quantized. Paged attention reads 8 bytes per lane and folds the key scale into the dot product and the value scale into the softmax weight, so values are never expanded in memory. A token and head take 260 bytes instead of 512.
+
+On the RTX 5090 the cache holds 1.97 times the tokens: 7,522 blocks of 16 for Qwen3.5-9B instead of 3,818, and 3,652 for Qwen3.8-27B Q4_K_M instead of 1,850. That lets the 27B model take a full 32,768-token context, which a bf16 cache cannot fit. Concurrency does not change, because recurrent state still caps the number of sequences (54 for 9B, 17 for 27B). Throughput at the short contexts of the load test is the same: 1,527 against 1,516 tok/s for 9B at 64 in flight.
+
+Accuracy against Transformers, with prompts of about 3,300 tokens (`scripts/accuracy.py long`) so that most of the context comes from the cache:
+
+| Model | KV cache | Top-1 agreement | Median, p95 log-prob difference |
+|---|---|---|---|
+| Qwen3.5-2B | bf16 | 285 of 288 (all misses within one bf16 step) | 0.0012, 0.042 |
+| Qwen3.5-2B | FP8 | 285 of 288 (all within one bf16 step) | 0.0024, 0.071 |
+| Qwen3.5-9B | bf16 | 284 of 288 (all within one bf16 step) | 0.0005, 0.036 |
+| Qwen3.5-9B | FP8 | 281 of 288 (5 within one bf16 step) | 0.0007, 0.076 |
+
+On the short fixture prompts, the 0.8B, 2B and 9B models pass the bf16 accuracy bar unchanged with an FP8 cache.
+
 ## Loading
 
 Weights go from the file to the GPU without passing through mapped memory. Tensor ranges are read with parallel `pread` calls into four 64 MB pinned buffers, and the copy engine drains each buffer while the next one fills. GGUF blocks that need padding are repacked on the GPU, and FP8 conversions run on the GPU too. All of this is ordered on one stream, so loading never waits for the device. From the page cache on the RTX 5090 machine:

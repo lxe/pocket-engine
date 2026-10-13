@@ -48,6 +48,10 @@ struct EngineArgs {
     /// checkpoints load as FP8 without it.
     #[arg(long)]
     fp8: bool,
+    /// Store the KV cache as FP8 (E4M3, a scale per token and head): about
+    /// twice the tokens in the same memory.
+    #[arg(long)]
+    kv_fp8: bool,
 }
 
 impl EngineArgs {
@@ -64,6 +68,7 @@ impl EngineArgs {
             max_image_pixels: self.max_image_pixels,
             image_pool: self.image_pool,
             fp8: self.fp8,
+            kv_fp8: self.kv_fp8,
             ..EngineConfig::new(self.model.clone())
         }
     }

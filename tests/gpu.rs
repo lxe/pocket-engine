@@ -29,6 +29,7 @@ fn config(model: PathBuf) -> EngineConfig {
         image_pool: 4096,
         max_image_pixels: 1 << 20,
         fp8: fp8(),
+        kv_fp8: kv_fp8(),
         ..EngineConfig::new(model)
     }
 }
@@ -130,6 +131,11 @@ fn close_enough(
 /// POCKET_ENGINE_FP8=1 runs the suite with weights quantized to FP8 at load.
 fn fp8() -> bool {
     std::env::var("POCKET_ENGINE_FP8").is_ok_and(|v| v == "1")
+}
+
+/// POCKET_ENGINE_KV_FP8=1 runs the suite with an FP8 KV cache.
+fn kv_fp8() -> bool {
+    std::env::var("POCKET_ENGINE_KV_FP8").is_ok_and(|v| v == "1")
 }
 
 /// How far apart the reference's top two may be for a miss to count as a

@@ -15,6 +15,17 @@ __device__ __forceinline__ float from_e4m3(uint8_t v) {
     return __half2float(__half(__nv_cvt_fp8_to_halfraw(v, __NV_E4M3)));
 }
 
+// Eight E4M3 values to floats.
+__device__ __forceinline__ void unpack8_e4m3(uint2 u, float* f) {
+    const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const float2 x = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3)));
+        f[2 * i] = x.x;
+        f[2 * i + 1] = x.y;
+    }
+}
+
 // Byte offset of the scale for (row r, 32-block kb) in MXFP8's tiled layout.
 __device__ __forceinline__ size_t mx_index(int r, int kb, int KB) {
     const int kt = (KB + 3) / 4;

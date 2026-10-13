@@ -41,6 +41,20 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
     return t;
 }
 
+// Max across the block, like block_sum.
+__device__ __forceinline__ float block_max(float v, float* sh) {
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31, nw = blockDim.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    if (l == 0) sh[w] = v;
+    __syncthreads();
+    float t = l < nw ? sh[l] : -INFINITY;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) t = fmaxf(t, __shfl_xor_sync(0xffffffffu, t, o));
+    __syncthreads();
+    return t;
+}
+
 __device__ __forceinline__ void unpack8(uint4 u, float* f) {
     const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&u);
 #pragma unroll
@@ -290,6 +304,18 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
     for (int i = 0; i < GDN_HALF; i++) S[(i0 + i) * GDN_DIM + j] = r[i];
 }
 
+// One head's 256 values (v0 from thread i, v1 from i + 128) as E4M3 with a
+// scale per (token, head): amax / 448, so the largest maps to E4M3's largest.
+__device__ __forceinline__ void store_e4m3(float v0, float v1, uint8_t* dst, float* scale, float* sh) {
+    const float amax = block_max(fmaxf(fabsf(v0), fabsf(v1)), sh);
+    const float sc = amax > 0.f ? amax / 448.f : 1.f;
+    const float inv = 1.f / sc;
+    const int i = threadIdx.x;
+    dst[i] = to_e4m3(v0 * inv);
+    dst[i + 128] = to_e4m3(v1 * inv);
+    if (i == 0) *scale = sc;
+}
+
 // Full-attention input preparation, one block of 128 threads per (token, head).
 // qkv rows: [Hq x (q 256 | gate 256) | k (Hkv*256) | v (Hkv*256)].
 // q heads: RMSNorm, rotary -> qout [t][Hq][256]. k heads: RMSNorm, rotary ->
@@ -304,8 +330,8 @@ extern "C" __global__ void __launch_bounds__(128)
               const float* __restrict__ q_norm, const float* __restrict__ k_norm,
               const int* __restrict__ rope, int rope_stride, int sec_h, int sec_w,
               const int* __restrict__ slot_map, const float* __restrict__ inv_freq,
-              bf16* __restrict__ qout, bf16* __restrict__ kcache, bf16* __restrict__ vcache,
-              float eps) {
+              bf16* __restrict__ qout, void* __restrict__ kcache, void* __restrict__ vcache,
+              float* __restrict__ kscale, float* __restrict__ vscale, float eps) {
     __shared__ float sh[32], rot[ROPE_DIM];
     const int t = blockIdx.x, hh = blockIdx.y, i = threadIdx.x;
     const bf16* row = qkv + (size_t)t * qstride;
@@ -314,7 +340,12 @@ extern "C" __global__ void __launch_bounds__(128)
         if (slot < 0) return;
         const int vh = hh - Hq - Hkv;
         const bf16* src = row + Hq * 2 * HEAD_DIM + Hkv * HEAD_DIM + vh * HEAD_DIM;
-        bf16* dst = vcache + ((size_t)slot * Hkv + vh) * HEAD_DIM;
+        const size_t at = (size_t)slot * Hkv + vh;
+        if (vscale) {
+            store_e4m3(b2f(src[i]), b2f(src[i + 128]), (uint8_t*)vcache + at * HEAD_DIM, vscale + at, sh);
+            return;
+        }
+        bf16* dst = (bf16*)vcache + at * HEAD_DIM;
         dst[i] = src[i];
         dst[i + 128] = src[i + 128];
         return;
@@ -338,8 +369,12 @@ extern "C" __global__ void __launch_bounds__(128)
         const float lo = rot[d], hi = rot[d + ROPE_DIM / 2];
         y0 = i < ROPE_DIM / 2 ? rbf(rbf(lo * c) - rbf(hi * s)) : rbf(rbf(hi * c) + rbf(lo * s));
     }
-    bf16* dst = is_q ? qout + ((size_t)t * Hq + hh) * HEAD_DIM
-                     : kcache + ((size_t)slot * Hkv + (hh - Hq)) * HEAD_DIM;
+    const size_t at = (size_t)slot * Hkv + (hh - Hq);
+    if (!is_q && kscale) {
+        store_e4m3(y0, y1, (uint8_t*)kcache + at * HEAD_DIM, kscale + at, sh);
+        return;
+    }
+    bf16* dst = is_q ? qout + ((size_t)t * Hq + hh) * HEAD_DIM : (bf16*)kcache + at * HEAD_DIM;
     dst[i] = f2b(y0);
     dst[i + 128] = f2b(y1);
 }
@@ -348,10 +383,14 @@ extern "C" __global__ void __launch_bounds__(128)
 // block per (token, kv head) covering the G query heads that share it. Keys
 // are split across warps with an online softmax per warp, then merged. The
 // output is gated: out = bf16(bf16(attn) * sigmoid(gate)).
-// Cache layout: [block * block_size + offset][Hkv][256].
-template <int G, int WARPS>
-__device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16* __restrict__ kcache,
-                                          const bf16* __restrict__ vcache, const bf16* __restrict__ qkv,
+// Cache layout: [block * block_size + offset][Hkv][256], bf16, or E4M3 (F8)
+// with an f32 scale per [slot][Hkv] that folds into the dot product and the
+// weighted sum of values.
+template <int G, int WARPS, bool F8>
+__device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void* __restrict__ kcache,
+                                          const void* __restrict__ vcache,
+                                          const float* __restrict__ kscale,
+                                          const float* __restrict__ vscale, const bf16* __restrict__ qkv,
                                           int qstride, int Hq, int Hkv, const int* __restrict__ pos,
                                           const int* __restrict__ tok_seq,
                                           const int* __restrict__ block_table, int max_blocks,
@@ -378,22 +417,31 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16
     }
     for (int j = w; j < L; j += WARPS) {
         const size_t slot = (size_t)bt[j / block_size] * block_size + (j % block_size);
-        const size_t off = (slot * Hkv + kvh) * HEAD_DIM + l * 8;
-        float kf[8], vf[8];
-        unpack8(*reinterpret_cast<const uint4*>(kcache + off), kf);
-        unpack8(*reinterpret_cast<const uint4*>(vcache + off), vf);
+        const size_t at = slot * Hkv + kvh;
+        const size_t off = at * HEAD_DIM + l * 8;
+        float kf[8], vf[8], ks = 1.f, vs = 1.f;
+        if constexpr (F8) {
+            unpack8_e4m3(*reinterpret_cast<const uint2*>((const uint8_t*)kcache + off), kf);
+            unpack8_e4m3(*reinterpret_cast<const uint2*>((const uint8_t*)vcache + off), vf);
+            ks = kscale[at];
+            vs = vscale[at];
+        } else {
+            unpack8(*reinterpret_cast<const uint4*>((const bf16*)kcache + off), kf);
+            unpack8(*reinterpret_cast<const uint4*>((const bf16*)vcache + off), vf);
+        }
 #pragma unroll
         for (int g = 0; g < G; g++) {
             float d = 0.f;
 #pragma unroll
             for (int e = 0; e < 8; e++) d += qr[g][e] * kf[e];
-            d = warp_sum(d);
+            d = warp_sum(d) * ks;
             const float mn = fmaxf(m[g], d);
             const float corr = expf(m[g] - mn);
             const float p = expf(d - mn);
+            const float pv = p * vs;
             ssum[g] = ssum[g] * corr + p;
 #pragma unroll
-            for (int e = 0; e < 8; e++) acc[g][e] = acc[g][e] * corr + p * vf[e];
+            for (int e = 0; e < 8; e++) acc[g][e] = acc[g][e] * corr + pv * vf[e];
             m[g] = mn;
         }
     }
@@ -444,16 +492,22 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16
 
 // Query heads per kv head (G) select the kernel; the per-warp merge buffers
 // must fit in 48 KB of shared memory, so larger groups use fewer warps.
-#define ATTN_KERNEL(G, WARPS)                                                                          \
-    extern "C" __global__ void __launch_bounds__(WARPS * 32) attn_paged_g##G(                          \
-        const bf16* __restrict__ q, const bf16* __restrict__ kcache, const bf16* __restrict__ vcache,  \
+#define ATTN_KERNEL_AS(NAME, G, WARPS, F8)                                                             \
+    extern "C" __global__ void __launch_bounds__(WARPS * 32) NAME(                                     \
+        const bf16* __restrict__ q, const void* __restrict__ kcache, const void* __restrict__ vcache,  \
+        const float* __restrict__ kscale, const float* __restrict__ vscale,                            \
         const bf16* __restrict__ qkv, int qstride, int Hq, int Hkv, const int* __restrict__ pos,      \
         const int* __restrict__ tok_seq, const int* __restrict__ block_table, int max_blocks,         \
         int block_size, bf16* __restrict__ out, float scale, uint8_t* fq, void* fs, int fmode,         \
         int frows) {                                                                                   \
-        attn_body<G, WARPS>(q, kcache, vcache, qkv, qstride, Hq, Hkv, pos, tok_seq, block_table,       \
-                            max_blocks, block_size, out, scale, fq, fs, fmode, frows);                 \
+        attn_body<G, WARPS, F8>(q, kcache, vcache, kscale, vscale, qkv, qstride, Hq, Hkv, pos,         \
+                                tok_seq, block_table, max_blocks, block_size, out, scale, fq, fs,      \
+                                fmode, frows);                                                         \
     }
+// attn_paged_g<G> reads a bf16 cache, attn_paged8_g<G> an E4M3 one.
+#define ATTN_KERNEL(G, WARPS)                                                                          \
+    ATTN_KERNEL_AS(attn_paged_g##G, G, WARPS, false)                                                   \
+    ATTN_KERNEL_AS(attn_paged8_g##G, G, WARPS, true)
 ATTN_KERNEL(1, 8)
 ATTN_KERNEL(2, 8)
 ATTN_KERNEL(4, 8)
@@ -493,18 +547,6 @@ __device__ __forceinline__ uint32_t fkey(float x) {
 
 #define SAMPLE_THREADS 1024
 #define SAMPLE_WARPS (SAMPLE_THREADS / 32)
-
-__device__ __forceinline__ float block_max(float v, float* sh) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
-    __syncthreads();
-    float t = (threadIdx.x & 31) < SAMPLE_WARPS ? sh[threadIdx.x & 31] : -INFINITY;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) t = fmaxf(t, __shfl_xor_sync(0xffffffffu, t, o));
-    __syncthreads();
-    return t;
-}
 
 // Radix selection over the keys of x = logit / T among elements with key >=
 // floor. By count (mass == false): the largest key K with at least `target`

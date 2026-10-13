@@ -36,6 +36,8 @@ pub struct EngineConfig {
     pub image_pool: usize,
     /// Quantize bf16 weights to FP8 at load.
     pub fp8: bool,
+    /// Store the KV cache as E4M3 with a scale per token and head.
+    pub kv_fp8: bool,
 }
 
 impl EngineConfig {
@@ -53,6 +55,7 @@ impl EngineConfig {
             max_image_pixels: 4 << 20,
             image_pool: 16_384,
             fp8: false,
+            kv_fp8: false,
         }
     }
 }
@@ -180,13 +183,13 @@ impl Engine {
         let usable = free
             .saturating_sub(reserve)
             .saturating_sub(slots * mc.slot_bytes());
-        let blocks = (usable / mc.block_bytes()).min(cfg.max_seqs * max_blocks);
+        let blocks = (usable / mc.block_bytes(cfg.kv_fp8)).min(cfg.max_seqs * max_blocks);
         if blocks < max_blocks {
             return Err(Error::Config(format!(
                 "not enough memory for one full context: {blocks} KV blocks, {max_blocks} needed"
             )));
         }
-        let state = State::new(&gpu, &mc, slots, blocks)?;
+        let state = State::new(&gpu, &mc, slots, blocks, cfg.kv_fp8)?;
         gpu.sync()?;
         let sched = Scheduler::with_images(
             meta,

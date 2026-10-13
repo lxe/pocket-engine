@@ -254,9 +254,10 @@ impl Config {
     pub fn slot_bytes(&self) -> usize {
         self.gdn_layers() * (self.lin_v_heads * GDN_DIM * GDN_DIM * 4 + 3 * self.conv_dim() * 2)
     }
-    /// KV cache bytes per block of BLOCK_SIZE tokens.
-    pub fn block_bytes(&self) -> usize {
-        self.kv_layers() * 2 * BLOCK_SIZE * self.hkv * HEAD_DIM * 2
+    /// KV cache bytes per block of BLOCK_SIZE tokens: bf16, or E4M3 with an
+    /// f32 scale per token and head.
+    pub fn block_bytes(&self, kv_fp8: bool) -> usize {
+        self.kv_layers() * 2 * BLOCK_SIZE * self.hkv * kv_head_bytes(kv_fp8)
     }
 }
 
@@ -295,6 +296,8 @@ struct Kernels {
     gdn_recurrent: Kernel,
     attn_prep: Kernel,
     attn: Kernel,
+    /// Paged attention over an E4M3 cache.
+    attn8: Kernel,
     penalize: Kernel,
     sample: Kernel,
 }
@@ -459,6 +462,7 @@ impl Model {
             gdn_recurrent: gpu.kernel("gdn_recurrent")?,
             attn_prep: gpu.kernel("attn_prep")?,
             attn: gpu.kernel(&format!("attn_paged_g{}", cfg.hq / cfg.hkv))?,
+            attn8: gpu.kernel(&format!("attn_paged8_g{}", cfg.hq / cfg.hkv))?,
             penalize: gpu.kernel("penalize")?,
             sample: gpu.kernel("sample")?,
         };
@@ -504,26 +508,39 @@ impl Model {
     }
 }
 
+/// Bytes of one cached key or value head.
+fn kv_head_bytes(kv_fp8: bool) -> usize {
+    if kv_fp8 { HEAD_DIM + 4 } else { HEAD_DIM * 2 }
+}
+
 /// Per-sequence recurrent state slots and the paged KV pool.
 pub struct State {
     conv: Vec<Buf>,
     rec: Vec<Buf>,
     kc: Vec<Buf>,
     vc: Vec<Buf>,
+    /// With an E4M3 cache: f32 scales per [slot][kv head] of each layer.
+    ks: Vec<Buf>,
+    vs: Vec<Buf>,
+    pub kv_fp8: bool,
     pub slots: usize,
     pub blocks: usize,
 }
 
 impl State {
-    pub fn new(gpu: &Gpu, cfg: &Config, slots: usize, blocks: usize) -> Result<Self> {
+    pub fn new(gpu: &Gpu, cfg: &Config, slots: usize, blocks: usize, kv_fp8: bool) -> Result<Self> {
         let conv_bytes = slots * 3 * cfg.conv_dim() * 2;
         let rec_bytes = slots * cfg.lin_v_heads * GDN_DIM * GDN_DIM * 4;
-        let kv_bytes = blocks * BLOCK_SIZE * cfg.hkv * HEAD_DIM * 2;
+        let heads = blocks * BLOCK_SIZE * cfg.hkv;
+        let kv_bytes = heads * HEAD_DIM * if kv_fp8 { 1 } else { 2 };
         let mut s = Self {
             conv: vec![],
             rec: vec![],
             kc: vec![],
             vc: vec![],
+            ks: vec![],
+            vs: vec![],
+            kv_fp8,
             slots,
             blocks,
         };
@@ -534,8 +551,20 @@ impl State {
         for _ in 0..cfg.kv_layers() {
             s.kc.push(gpu.alloc_zeroed(kv_bytes)?);
             s.vc.push(gpu.alloc_zeroed(kv_bytes)?);
+            if kv_fp8 {
+                s.ks.push(gpu.alloc_zeroed(heads * 4)?);
+                s.vs.push(gpu.alloc_zeroed(heads * 4)?);
+            }
         }
         Ok(s)
+    }
+
+    /// Scale pointers of an attention layer's cache, 0 for a bf16 cache.
+    fn kv_scales(&self, cache: usize) -> (u64, u64) {
+        match (self.ks.get(cache), self.vs.get(cache)) {
+            (Some(k), Some(v)) => (k.ptr, v.ptr),
+            _ => (0, 0),
+        }
     }
 }
 
@@ -879,6 +908,7 @@ impl Model {
                     cache,
                 } => {
                     let qs = c.attn_proj();
+                    let (kscale, vscale) = st.kv_scales(*cache);
                     w_qkv.forward(gpu, q, xn_in, t, a.proj.ptr, qs, false)?;
                     gpu.launch(
                         k.attn_prep,
@@ -901,11 +931,13 @@ impl Model {
                             P(a.q.ptr),
                             P(st.kc[*cache].ptr),
                             P(st.vc[*cache].ptr),
+                            P(kscale),
+                            P(vscale),
                             F(eps),
                         ],
                     )?;
                     gpu.launch(
-                        k.attn,
+                        if st.kv_fp8 { k.attn8 } else { k.attn },
                         (ti, c.hkv as u32, 1),
                         if c.hq / c.hkv >= 6 { 128 } else { 256 },
                         0,
@@ -913,6 +945,8 @@ impl Model {
                             P(a.q.ptr),
                             P(st.kc[*cache].ptr),
                             P(st.vc[*cache].ptr),
+                            P(kscale),
+                            P(vscale),
                             P(a.proj.ptr),
                             I(qs as i32),
                             I(c.hq as i32),

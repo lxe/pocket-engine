@@ -1,6 +1,7 @@
 """Accuracy check against Transformers.
 
   python scripts/accuracy.py reference MODEL_DIR OUT [N]   # greedy continuations + teacher-forced top-5
+  python scripts/accuracy.py long MODEL_DIR OUT            # the same over ~3,300-token prompts (docs/)
   pocket-engine score --model MODEL_DIR OUT.pairs.json OUT.ours.json
   python scripts/accuracy.py compare OUT.ref.json OUT.ours.json
 
@@ -8,12 +9,14 @@
 import json, sys
 
 
-def reference(M, OUT, N=48):
+def reference(M, OUT, N=48, prompts=None):
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
     tok = AutoTokenizer.from_pretrained(M)
     model = AutoModelForCausalLM.from_pretrained(M, dtype=torch.bfloat16, device_map="cuda").eval()
-    prompts = [
+    if callable(prompts):
+        prompts = prompts(tok)
+    prompts = prompts or [
         "Hello! Who are you?",
         "Summarize briefly: the receipt shows a total amount paid by card at the store on the date with tax and tip included for the meal",
         "Write a Python function that returns the n-th Fibonacci number, with a docstring.",
@@ -37,6 +40,19 @@ def reference(M, OUT, N=48):
     json.dump(ref, open(OUT + ".ref.json", "w"))
 
 
+def long_prompts(tok):
+    """Three questions about this repository's design notes and README, each after a different
+    3,300-token slice of them: long enough that most of the context is in the KV cache."""
+    import os
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    text = "".join(open(os.path.join(root, f)).read() + "\n\n" for f in ("docs/design.md", "README.md"))
+    ids = tok(text, add_special_tokens=False)["input_ids"]
+    qs = ["Summarize the document above in detail, section by section.",
+          "Using the document above, explain how a quantized matrix multiply picks its path, and why.",
+          "List every number the document above reports for the RTX 5090, with what each measures."]
+    return [tok.decode(ids[k * 200: k * 200 + 3300]) + "\n\n" + q for k, q in enumerate(qs)]
+
+
 def compare(ref_path, ours_path):
     ref = json.load(open(ref_path)); got = json.load(open(ours_path))
     agree = tot = ties = 0; diffs = []
@@ -55,7 +71,9 @@ def compare(ref_path, ours_path):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "reference":
+    if sys.argv[1] == "long":
+        reference(sys.argv[2], sys.argv[3], 96, long_prompts)
+    elif sys.argv[1] == "reference":
         reference(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 48)
     else:
         compare(sys.argv[2], sys.argv[3])

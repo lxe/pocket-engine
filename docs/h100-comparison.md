@@ -88,9 +88,9 @@ Measured on one H100 80GB SXM (driver 580.126.09), 2026-10-12, one engine after 
 - **llama.cpp** barely gains from concurrency on these hybrid models. Its best is 752 tok/s, on 0.8B at 64 in flight, where pocket-engine serves 7,439 from Q4_K_M. Its default cache roughly halves even that.
 - **Tiled Q4 weights** give pocket-engine 10 to 29% more Q4_K_M throughput than plain blocks from 8 in flight. A single request on 0.8B is slower with them (459 against 539 tok/s), because its matrices are too small for the tiled kernel to hide latency. On the H100 the tiled kernel also falls behind bf16 cuBLAS above 8 rows (57 against 39 µs at 64 rows on 9B `ffn_up`), because it reaches only about 1 TB/s of the H100's 3.35.
 
-## 27B, multi-token prediction, shared prefixes and long prompts
+## 27B, multi-token prediction and shared prefixes
 
-Measured on another H100 80GB SXM (driver 580.126.09), 2026-10-13, one engine after the other, with pocket-engine 42b6977 (7da5da0 for the multi-token-prediction rows) and the same vLLM 0.31.0 image. vLLM ran with `--max-num-seqs 256` (128 for the 70,000-token runs) and, for FP8, `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0`. [Receipt](receipts/h100-retest.json).
+Measured on another H100 80GB SXM (driver 580.126.09), 2026-10-13, one engine after the other, with pocket-engine 42b6977 (7da5da0 for the multi-token-prediction rows) and the same vLLM 0.31.0 image. vLLM ran with `--max-num-seqs 256` and, for FP8, `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0`. [Receipt](receipts/h100-retest.json).
 
 ### Under `scripts/load.py`
 
@@ -127,20 +127,9 @@ Both engines draft two tokens a step with the checkpoint's MTP layer: pocket-eng
 | 16 conversations of 8 turns, each resending its history | 9b | 1,613 tok/s, 0.118 s | 1,419 tok/s, 0.220 s |
 | | 27b | 420 tok/s, 0.202 s | 423 tok/s, 0.451 s |
 
-### Long prompts
-
-One request at a time, bf16, servers started with a 70,000-token context; time to first token.
-
-| Prompt | 9b pocket-engine | 9b vLLM | 27b pocket-engine | 27b vLLM |
-|---:|---:|---:|---:|---:|
-| 8k | 0.37 s | 0.27 s | 0.98 s | 0.70 s |
-| 32k | 1.86 s | 1.05 s | 4.96 s | 3.17 s |
-| 64k | 4.88 s | 2.25 s | 12.7 s | 6.86 s |
-| 4 × 32k at once (median) | 3.82 s | 1.48 s | 9.80 s | 4.71 s |
-
 ### What these runs show
 
 - **27B.** In FP8, pocket-engine matches vLLM at 64 in flight (1,314 against 1,302) and leads from 8 to 32; vLLM keeps the burst (1,075 against 889). In bf16 the two are within 7% up to 32 in flight, and vLLM leads at 64 (1,088 against 978).
 - **Multi-token prediction.** pocket-engine leads at every steady load on both models: a single 9B request decodes at 252 tok/s against vLLM's 200, and 27B reaches 1,092 at 64 in flight against vLLM's 989. The 9B burst goes to vLLM (2,797 against 2,609). With drafting, 27B in bf16 matches vLLM's best without it.
 - **Shared prefixes.** First tokens come 1.9 to 3.5 times sooner. Throughput leads on a shared system prompt and is level on multi-turn 27B.
-- **Long prompts are vLLM's.** In these runs its prefill is about twice as fast from 32k: FlashAttention 3 on Hopper's wgmma against the mma.sync flash kernel of pocket-engine 42b6977, whose share of prefill grows with the context. The receipt's decoding speeds come from about 25 tokens per request, too few to compare. The design notes have [time to first token](design.md#long-contexts) with the wgmma flash kernel and two-pass recurrence against vLLM.
+- **Long prompts.** The design notes have [time to first token](design.md#long-contexts) for 8k to 64k prompts and each prefill kernel against vLLM's.

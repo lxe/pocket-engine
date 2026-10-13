@@ -54,28 +54,28 @@ Decoding with a short context runs at 89 tok/s; at 64k, reading the 2 GB of cach
 
 Flash attention runs at 115 TFLOPS on the 5090 (cuBLAS's bf16 matmuls reach 211). Its blocks take eight warps of queries: only one block fits per SM, and four warps are too few to hide latency. The convolution splits each sequence into 64-token chunks rather than walking it in one thread per channel.
 
-On an H100, prompts with a bf16 cache run a flash kernel on Hopper's wgmma instead, warp-specialized as FlashAttention 3 is. A block takes 64 query tokens of two heads of one key/value group. A producer warpgroup (40 registers) loads each 64-key tile into one of two shared-memory stages by TMA, one 16-slot by 64-column box of the cache's tensor map per page and swizzle atom; two consumer warpgroups (232 registers), a head each, compute. mbarriers pass the stages between them. Q Kᵀ runs as m64n64k16 from shared memory and P V as m64n256k16 with P in registers; each consumer issues the next tile's scores with this tile's P V and runs the next softmax while P V is on the tensor cores. Scores are kept in log₂ units for `ex2.approx`, and only tiles reaching past the block's first query apply the causal mask. It reaches 330 TFLOPS for groups of 4 and 336 for groups of 6.
+On an H100, prompts with a bf16 cache run a flash kernel on Hopper's wgmma instead, warp-specialized and persistent as FlashAttention 3 is. A block per SM loops over work items of 64 query tokens of two heads of one key/value group. A producer warpgroup (40 registers) writes each item's queries and loads each 64-key tile's keys and values by TMA into one of two shared-memory stages, one warp per 16-token page, one box of the cache's tensor map per page and swizzle atom; two consumer warpgroups (232 registers), a head each, compute. Keys and values pass through separate mbarrier pipelines that run on across items, so a key stage frees as soon as Q Kᵀ has read it and the next tile's keys load while P V runs. Q Kᵀ runs as m64n64k16 from shared memory and P V as m64n256k16 with P in registers. Each consumer issues the next tile's Q Kᵀ, rescales its output, issues this tile's P V and runs the next softmax while P V is on the tensor cores; the probabilities stay in f32 until P V has read the registers they replace, and a shared-memory store of the row sums keeps ptxas from hoisting the P V wait above the softmax. Scores are kept in log₂ units for `ex2.approx`, and only tiles reaching past the block's first query apply the causal mask. Items run key/value head first, the longest tiles first, and block b takes every grid-th one, so all blocks stream one head's cache together: a long context's keys and values, more than L2 holds, are read from memory about once per head rather than once per block. It reaches 665 TFLOPS for groups of 4 and 658 for groups of 6 at 61k cached tokens.
 
 The chunked recurrence runs in two passes, as FLA's does. `gdn_prep` computes every chunk's local terms at once: normalized q and k, the decay, P, and the WY form U = T βV, W = T β e^G K with T = (I + A)⁻¹. `gdn_scan` then walks the chunks with only D = U − W S, the outputs and the state update, which are separable by value column, so up to four blocks share a head when a step has few sequences. A 4,096-token chunk of 9B's recurrence takes 0.65 ms on an RTX 5090.
 
-Time to first token, one request at a time, on an H100 against vLLM 0.31.0 run on the same machine:
+Time to first token, one request at a time, on an H100 against vLLM 0.31.0 run on the same machine ([receipt](receipts/h100-mtp-ttft.json)):
 
 | Prompt | 9B | 9B, vLLM | 27B | 27B, vLLM |
 |---:|---:|---:|---:|---:|
-| 8k | 0.26 s | 0.26 s | 0.80 s | 0.73 s |
-| 32k | 1.12 s | 1.04 s | 3.57 s | 3.12 s |
-| 64k | 2.70 s | 2.17 s | 8.31 s | 6.83 s |
+| 8k | 0.29 s | 0.33 s | 0.82 s | 0.79 s |
+| 32k | 1.13 s | 1.10 s | 3.36 s | 3.22 s |
+| 64k | 2.40 s | 2.29 s | 7.38 s | 6.90 s |
 
-The gap is in two prefill kernels, attention and the recurrence. Each kernel alone on the same shapes (4,096 new tokens after 28,672 cached for attention; 4,096 tokens with a carried state for the recurrence):
+Each prefill kernel alone on the same shapes (4,096 new tokens after 28,672 cached for attention; 4,096 tokens with a carried state for the recurrence):
 
 | Kernel | H100, pocket-engine | H100, vLLM | RTX 5090, pocket-engine | RTX 5090, vLLM |
 |---|---:|---:|---:|---:|
-| Attention, groups of 4 | 328 TFLOPS | 752 (FlashAttention 3) | 130 | 167 (FlashAttention 2) |
-| Attention, groups of 6 | 336 TFLOPS | 676 | 108 | 174 |
-| Recurrence, 32 heads | 0.68 ms | 0.29 ms (FlashInfer) | 0.66 ms | 0.41 ms |
+| Attention, groups of 4 | 661 TFLOPS | 776 (FlashAttention 3) | 130 | 167 (FlashAttention 2) |
+| Attention, groups of 6 | 664 TFLOPS | 684 | 108 | 174 |
+| Recurrence, 32 heads | 0.67 ms | 0.34 ms (FlashInfer) | 0.66 ms | 0.41 ms |
 | Recurrence, 48 heads | 0.83 ms | 0.32 ms | 0.95 ms | 0.60 ms |
 
-At 64k on 27B the attention alone is about 840 TFLOP: 2.5 s at this kernel's rate and 1.2 s at FlashAttention 3's, most of the 1.5 s between the two engines. The rest of FlashAttention 3's lead would take its larger tiles and deeper pipelining than this kernel's two 64-key stages.
+At 64k on 27B the attention is about 840 TFLOP, 1.3 s at either kernel's rate. Most of the remaining 0.5 s between the engines is the recurrence: 48 layers, 16 chunks of 4,096 tokens each, 0.5 ms apart per chunk.
 
 ## Time to first token
 
@@ -89,8 +89,8 @@ Median time to first token for single short prompts (60 to 200 words, chat templ
 | | pocket-engine | vLLM |
 |---|---:|---:|
 | RTX 5090, Qwen3.5-9B | 19.6 ms | 22 ms (0.30) |
-| H100, Qwen3.5-9B | 12.4 ms | 43.8 ms (0.31.0) |
-| H100, Qwen3.8-27B | 32.6 ms | 73.7 ms (0.31.0) |
+| H100, Qwen3.5-9B | 13.3 ms | 55.0 ms (0.31.0) |
+| H100, Qwen3.8-27B | 36.3 ms | 113.6 ms (0.31.0) |
 
 ## Multi-token prediction
 
@@ -115,27 +115,27 @@ On an H100 against vLLM 0.31.0's MTP (`--speculative-config '{"method":"mtp","nu
 
 | Qwen3.5-9B | One stream | 1 | 8 | 16 | 32 | 64 | burst 64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| pocket-engine, plain | 156 | 150 | 976 | 1,744 | 2,685 | 3,516 | 2,572 |
-| vLLM, plain | 148 | 129 | 732 | 1,194 | 2,038 | 3,028 | 2,361 |
-| pocket-engine, 1 draft | 248 | 228 | 1,408 | 2,362 | 3,384 | 4,069 | 2,855 |
-| vLLM, 1 draft | 223 | 182 | 971 | 1,493 | 2,326 | 3,443 | 3,001 |
-| pocket-engine, 2 drafts | 290 | 263 | 1,514 | 2,523 | 3,522 | 4,190 | 3,024 |
-| vLLM, 2 drafts | 254 | 198 | 1,087 | 1,671 | 2,654 | 3,516 | 3,104 |
-| pocket-engine, 3 drafts | 306 | 265 | 1,520 | 2,525 | 3,418 | 4,000 | 3,034 |
-| vLLM, 3 drafts | 257 | 201 | 1,083 | 1,855 | 2,657 | 3,700 | 3,104 |
+| pocket-engine, plain | 150 | 144 | 948 | 1,666 | 2,612 | 3,387 | 2,325 |
+| vLLM, plain | 144 | 126 | 653 | 1,094 | 1,797 | 2,720 | 2,278 |
+| pocket-engine, 1 draft | 240 | 220 | 1,318 | 2,286 | 3,214 | 4,027 | 2,664 |
+| vLLM, 1 draft | 215 | 178 | 801 | 1,238 | 2,248 | 2,935 | 2,620 |
+| pocket-engine, 2 drafts | 280 | 253 | 1,457 | 2,375 | 3,413 | 4,154 | 2,994 |
+| vLLM, 2 drafts | 245 | 201 | 918 | 1,438 | 2,444 | 3,024 | 2,809 |
+| pocket-engine, 3 drafts | 296 | 253 | 1,427 | 2,452 | 3,368 | 4,066 | 2,783 |
+| vLLM, 3 drafts | 247 | 194 | 907 | 1,543 | 2,140 | 3,220 | 2,821 |
 
 | Qwen3.8-27B | One stream | 1 | 8 | 16 | 32 | 64 | burst 64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| pocket-engine, plain | 52 | 50 | 304 | 538 | 829 | 1,054 | 776 |
-| vLLM, plain | 51 | 45 | 269 | 497 | 729 | 1,083 | 777 |
-| pocket-engine, 1 draft | 88 | 78 | 462 | 793 | 1,054 | 1,124 | 930 |
-| vLLM, 1 draft | 83 | 66 | 381 | 668 | 987 | 1,136 | 915 |
-| pocket-engine, 2 drafts | 110 | 91 | 515 | 871 | 1,076 | 1,114 | 916 |
-| vLLM, 2 drafts | 102 | 76 | 439 | 755 | 1,036 | 1,052 | 883 |
-| pocket-engine, 3 drafts | 123 | 99 | 546 | 899 | 827 | 1,104 | 940 |
-| vLLM, 3 drafts | 112 | 79 | 477 | 796 | 999 | 981 | 878 |
+| pocket-engine, plain | 50 | 48 | 292 | 520 | 802 | 1,034 | 750 |
+| vLLM, plain | 48 | 44 | 249 | 448 | 681 | 1,019 | 774 |
+| pocket-engine, 1 draft | 85 | 74 | 446 | 772 | 1,039 | 1,113 | 908 |
+| vLLM, 1 draft | 79 | 62 | 363 | 574 | 884 | 1,022 | 884 |
+| pocket-engine, 2 drafts | 106 | 87 | 497 | 853 | 1,067 | 1,098 | 896 |
+| vLLM, 2 drafts | 97 | 72 | 402 | 632 | 800 | 830 | 801 |
+| pocket-engine, 3 drafts | 118 | 95 | 526 | 885 | 808 | 1,080 | 891 |
+| vLLM, 3 drafts | 107 | 76 | 432 | 732 | 913 | 886 | 812 |
 
-Both engines accept drafts at about the same rate: here 76%, 61% and 49% of drafts on 9B and 79%, 62% and 53% on 27B with one, two and three drafts; vLLM reports mean acceptance lengths of 1.79, 2.29 and 2.63 on 9B (79%, 65%, 54% of drafts) and 1.80, 2.33, 2.71 on 27B. pocket-engine drafts with the cut output layer and no extra memory; a 27B sequence's state is 75 MB, so at 32 in flight with three drafts the free slots run out and those steps decode plainly, where vLLM, holding a slot per draft, keeps drafting.
+Both engines accept drafts at about the same rate: here 76%, 61% and 50% of drafts on 9B and 79%, 62% and 53% on 27B with one, two and three drafts; vLLM reports mean acceptance lengths of 1.79, 2.29 and 2.64 on 9B (79%, 65%, 55% of drafts) and 1.81, 2.34, 2.72 on 27B (81%, 67%, 57%). pocket-engine drafts with the cut output layer and no extra memory; a 27B sequence's state is 75 MB, so at 32 in flight with three drafts the free slots run out and those steps decode plainly, where vLLM, holding a slot per draft, keeps drafting.
 
 Greedy output with drafting matches teacher-forced picks except at near ties: on Qwen3.5-9B, 1 of 320 positions departs, by 0.012 in log-probability. With FP8 activations, verification's matmuls run with four times the rows and take other cuBLAS kernels, and E4M3 rounding magnifies their last-bit differences: 10 of 320 positions depart, against 4 for the same comparison without drafting.
 

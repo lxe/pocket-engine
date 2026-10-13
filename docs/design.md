@@ -110,7 +110,7 @@ GGUF quantizations are measured against the same bf16 references, so they show t
 | Qwen3.8-27B UD-Q4_K_XL | 210 of 213 | 0.0011, 0.16 |
 | Qwen3.8-27B UD-IQ4_XS | 207 of 213 | 0.0022, 0.19 |
 
-FP8 against the same bf16 references. The 27B checkpoints ran on an H100; `--fp8` ran on the RTX 5090 (MXFP8):
+FP8 against the same bf16 references. The 27B checkpoints ran on an H100; `--fp8` ran on the RTX 5090 (MXFP8). [Receipt](receipts/fp8.json).
 
 | FP8 | Top-1 agreement | Median, p95 log-prob difference |
 |---|---|---|

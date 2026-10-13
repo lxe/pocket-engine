@@ -185,7 +185,10 @@ extern "C" __global__ void silu_mul(const bf16* __restrict__ gu, bf16* __restric
 
 // Depthwise causal convolution (kernel 4) over each sequence's tokens, then
 // SiLU. The state holds the last three inputs of each sequence: [slot][3][C].
-// proj rows hold the convolution inputs in their first C columns.
+// proj rows hold the convolution inputs in their first C columns. A thread
+// takes one channel of CONV_CHUNK tokens (blockIdx.z), reading the three
+// inputs before them from the rows before or, at the start, the state.
+#define CONV_CHUNK 64
 extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
                                     const float* __restrict__ w, bf16* __restrict__ state,
                                     bf16* __restrict__ out, const int* __restrict__ cu,
@@ -195,25 +198,28 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const int t0 = cu[s], t1 = cu[s + 1];
-    if (t0 == t1) return;
+    const int ta = t0 + blockIdx.z * CONV_CHUNK, tz = min(t1, ta + CONV_CHUNK);
+    if (ta >= tz) return;
     bf16* st = state + (size_t)slots[s] * 3 * C;
     const bool keep = is_spec(outs, spec, s);
-    float x0 = 0.f, x1 = 0.f, x2 = 0.f;
-    if (!fresh[s]) {
-        x0 = b2f(st[c]);
-        x1 = b2f(st[C + c]);
-        x2 = b2f(st[2 * C + c]);
+    // Inputs at ta - 3, ta - 2, ta - 1.
+    float x[3];
+#pragma unroll
+    for (int i = 0; i < 3; i++) {
+        const int tt = ta - 3 + i;
+        x[i] = tt >= t0 ? b2f(proj[(size_t)tt * pstride + c]) : fresh[s] ? 0.f : b2f(st[(size_t)(tt - t0 + 3) * C + c]);
     }
+    float x0 = x[0], x1 = x[1], x2 = x[2];
     const float4 k = *reinterpret_cast<const float4*>(w + 4 * c);
-    // Inputs are loaded 8 tokens at a time, so a prompt waits for one load
+    // Inputs are loaded 8 tokens at a time, so a chunk waits for one load
     // latency per 8 tokens rather than per token.
-    for (int t = t0; t < t1; t += 8) {
+    for (int t = ta; t < tz; t += 8) {
         float xs[8];
 #pragma unroll
-        for (int u = 0; u < 8; u++) xs[u] = t + u < t1 ? b2f(proj[(size_t)(t + u) * pstride + c]) : 0.f;
+        for (int u = 0; u < 8; u++) xs[u] = t + u < tz ? b2f(proj[(size_t)(t + u) * pstride + c]) : 0.f;
 #pragma unroll
         for (int u = 0; u < 8; u++) {
-            if (t + u >= t1) break;
+            if (t + u >= tz) break;
             const float x3 = xs[u];
             float acc = 0.f;
             acc += x0 * k.x;
@@ -232,7 +238,15 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
             }
         }
     }
-    if (keep) return;
+    // The first chunk, the only one that read the state, writes it: from
+    // its own window, or the sequence's last three rows (a sequence of more
+    // than one chunk has at least three).
+    if (keep || blockIdx.z != 0) return;
+    if (tz != t1) {
+        x0 = b2f(proj[(size_t)(t1 - 3) * pstride + c]);
+        x1 = b2f(proj[(size_t)(t1 - 2) * pstride + c]);
+        x2 = b2f(proj[(size_t)(t1 - 1) * pstride + c]);
+    }
     st[c] = f2b(x0);
     st[C + c] = f2b(x1);
     st[2 * C + c] = f2b(x2);

@@ -1571,7 +1571,8 @@ impl Model {
                     w_in.forward(gpu, q, xn_in, t, a.proj.ptr, pw, false)?;
                     gpu.launch(
                         k.gdn_conv,
-                        (cd.div_ceil(128) as u32, si, 1),
+                        // Chunks of CONV_CHUNK tokens; a sequence has at most t.
+                        (cd.div_ceil(128) as u32, si, t.div_ceil(64) as u32),
                         128,
                         0,
                         &[

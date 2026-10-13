@@ -782,7 +782,12 @@ pub async fn serve(
         .route("/v1/models", get(models))
         .route("/health", get(health_report))
         .with_state(app);
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+    // Tokens are small writes: without TCP_NODELAY, Nagle's algorithm holds one
+    // back until the previous is acknowledged, which a delayed ACK can stall.
+    let listener =
+        axum::serve::ListenerExt::tap_io(tokio::net::TcpListener::bind(bind).await?, |tcp| {
+            let _ = tcp.set_nodelay(true);
+        });
     eprintln!("listening on {bind}");
     axum::serve(listener, router)
         .with_graceful_shutdown(async {

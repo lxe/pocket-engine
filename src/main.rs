@@ -130,9 +130,13 @@ enum Cmd {
         seqs: usize,
         #[arg(long, default_value_t = 128)]
         tokens: usize,
-        /// Split each head's columns across 4 blocks, with a separate norm.
+        /// The chunked tensor-core kernel for prompts, with its norm, instead
+        /// of gdn_recurrent.
         #[arg(long)]
-        split: bool,
+        chunk: bool,
+        /// Compare the chunked kernel's outputs and state with gdn_recurrent's.
+        #[arg(long)]
+        check: bool,
     },
     BenchFp8 {
         #[arg(long)]
@@ -421,7 +425,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             k_heads,
             seqs,
             tokens,
-            split,
+            chunk,
+            check,
         } => {
             use pocket_engine::gpu::{Arg, Gpu};
             let gpu = Gpu::new(0)?;
@@ -443,7 +448,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 |v: Vec<i32>| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
             let conv = gpu.upload(&rnd(t * c, 1.0))?;
             let proj = gpu.upload(&rnd(t * pw, 1.0))?;
-            let neg_a = gpu.upload(&f32s(vec![-0.5; hv]))?;
+            let neg_a = gpu.upload(&f32s(vec![-0.01; hv]))?;
             let dt = gpu.upload(&f32s(vec![0.1; hv]))?;
             let nw = gpu.upload(&f32s(vec![1.0; d]))?;
             let state = gpu.alloc_zeroed(seqs * hv * d * d * 2)?;
@@ -452,14 +457,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fresh = gpu.upload(&i32s(vec![0; seqs]))?;
             let tok_seq = gpu.upload(&i32s((0..t).map(|i| (i / tokens) as i32).collect()))?;
             let out = gpu.alloc(t * hv * d * 2)?;
-            let k = gpu.kernel(if split {
-                "gdn_recurrent_split"
-            } else {
-                "gdn_recurrent"
-            })?;
+            let chunk_smem = 4 * 32 * 136 * 2
+                + 128 * 136 * 2
+                + 32 * 132 * 4
+                + 32 * 33 * 4
+                + 32 * 40 * 2
+                + 4 * 32 * 4;
+            let kchunk = gpu.kernel("gdn_chunk")?;
+            gpu.set_smem(kchunk, chunk_smem)?;
             let norm = gpu.kernel("gdn_norm")?;
-            let run = || -> pocket_engine::Result<()> {
-                if split {
+            let launch = |name: &str, fresh_ptr: u64| -> pocket_engine::Result<()> {
+                let (kern, smem) = match name {
+                    "chunk" => (kchunk, chunk_smem as u32),
+                    _ => (gpu.kernel("gdn_recurrent")?, 0),
+                };
+                gpu.launch(
+                    kern,
+                    (seqs as u32, hv as u32, 1),
+                    2 * d as u32,
+                    smem,
+                    &[
+                        Arg::P(conv.ptr),
+                        Arg::P(proj.ptr),
+                        Arg::I(pw as i32),
+                        Arg::I(c as i32),
+                        Arg::I(hk as i32),
+                        Arg::I(hv as i32),
+                        Arg::P(neg_a.ptr),
+                        Arg::P(dt.ptr),
+                        Arg::P(nw.ptr),
+                        Arg::P(state.ptr),
+                        Arg::I(1),
+                        Arg::P(cu.ptr),
+                        Arg::P(slots.ptr),
+                        Arg::P(fresh_ptr),
+                        Arg::P(out.ptr),
+                        Arg::F(1e-6),
+                        Arg::I(0),
+                        Arg::P(0),
+                        Arg::P(0),
+                        Arg::I(0),
+                        Arg::I(0),
+                    ],
+                )?;
+                if name != "decode" {
                     gpu.launch(
                         norm,
                         ((t * hv * 32).div_ceil(256) as u32, 1, 1),
@@ -483,36 +524,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ],
                     )?;
                 }
-                gpu.launch(
-                    k,
-                    (seqs as u32, hv as u32, if split { 4 } else { 1 }),
-                    2 * d as u32,
-                    0,
-                    &[
-                        Arg::P(conv.ptr),
-                        Arg::P(proj.ptr),
-                        Arg::I(pw as i32),
-                        Arg::I(c as i32),
-                        Arg::I(hk as i32),
-                        Arg::I(hv as i32),
-                        Arg::P(neg_a.ptr),
-                        Arg::P(dt.ptr),
-                        Arg::P(nw.ptr),
-                        Arg::P(state.ptr),
-                        Arg::I(1),
-                        Arg::P(cu.ptr),
-                        Arg::P(slots.ptr),
-                        Arg::P(fresh.ptr),
-                        Arg::P(out.ptr),
-                        Arg::F(1e-6),
-                        Arg::I(0),
-                        Arg::P(0),
-                        Arg::P(0),
-                        Arg::I(0),
-                        Arg::I(0),
-                    ],
-                )
+                Ok(())
             };
+            let which = if chunk { "chunk" } else { "decode" };
+            if check {
+                // Warm the state, then run both kernels from the same state.
+                let fresh1 = gpu.upload(&i32s(vec![1; seqs]))?;
+                launch("decode", fresh1.ptr)?;
+                let sbytes = seqs * hv * d * d * 2;
+                let saved = gpu.alloc(sbytes)?;
+                gpu.dtod(saved.ptr, state.ptr, sbytes)?;
+                let fetch = |ptr: u64, bytes: usize| -> pocket_engine::Result<Vec<f32>> {
+                    let mut h = gpu.pinned(bytes)?;
+                    gpu.dtoh(&mut h, ptr, bytes)?;
+                    gpu.sync()?;
+                    Ok(h.as_slice::<u16>()
+                        .iter()
+                        .map(|&b| half::bf16::from_bits(b).to_f32())
+                        .collect())
+                };
+                for (label, f) in [("fresh", fresh1.ptr), ("carried", fresh.ptr)] {
+                    gpu.dtod(state.ptr, saved.ptr, sbytes)?;
+                    launch("decode", f)?;
+                    let (o1, s1) = (fetch(out.ptr, t * hv * d * 2)?, fetch(state.ptr, sbytes)?);
+                    gpu.dtod(state.ptr, saved.ptr, sbytes)?;
+                    launch("chunk", f)?;
+                    let (o2, s2) = (fetch(out.ptr, t * hv * d * 2)?, fetch(state.ptr, sbytes)?);
+                    let rel = |a: &[f32], b: &[f32]| {
+                        let scale = a.iter().fold(0f32, |m, x| m.max(x.abs()));
+                        let mut diffs: Vec<f32> = a
+                            .iter()
+                            .zip(b)
+                            .map(|(x, y)| (x - y).abs() / scale)
+                            .collect();
+                        diffs.sort_by(f32::total_cmp);
+                        (
+                            diffs[diffs.len() / 2],
+                            diffs[diffs.len() * 99 / 100],
+                            *diffs.last().unwrap(),
+                        )
+                    };
+                    println!(
+                        "{label}: outputs median/p99/max rel diff {:?}, state {:?}",
+                        rel(&o1, &o2),
+                        rel(&s1, &s2)
+                    );
+                }
+                return Ok(());
+            }
+            let run = || launch(which, fresh.ptr);
             run()?;
             gpu.sync()?;
             let n = 50;

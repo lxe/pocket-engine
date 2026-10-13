@@ -13,6 +13,10 @@ pub const GDN_DIM: usize = 128;
 pub const HEAD_DIM: usize = 256;
 pub const ROPE_DIM: usize = 64;
 pub const BLOCK_SIZE: usize = 16;
+/// Dynamic shared memory of the chunked gated delta rule (GDN_CHUNK_SMEM in
+/// qwen35.cu).
+const GDN_CHUNK_SMEM: usize =
+    4 * 32 * 136 * 2 + 128 * 136 * 2 + 32 * 132 * 4 + 32 * 33 * 4 + 32 * 40 * 2 + 4 * 32 * 4;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -296,7 +300,8 @@ struct Kernels {
     silu_mul: Kernel,
     gdn_conv: Kernel,
     gdn_recurrent: Kernel,
-    /// The recurrence for steps with prompt tokens, and its gated norm.
+    /// The recurrence for steps with prompt tokens (chunked, on tensor
+    /// cores), and its gated norm.
     gdn_split: Kernel,
     gdn_norm: Kernel,
     attn_prep: Kernel,
@@ -469,7 +474,11 @@ impl Model {
             silu_mul: gpu.kernel("silu_mul")?,
             gdn_conv: gpu.kernel("gdn_conv")?,
             gdn_recurrent: gpu.kernel("gdn_recurrent")?,
-            gdn_split: gpu.kernel("gdn_recurrent_split")?,
+            gdn_split: {
+                let k = gpu.kernel("gdn_chunk")?;
+                gpu.set_smem(k, GDN_CHUNK_SMEM)?;
+                k
+            },
             gdn_norm: gpu.kernel("gdn_norm")?,
             attn_prep: gpu.kernel("attn_prep")?,
             attn: gpu.kernel(&format!("attn_paged_g{}", cfg.hq / cfg.hkv))?,
@@ -921,13 +930,12 @@ impl Model {
                         I(c.tiled_v as i32),
                     ];
                     if t > s {
-                        // Prompt tokens: four blocks per head for prompt
-                        // sequences, then the norm.
+                        // Prompt tokens: chunked on tensor cores, then the norm.
                         gpu.launch(
                             k.gdn_split,
-                            (si, hv as u32, 4),
+                            (si, hv as u32, 1),
                             2 * GDN_DIM as u32,
-                            0,
+                            GDN_CHUNK_SMEM as u32,
                             &[args.as_slice(), &a.fp8_args(|f| &f.core, t)].concat(),
                         )?;
                         gpu.launch(

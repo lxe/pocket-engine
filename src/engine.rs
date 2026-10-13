@@ -169,13 +169,15 @@ impl Engine {
         let pool_rows = if vision.is_some() { cfg.image_pool } else { 0 };
         // Each sequence holds a recurrent state slot (tens of MB on larger
         // models). Keep slots within half of what is left after the weights,
-        // so the KV cache gets the rest.
+        // and leave the KV cache at least one full context.
         {
             let (free, total) = gpu.mem_info()?;
             let usable = free.saturating_sub((total as f64 * (1.0 - cfg.memory_fraction)) as usize);
-            let fit = (usable / 2 / mc.slot_bytes(cfg.state_bf16))
-                .saturating_sub(1)
-                .max(1);
+            let one_context = cfg.max_context.div_ceil(BLOCK_SIZE) * mc.block_bytes(cfg.kv_fp8);
+            let fit = ((usable / 2).min(usable.saturating_sub(one_context + (1 << 30)))
+                / mc.slot_bytes(cfg.state_bf16))
+            .saturating_sub(1)
+            .max(1);
             if fit < cfg.max_seqs {
                 eprintln!(
                     "{} sequences fit beside the KV cache ({} MB of state each); --max-seqs {} lowered",

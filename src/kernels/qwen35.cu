@@ -1232,7 +1232,7 @@ __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commi
 __device__ __forceinline__ void cp_async_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
 __device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_group 0;\n" ::); }
 
-template <int G, bool F8, int NT, int BN>
+template <int G, bool F8, int NT, int BN, bool QR, bool S1 = false>
 __device__ __forceinline__ void attn_flash_group(
     const bf16* __restrict__ q, const void* __restrict__ kcache, const void* __restrict__ vcache,
     const float* __restrict__ kscale, const float* __restrict__ vscale, const bf16* __restrict__ qkv, int qstride,
@@ -1241,9 +1241,14 @@ __device__ __forceinline__ void attn_flash_group(
     const int* __restrict__ outs, int spec) {
     extern __shared__ __align__(16) unsigned char fsm[];
     constexpr int BT = 16 * NT;            // tokens per block
-    bf16* sQ = (bf16*)fsm;                 // [NT][G][16][FA_STR]
-    bf16* sK = sQ + NT * G * 16 * FA_STR;  // [2][BN][FA_STR]
-    bf16* sV = sK + 2 * BN * FA_STR;       // [2][BN][FA_STR]
+    // With QR each warp keeps its queries in registers, and the keys and
+    // values reuse the queries' shared memory once they are read.
+    // With S1 keys and values have one buffer each, as FlashAttention 2's:
+    // the next tile's keys load during P V and this tile's values during
+    // Q K^T.
+    bf16* sQ = (bf16*)fsm;                                // [NT][G][16][FA_STR]
+    bf16* sK = QR ? sQ : sQ + NT * G * 16 * FA_STR;       // [S1 ? 1 : 2][BN][FA_STR]
+    bf16* sV = sK + (S1 ? 1 : 2) * BN * FA_STR;           // [S1 ? 1 : 2][BN][FA_STR]
     constexpr int T = NT * G * 32;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
     // Warp w takes query head w % G of query tile w / G.
@@ -1278,14 +1283,14 @@ __device__ __forceinline__ void attn_flash_group(
         }
         *reinterpret_cast<uint4*>(sQ + row * FA_STR + c) = v;
     }
-    auto load = [&](int k0, int buf) {
+    auto load = [&](int k0, int buf, int which = 3) {  // which: 1 keys, 2 values, 3 both
         bf16* dk = sK + buf * BN * FA_STR;
         bf16* dv = sV + buf * BN * FA_STR;
         for (int e = tid; e < BN * (HEAD_DIM / 8); e += T) {
             const int j = e / (HEAD_DIM / 8), c = (e % (HEAD_DIM / 8)) * 8, kp = k0 + j;
             if (kp >= L) {
-                *reinterpret_cast<uint4*>(dk + j * FA_STR + c) = make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4*>(dv + j * FA_STR + c) = make_uint4(0, 0, 0, 0);
+                if (which & 1) *reinterpret_cast<uint4*>(dk + j * FA_STR + c) = make_uint4(0, 0, 0, 0);
+                if (which & 2) *reinterpret_cast<uint4*>(dv + j * FA_STR + c) = make_uint4(0, 0, 0, 0);
                 continue;
             }
             const size_t slot = (size_t)bt[kp / block_size] * block_size + kp % block_size;
@@ -1303,8 +1308,8 @@ __device__ __forceinline__ void attn_flash_group(
                 *reinterpret_cast<uint4*>(dk + j * FA_STR + c) = pack8(kf);
                 *reinterpret_cast<uint4*>(dv + j * FA_STR + c) = pack8(vf);
             } else {
-                cp_async16(dk + j * FA_STR + c, (const bf16*)kcache + at);
-                cp_async16(dv + j * FA_STR + c, (const bf16*)vcache + at);
+                if (which & 1) cp_async16(dk + j * FA_STR + c, (const bf16*)kcache + at);
+                if (which & 2) cp_async16(dv + j * FA_STR + c, (const bf16*)vcache + at);
             }
         }
         cp_async_commit();
@@ -1317,6 +1322,13 @@ __device__ __forceinline__ void attn_flash_group(
     const int last = p0 + n - 1;  // this warp's last query position
     float sc[BN / 8][4];
     float c0 = 1.f, c1 = 1.f;
+    uint32_t qa[QR ? HEAD_DIM / 16 : 1][4];
+    if constexpr (QR) {
+        __syncthreads();
+#pragma unroll
+        for (int kd = 0; kd < HEAD_DIM; kd += 16) frag_a(qa[kd / 16], myQ, FA_STR, 0, kd);
+        __syncthreads();  // the queries' shared memory now holds keys and values
+    }
     // Scores of the tile from k0, masked, and the online softmax into sc;
     // c0, c1 are the factors the outputs so far take.
     auto scores = [&](const bf16* cK, int k0) {
@@ -1325,7 +1337,12 @@ __device__ __forceinline__ void attn_flash_group(
 #pragma unroll
         for (int kd = 0; kd < HEAD_DIM; kd += 16) {
             uint32_t a[4];
-            frag_a(a, myQ, FA_STR, 0, kd);
+            if constexpr (QR) {
+#pragma unroll
+                for (int i = 0; i < 4; i++) a[i] = qa[kd / 16][i];
+            } else {
+                frag_a(a, myQ, FA_STR, 0, kd);
+            }
 #pragma unroll
             for (int np = 0; np < BN / 16; np++) {
                 uint32_t b[4];
@@ -1402,6 +1419,19 @@ __device__ __forceinline__ void attn_flash_group(
             }
         }
     };
+    if constexpr (S1) {
+        load(0, 0, 1);
+        for (int k0 = 0; k0 < L; k0 += BN) {
+            cp_async_wait0();
+            __syncthreads();  // this tile's keys landed; every warp is done with the last values
+            load(k0, 0, 2);
+            if (k0 <= last) scores(sK, k0);
+            cp_async_wait0();
+            __syncthreads();  // this tile's values landed; every warp is done with the keys
+            if (k0 + BN < L) load(k0 + BN, 0, 1);
+            if (k0 <= last) values(sV);
+        }
+    } else {
     load(0, 0);
     int buf = 0;
     for (int k0 = 0; k0 < L; k0 += BN, buf ^= 1) {
@@ -1418,6 +1448,7 @@ __device__ __forceinline__ void attn_flash_group(
             values(sV + buf * BN * FA_STR);
         }
         __syncthreads();  // this buffer is refilled two tiles on
+    }
     }
     const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
 #pragma unroll
@@ -1441,14 +1472,23 @@ __device__ __forceinline__ void attn_flash_group(
     }
 }
 // attn_group_g<G>_t<NT>_k<BN>: groups of G, NT query tiles, key tiles of BN;
-// attn_group8_... reads an E4M3 cache. The host picks the variant whose
-// shared memory the device allows.
+// attn_group8_... reads an E4M3 cache; attn_groupr_... keeps the queries in
+// registers. The host picks the variant whose shared memory the device
+// allows.
 #define ATTN_GROUP_V(G, NT, BN)                                                                                \
     extern "C" __global__ void __launch_bounds__(G * 32 * NT) attn_group_g##G##_t##NT##_k##BN(ATTN_FLASH_ARGS) {  \
-        attn_flash_group<G, false, NT, BN>(ATTN_FLASH_PASS);                                            \
+        attn_flash_group<G, false, NT, BN, false>(ATTN_FLASH_PASS);                                     \
     }                                                                                                          \
     extern "C" __global__ void __launch_bounds__(G * 32 * NT) attn_group8_g##G##_t##NT##_k##BN(ATTN_FLASH_ARGS) { \
-        attn_flash_group<G, true, NT, BN>(ATTN_FLASH_PASS);                                             \
+        attn_flash_group<G, true, NT, BN, false>(ATTN_FLASH_PASS);                                      \
+    }
+#define ATTN_GROUP_R(G, NT, BN)                                                                                 \
+    extern "C" __global__ void __launch_bounds__(G * 32 * NT) attn_groupr_g##G##_t##NT##_k##BN(ATTN_FLASH_ARGS) { \
+        attn_flash_group<G, false, NT, BN, true>(ATTN_FLASH_PASS);                                      \
+    }
+#define ATTN_GROUP_S(G, NT, BN)                                                                                 \
+    extern "C" __global__ void __launch_bounds__(G * 32 * NT) attn_groups_g##G##_t##NT##_k##BN(ATTN_FLASH_ARGS) { \
+        attn_flash_group<G, false, NT, BN, true, true>(ATTN_FLASH_PASS);                                \
     }
 // Up to 99 KB (RTX 50-series): 8 warps of queries and 16-key tiles.
 ATTN_GROUP_V(1, 8, 16)
@@ -1461,6 +1501,17 @@ ATTN_GROUP_V(8, 1, 16)
 ATTN_GROUP_V(4, 2, 64)
 ATTN_GROUP_V(6, 2, 32)
 ATTN_GROUP_V(2, 1, 32)
+// Queries in registers: 32-key tiles in 99 KB, 64-key tiles in 227 KB.
+ATTN_GROUP_R(4, 2, 32)
+ATTN_GROUP_R(6, 1, 32)
+ATTN_GROUP_R(4, 2, 64)
+ATTN_GROUP_R(6, 1, 64)
+ATTN_GROUP_R(6, 2, 64)
+// Queries in registers and one buffer each of keys and values.
+ATTN_GROUP_S(4, 2, 64)
+ATTN_GROUP_S(6, 1, 64)
+ATTN_GROUP_S(4, 2, 128)
+ATTN_GROUP_S(6, 2, 64)
 
 // ---------------------------------------------------------------------------
 // Flash attention for prompts on Hopper's wgmma (sm_90a). A block takes 64

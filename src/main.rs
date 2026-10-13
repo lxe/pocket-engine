@@ -741,7 +741,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let scale = 1.0 / (D as f32).sqrt();
             let sh = match shape.as_deref() {
                 Some(v) => pocket_engine::model::FaShape::parse(v).ok_or("--shape takes NT,BN")?,
-                None => pocket_engine::model::fa_shape(group, gpu.arch),
+                None => pocket_engine::model::fa_shape(group, gpu.arch, false),
             };
             let (tiles, smem) = (sh.tiles, sh.smem(group));
             let (name, grid, threads, smem) = if wg {

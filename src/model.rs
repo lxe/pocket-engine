@@ -30,19 +30,29 @@ fn split_ranges(t: usize, hkv: usize, sms: usize) -> usize {
 }
 
 /// Flash attention's shape for groups of `g` query heads on a device of
-/// compute capability `arch`: query tiles of 16 tokens per block and keys
-/// per tile, naming the kernel attn_group_g<G>_t<NT>_k<BN> (qwen35.cu). Up
-/// to 99 KB of shared memory (RTX 50-series): 8 warps of queries and 16-key
-/// tiles. The 227 KB of Hopper and datacenter Blackwell (B200, B300) take
-/// larger key tiles, and two query tiles for groups of 6 (bench-attn on an
-/// H100: groups of 4 from 123 to 158 TFLOPS, of 6 from 97 to 168).
-pub fn fa_shape(g: usize, arch: u32) -> FaShape {
-    let (tiles, keys) = match (arch, g) {
-        (90 | 100 | 103, 4) => (2, 64),
-        (90 | 100 | 103, 6) => (2, 32),
-        _ => (if g == 6 { 1 } else { 8 / g }, 16),
+/// compute capability `arch`, for a bf16 or an E4M3 (`fp8`) cache: query
+/// tiles of 16 tokens per block and keys per tile, naming the kernel
+/// attn_group*_g<G>_t<NT>_k<BN> (qwen35.cu). Up to 99 KB of shared memory
+/// (RTX 50-series): 8 warps of queries and 16-key tiles, or with a bf16 cache
+/// for groups of 4 and 6 the queries in registers and 32-key tiles
+/// (bench-attn on an RTX 5090: groups of 4 from 128 to 141 TFLOPS, of 6 from
+/// 107 to 115). The 227 KB of Hopper and datacenter Blackwell (B200, B300)
+/// take larger key tiles, and two query tiles for groups of 6 (bench-attn on
+/// an H100: groups of 4 from 123 to 158 TFLOPS, of 6 from 97 to 168).
+pub fn fa_shape(g: usize, arch: u32, fp8: bool) -> FaShape {
+    let shape = |tiles, keys, qreg| FaShape {
+        tiles,
+        keys,
+        qreg,
+        single: false,
     };
-    FaShape { tiles, keys }
+    match (arch, g, fp8) {
+        (90 | 100 | 103, 4, _) => shape(2, 64, false),
+        (90 | 100 | 103, 6, _) => shape(2, 32, false),
+        (_, 4, false) => shape(2, 32, true),
+        (_, 6, false) => shape(1, 32, true),
+        _ => shape(if g == 6 { 1 } else { 8 / g }, 16, false),
+    }
 }
 
 /// A flash kernel's shape: query tiles of 16 tokens per block and keys per
@@ -51,26 +61,54 @@ pub fn fa_shape(g: usize, arch: u32) -> FaShape {
 pub struct FaShape {
     pub tiles: usize,
     pub keys: usize,
+    /// Queries in registers (attn_groupr_; bf16 caches only).
+    pub qreg: bool,
+    /// Queries in registers and one buffer each of keys and values
+    /// (attn_groups_; bf16 caches only).
+    pub single: bool,
 }
 
 impl FaShape {
-    /// Parses "NT,BN".
+    /// Parses "NT,BN", "NT,BN,r" (queries in registers) or "NT,BN,s" (and
+    /// single key and value buffers).
     pub fn parse(v: &str) -> Option<Self> {
-        let (a, b) = v.split_once(',')?;
-        Some(Self {
-            tiles: a.parse().ok()?,
-            keys: b.parse().ok()?,
+        let mut it = v.split(',');
+        let (tiles, keys) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+        let (qreg, single) = match it.next() {
+            None => (false, false),
+            Some("r") => (true, false),
+            Some("s") => (true, true),
+            Some(_) => return None,
+        };
+        it.next().is_none().then_some(Self {
+            tiles,
+            keys,
+            qreg,
+            single,
         })
     }
-    /// The kernel: attn_group_g<G>_t<NT>_k<BN>, attn_group8_ for an E4M3 cache.
+    /// The kernel: attn_group_g<G>_t<NT>_k<BN>, attn_group8_ for an E4M3
+    /// cache, attn_groupr_ with the queries in registers.
     pub fn kernel(&self, g: usize, fp8: bool) -> String {
-        let f = if fp8 { "8" } else { "" };
+        let f = if fp8 {
+            "8"
+        } else if self.single {
+            "s"
+        } else if self.qreg {
+            "r"
+        } else {
+            ""
+        };
         format!("attn_group{f}_g{g}_t{}_k{}", self.tiles, self.keys)
     }
-    /// Its dynamic shared memory (fg_smem in qwen35.cu): the tiles' queries
-    /// for each of G heads and two buffers of BN keys and values.
+    /// Its dynamic shared memory: the tiles' queries for each of G heads and
+    /// two (or with `single` one) buffers of BN keys and values, or, with the
+    /// queries in registers, the larger of the two (the buffers reuse the
+    /// queries' space).
     pub fn smem(&self, g: usize) -> usize {
-        (g * 16 * self.tiles + 4 * self.keys) * (HEAD_DIM + 8) * 2
+        let q = g * 16 * self.tiles;
+        let kv = if self.single { 2 } else { 4 } * self.keys;
+        (if self.qreg { q.max(kv) } else { q + kv }) * (HEAD_DIM + 8) * 2
     }
 }
 /// Dynamic shared memory of attn_ws_g<G> (WS_SMEM in qwen35.cu): two
@@ -429,6 +467,7 @@ struct Kernels {
     attn_flash: Kernel,
     attn_flash8: Kernel,
     fa_shape: FaShape,
+    fa_shape8: FaShape,
     /// On Hopper: flash attention on wgmma, warp-specialized with TMA loads,
     /// for a bf16 cache.
     attn_wg: Option<Kernel>,
@@ -696,19 +735,20 @@ impl Model {
             attn8: gpu.kernel(&format!("attn_paged8_g{}", cfg.hq / cfg.hkv))?,
             attn_flash: {
                 let g = cfg.hq / cfg.hkv;
-                let sh = fa_shape(g, gpu.arch);
+                let sh = fa_shape(g, gpu.arch, false);
                 let k = gpu.kernel(&sh.kernel(g, false))?;
                 gpu.set_smem(k, sh.smem(g))?;
                 k
             },
             attn_flash8: {
                 let g = cfg.hq / cfg.hkv;
-                let sh = fa_shape(g, gpu.arch);
+                let sh = fa_shape(g, gpu.arch, true);
                 let k = gpu.kernel(&sh.kernel(g, true))?;
                 gpu.set_smem(k, sh.smem(g))?;
                 k
             },
-            fa_shape: fa_shape(cfg.hq / cfg.hkv, gpu.arch),
+            fa_shape: fa_shape(cfg.hq / cfg.hkv, gpu.arch, false),
+            fa_shape8: fa_shape(cfg.hq / cfg.hkv, gpu.arch, true),
             attn_wg: if fa_wgmma(cfg.hq / cfg.hkv, gpu.arch, false) {
                 let k = gpu.kernel(&format!("attn_ws_g{}", cfg.hq / cfg.hkv))?;
                 gpu.set_smem(k, WS_SMEM)?;
@@ -1932,7 +1972,7 @@ impl Model {
                     if t > s {
                         // Prompt sequences: flash attention.
                         let group = c.hq / c.hkv;
-                        let sh = k.fa_shape;
+                        let sh = if st.kv_fp8 { k.fa_shape8 } else { k.fa_shape };
                         let maps = st.maps.get(*cache);
                         let (kern, grid, threads, smem) = match (k.attn_wg, maps) {
                             (Some(wg), Some(_)) => (wg, (gpu.sms as u32, 1, 1), 384, WS_SMEM),

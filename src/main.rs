@@ -65,6 +65,10 @@ struct EngineArgs {
     /// of --max-seqs, 2 to 64.
     #[arg(long)]
     prefix_cache: Option<usize>,
+    /// Speculative decoding with the checkpoint's multi-token-prediction
+    /// layer: each step verifies this many drafted tokens (2 without a value).
+    #[arg(long, num_args = 0..=1, default_missing_value = "2")]
+    mtp: Option<usize>,
 }
 
 impl EngineArgs {
@@ -85,6 +89,7 @@ impl EngineArgs {
             kv_fp8: self.kv_fp8,
             state_bf16: !self.state_f32,
             prefix_cache: self.prefix_cache,
+            mtp: self.mtp.unwrap_or(0),
             ..EngineConfig::new(self.model.clone())
         }
     }

@@ -32,6 +32,10 @@ fn config(model: PathBuf) -> EngineConfig {
         fp4: fp4(),
         kv_fp8: kv_fp8(),
         state_bf16: !std::env::var("POCKET_ENGINE_STATE_F32").is_ok_and(|v| v == "1"),
+        mtp: std::env::var("POCKET_ENGINE_MTP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         ..EngineConfig::new(model)
     }
 }
@@ -320,6 +324,87 @@ fn batching_does_not_change_predictions() {
     let prompts: Vec<Vec<u32>> = pairs.into_iter().map(|p| p.prompt).collect();
     let together = generate(&mut e, &prompts, 8);
     assert!(together.iter().all(|t| !t.is_empty()));
+}
+
+/// Whether a checkpoint directory has a multi-token-prediction layer.
+fn has_mtp(dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(dir.join("model.safetensors.index.json"))
+        .is_ok_and(|s| s.contains("\"mtp.fc.weight\""))
+}
+
+/// With multi-token prediction each step verifies drafted tokens, and
+/// greedy output stays the model's: where it departs from the model's pick
+/// with that output fed back (teacher-forced, which never drafts), the two
+/// were within rounding of a tie. Most drafts are accepted.
+#[test]
+fn drafts_keep_the_models_greedy_choices() {
+    let Some(dir) = model() else { return };
+    if !has_mtp(&dir) {
+        eprintln!("no multi-token-prediction layer: skipping");
+        return;
+    }
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let pairs: Vec<Pair> = fixture(&format!("{}.pairs.json", size(&dir)));
+    let mut e = Engine::new(EngineConfig {
+        mtp: 3,
+        ..config(dir)
+    })
+    .unwrap();
+    let prompts: Vec<Vec<u32>> = pairs.into_iter().map(|p| p.prompt).collect();
+    let out = generate(&mut e, &prompts, 64);
+    let c = e.sched.counters.clone();
+    // Three drafts a step: about half accepted.
+    assert!(
+        c.drafted > 100 && c.accepted * 3 > c.drafted,
+        "{} of {} drafts accepted",
+        c.accepted,
+        c.drafted
+    );
+    let scored = e
+        .score(
+            prompts
+                .iter()
+                .zip(&out)
+                .map(|(p, o)| Scoring {
+                    prompt: p.clone(),
+                    forced: o.clone(),
+                    images: vec![],
+                    rope: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+    let (mut positions, mut departures, mut worst) = (0, 0, (0.0f32, String::new()));
+    for (o, sc) in out.iter().zip(&scored) {
+        for (i, (&tok, s)) in o.iter().zip(sc).enumerate() {
+            positions += 1;
+            if tok == s.argmax {
+                continue;
+            }
+            departures += 1;
+            let lp = |t: u32| s.top.iter().find(|x| x.0 == t).map(|x| x.1);
+            let gap = lp(s.argmax).unwrap() - lp(tok).unwrap_or(f32::INFINITY);
+            if gap > worst.0 {
+                worst = (
+                    gap,
+                    format!("position {i}: picked {tok}, the model {}", s.argmax),
+                );
+            }
+        }
+    }
+    if fp8() || fp4() || kv_fp8() {
+        // Verification runs several rows per sequence, so its matmuls take
+        // other kernels, and FP8 activations magnify the last-bit
+        // differences (see batching_does_not_change_predictions).
+        assert!(
+            departures * 20 <= positions,
+            "{departures} of {positions} positions depart; worst {} by {}",
+            worst.1,
+            worst.0
+        );
+    } else {
+        assert!(worst.0 < 0.15, "{} by {}", worst.1, worst.0);
+    }
 }
 
 /// The tokens a sampler should keep, given a row's top five log-probabilities.

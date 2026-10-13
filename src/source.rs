@@ -347,6 +347,8 @@ pub struct Load {
     /// Quantize bf16 MLP matrices to FP4 at load (the rest to FP8, so
     /// `quantize` is set too). Blackwell only.
     pub fp4: bool,
+    /// Load the multi-token-prediction layer.
+    pub mtp: bool,
 }
 
 /// What a part of a layer becomes on the device.

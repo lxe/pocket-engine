@@ -601,8 +601,8 @@ impl Gpu {
         smem: u32,
         args: &[Arg],
     ) -> Result<()> {
-        let mut vals = [0u64; 24];
-        let mut ptrs = [std::ptr::null_mut::<c_void>(); 24];
+        let mut vals = [0u64; 32];
+        let mut ptrs = [std::ptr::null_mut::<c_void>(); 32];
         for (i, a) in args.iter().enumerate() {
             // Little-endian: a 4-byte value sits at the start of its 8-byte slot.
             vals[i] = match *a {

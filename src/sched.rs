@@ -115,6 +115,11 @@ pub struct Scored {
 pub struct Seq {
     pub req: Request,
     slot: usize,
+    /// Draft tokens to verify next step (multi-token prediction).
+    drafts: Vec<u32>,
+    /// While verifying drafts: the slot to keep the state in after each fed
+    /// token, free slots borrowed for the step and its own slot last.
+    outs: Vec<usize>,
     blocks: Vec<u32>,
     /// Tokens of prompt ++ generated whose state is computed.
     fed: usize,
@@ -150,6 +155,10 @@ impl Seq {
     }
     fn in_prompt(&self) -> bool {
         self.fed < self.req.prompt.len()
+    }
+    /// Whether a row feeding `n` tokens verifies drafts.
+    fn verifies(&self, n: usize) -> bool {
+        !self.in_prompt() && n > 1
     }
 }
 
@@ -205,11 +214,15 @@ impl<'a> Pen<'a> {
 }
 
 /// The work of one step: `rows[i]` feeds `rows[i].1` tokens of running
-/// sequence `rows[i].0`.
+/// sequence `rows[i].0`, whose output rows start at `outs_at[i]`.
 #[derive(Debug, Default)]
 pub struct Step {
     rows: Vec<(usize, usize)>,
+    outs_at: Vec<usize>,
     pub tokens: usize,
+    /// Output rows: one per sequence, or one per token of a sequence
+    /// verifying drafts.
+    pub outs: usize,
     /// State slot copies (from, to) to make, in order, before the step runs:
     /// prefix-cache snapshots and restores.
     pub copies: Vec<(usize, usize)>,
@@ -222,6 +235,15 @@ impl Step {
     pub fn decode_only(&self) -> bool {
         self.tokens == self.rows.len()
     }
+    /// Whether every row verifies `spec - 1` drafts (a step a captured
+    /// verification graph can replay).
+    pub fn verify_only(&self, spec: usize) -> bool {
+        spec > 1 && self.tokens == self.rows.len() * spec && self.outs == self.tokens
+    }
+    /// The output row of sequence row `si` (its first, when it verifies).
+    pub fn out_row(&self, si: usize) -> usize {
+        self.outs_at[si]
+    }
 }
 
 #[derive(Default, Debug, Clone, serde::Serialize)]
@@ -231,7 +253,16 @@ pub struct Counters {
     pub prompt_tokens: u64,
     /// Prompt tokens served from the prefix cache instead of computed.
     pub cached_tokens: u64,
+    /// Drafts verified, and of those accepted.
+    pub drafted: u64,
+    pub accepted: u64,
 }
+
+/// Most tokens a step verifying drafts may feed. Past this, verification
+/// turns the step's matmuls compute-bound and costs more than the accepted
+/// drafts save (Qwen3.5-9B on an RTX 5090: three drafts each for 32
+/// sequences, 128 rows, ran 6% slower than plain decoding).
+const VERIFY_ROWS: usize = 96;
 
 /// Prompt tokens per prefix-cache unit: entries cover whole units, a
 /// multiple of the KV block.
@@ -278,6 +309,8 @@ pub struct Scheduler {
     pool_free: Vec<(usize, usize)>,
     pool_rows: usize,
     max_context: usize,
+    /// Free state slots: one per sequence, and lent for a step to sequences
+    /// verifying drafts.
     free_slots: Vec<usize>,
     free_blocks: Vec<u32>,
     /// References to each KV block, from sequences and cache entries; a block
@@ -407,6 +440,8 @@ impl Scheduler {
         self.waiting.push_back(Seq {
             req,
             slot: 0,
+            drafts: Vec::new(),
+            outs: Vec::new(),
             blocks: Vec::new(),
             fed: 0,
             generated: Vec::new(),
@@ -642,10 +677,25 @@ impl Scheduler {
             return None;
         }
         self.running.sort_by_key(|s| (s.in_prompt(), s.admitted));
+        // Sequences verify drafts when free slots can hold the states after
+        // their drafts and the step stays small enough that its matmuls are
+        // still bound by reading the weights: all of them, so the step can
+        // replay a graph, or none.
+        let drafting = self.running.iter().filter(|s| !s.drafts.is_empty()).count();
+        let verify = drafting > 0
+            && self.free_slots.len() >= drafting * (self.meta.spec - 1)
+            && drafting * self.meta.spec <= VERIFY_ROWS;
         let mut budget = self.meta.max_tokens;
         let mut step = Step::default();
-        for (i, s) in self.running.iter().enumerate() {
-            let mut n = (s.total() - s.fed).min(budget);
+        for (i, s) in self.running.iter_mut().enumerate() {
+            // A decoding sequence feeds its last token and its drafts, short
+            // of positions past what it may generate.
+            let ahead = if s.in_prompt() || !verify {
+                0
+            } else {
+                s.drafts.len().min(s.req.max_new - s.generated.len() - 1)
+            };
+            let mut n = (s.total() - s.fed + ahead).min(budget);
             if let Some(&at) = s.snap_at.first() {
                 // Stop the chunk at the boundary, so the state can be kept.
                 n = n.min(at - s.fed);
@@ -656,6 +706,14 @@ impl Scheduler {
             budget -= n;
             step.tokens += n;
             step.rows.push((i, n));
+            step.outs_at.push(step.outs);
+            step.outs += if s.verifies(n) { n } else { 1 };
+            if s.verifies(n) {
+                s.outs = (1..n)
+                    .map(|_| self.free_slots.pop().expect("counted above"))
+                    .chain([s.slot])
+                    .collect();
+            }
         }
         step.copies = std::mem::take(&mut self.pending_copies);
         Some(step)
@@ -669,18 +727,34 @@ impl Scheduler {
         let mut e = 0;
         m[me.cu()] = 0;
         m[me.pen_cu()] = 0;
+        m[me.ocu()] = 0;
         for (si, &(ri, n)) in step.rows.iter().enumerate() {
             let s = &self.running[ri];
+            let verifies = s.verifies(n);
+            let o0 = step.outs_at[si];
+            let plen = s.req.prompt.len();
+            let image_row = |p: usize| match (s.pool, s.image_rows.get(p)) {
+                (Some((start, _)), Some(&r)) if r >= 0 => start as i32 + r,
+                _ => -1,
+            };
             for k in 0..n {
                 let p = s.fed + k;
-                m[me.ids() + t] = s.token(p) as i32;
+                m[me.ids() + t] = if verifies && k > 0 {
+                    s.drafts[k - 1]
+                } else {
+                    s.token(p)
+                } as i32;
                 m[me.pos() + t] = p as i32;
                 m[me.slot_map() + t] =
                     (s.blocks[p / BLOCK_SIZE] as usize * BLOCK_SIZE + p % BLOCK_SIZE) as i32;
                 m[me.tok_seq() + t] = si as i32;
-                m[me.emb_src() + t] = match (s.pool, s.image_rows.get(p)) {
-                    (Some((start, _)), Some(&r)) if r >= 0 => start as i32 + r,
-                    _ => -1,
+                m[me.emb_src() + t] = image_row(p);
+                // The draft layer reads the token after this one: a prompt
+                // token, or the pick at this token's output row.
+                (m[me.mtp_ids() + t], m[me.mtp_src() + t]) = if p + 1 < plen {
+                    (s.req.prompt[p + 1] as i32, image_row(p + 1))
+                } else {
+                    (-((o0 + if verifies { k } else { 0 }) as i32) - 1, -1)
                 };
                 let rope = match &s.req.rope {
                     Some((pos, _)) if p < pos.len() => pos[p],
@@ -695,18 +769,33 @@ impl Scheduler {
             m[me.cu() + si + 1] = t as i32;
             m[me.slots() + si] = s.slot as i32;
             m[me.fresh() + si] = (s.fed == 0) as i32;
-            m[me.last() + si] = t as i32 - 1;
-            let sp = &s.req.sampling;
-            m[me.temps() + si] = sp.temperature.max(0.0).to_bits() as i32;
-            let seed = sp.seed ^ (s.generated.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            m[me.seeds() + si] = (seed ^ (seed >> 32)) as i32;
-            m[me.top_ks() + si] = sp.top_k as i32;
-            m[me.top_ps() + si] = sp.top_p.to_bits() as i32;
-            m[me.min_ps() + si] = sp.min_p.to_bits() as i32;
-            if sp.adjusts_logits() && s.fed + n >= s.total() {
-                e = pen.push_seq(e, s);
+            let outs = me.outs() + si * me.spec;
+            if verifies {
+                for (k, &slot) in s.outs.iter().enumerate() {
+                    m[outs + k] = slot as i32;
+                }
+            } else {
+                m[outs] = -1;
             }
-            m[me.pen_cu() + si + 1] = e as i32;
+            let nout = if verifies { n } else { 1 };
+            m[me.ocu() + si + 1] = (o0 + nout) as i32;
+            let sp = &s.req.sampling;
+            for j in 0..nout {
+                let o = o0 + j;
+                m[me.last() + o] = if verifies { t - n + j } else { t - 1 } as i32;
+                m[me.temps() + o] = sp.temperature.max(0.0).to_bits() as i32;
+                let g = (s.generated.len() + j) as u64;
+                let seed = sp.seed ^ g.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                m[me.seeds() + o] = (seed ^ (seed >> 32)) as i32;
+                m[me.top_ks() + o] = sp.top_k as i32;
+                m[me.top_ps() + o] = sp.top_p.to_bits() as i32;
+                m[me.min_ps() + o] = sp.min_p.to_bits() as i32;
+                if sp.adjusts_logits() && s.fed + n >= s.total() {
+                    e = pen.push_seq(e, s);
+                }
+                m[me.pen_cu() + o + 1] = e as i32;
+            }
+            m[me.limits() + si] = (s.blocks.len() * BLOCK_SIZE) as i32 - 1;
             let row = me.block_table() + si * me.max_blocks;
             for (dst, &b) in m[row..row + s.blocks.len()].iter_mut().zip(&s.blocks) {
                 *dst = b as i32;
@@ -715,34 +804,45 @@ impl Scheduler {
         e
     }
 
-    /// Writes padding rows [from, to) for a graph replay: one-token sequences
-    /// on the scratch slot that write no KV and whose picks are ignored.
-    pub fn pad(&self, m: &mut [i32], from: usize, to: usize) {
+    /// Writes padding sequences [from, to) for a graph replay, of `n`
+    /// tokens each (1, or `spec` for a verification graph): sequences on the
+    /// scratch slot that write no KV and whose picks are ignored.
+    pub fn pad(&self, m: &mut [i32], from: usize, to: usize, n: usize) {
         let me = &self.meta;
         let scratch = self.scratch_slot() as i32;
         if from == 0 {
             m[me.cu()] = 0;
             m[me.pen_cu()] = 0;
+            m[me.ocu()] = 0;
         }
         for i in from..to {
-            m[me.ids() + i] = 0;
-            m[me.pos() + i] = 0;
-            m[me.slot_map() + i] = -1;
-            m[me.tok_seq() + i] = i as i32;
-            m[me.emb_src() + i] = -1;
-            for axis in 0..3 {
-                m[me.rope() + axis * me.max_tokens + i] = 0;
+            for k in 0..n {
+                // With n > 1 every token is an output row, so row == token.
+                let t = i * n + k;
+                m[me.ids() + t] = 0;
+                m[me.pos() + t] = k as i32;
+                m[me.slot_map() + t] = -1;
+                m[me.tok_seq() + t] = i as i32;
+                m[me.emb_src() + t] = -1;
+                for axis in 0..3 {
+                    m[me.rope() + axis * me.max_tokens + t] = k as i32;
+                }
+                m[me.mtp_ids() + t] = -(t as i32) - 1;
+                m[me.mtp_src() + t] = -1;
+                m[me.last() + t] = t as i32;
+                m[me.temps() + t] = 0;
+                m[me.seeds() + t] = 0;
+                m[me.top_ks() + t] = 0;
+                m[me.top_ps() + t] = 1f32.to_bits() as i32;
+                m[me.min_ps() + t] = 0;
+                m[me.pen_cu() + t + 1] = m[me.pen_cu() + t];
+                m[me.outs() + i * me.spec + k] = if n > 1 { scratch } else { -1 };
             }
-            m[me.cu() + i + 1] = i as i32 + 1;
+            m[me.cu() + i + 1] = ((i + 1) * n) as i32;
+            m[me.ocu() + i + 1] = ((i + 1) * n) as i32;
             m[me.slots() + i] = scratch;
             m[me.fresh() + i] = 1;
-            m[me.last() + i] = i as i32;
-            m[me.temps() + i] = 0;
-            m[me.seeds() + i] = 0;
-            m[me.top_ks() + i] = 0;
-            m[me.top_ps() + i] = 1f32.to_bits() as i32;
-            m[me.min_ps() + i] = 0;
-            m[me.pen_cu() + i + 1] = m[me.pen_cu() + i];
+            m[me.limits() + i] = -1;
             m[me.block_table() + i * me.max_blocks..me.block_table() + (i + 1) * me.max_blocks]
                 .fill(0);
         }
@@ -759,24 +859,52 @@ impl Scheduler {
         self.running[step.rows[si].0].forced.is_some()
     }
 
-    /// Applies the step's picks, one per row; `scored[si]` carries the forced
-    /// rows' scores. Streams tokens and returns the sequences that finished.
+    /// Applies the step's picks, per output row, and each sequence's next
+    /// draft (`drafts`, with multi-token prediction); `scored[si]` carries
+    /// the forced rows' scores. Streams tokens and returns the sequences that
+    /// finished.
     pub fn finish(
         &mut self,
         step: Step,
         picked: &[u32],
+        drafts: Option<&[i32]>,
         mut scored: Vec<Option<Scored>>,
     ) -> Vec<Seq> {
         self.counters.steps += 1;
         let mut done = Vec::new();
         for (si, &(ri, n)) in step.rows.iter().enumerate() {
+            let o0 = step.outs_at[si];
             let s = &mut self.running[ri];
+            let verifies = s.verifies(n);
+            // Tokens whose state stands: all of a prompt chunk; the last
+            // token and the accepted drafts of a verifying row.
+            let (fed, toks) = if verifies {
+                let mut j = 0;
+                while j < n - 1 && picked[o0 + j] == s.drafts[j] {
+                    j += 1;
+                }
+                self.counters.drafted += (n - 1) as u64;
+                self.counters.accepted += j as u64;
+                // Keep the slot holding the state after the last accepted
+                // token; return the others.
+                s.slot = s.outs[j];
+                for (k, &slot) in s.outs.iter().enumerate() {
+                    if k != j {
+                        self.free_slots.push(slot);
+                    }
+                }
+                s.outs.clear();
+                (j + 1, picked[o0..=o0 + j].to_vec())
+            } else {
+                (n, vec![picked[o0]])
+            };
             if s.in_prompt() {
                 self.counters.prompt_tokens += n as u64;
             } else {
-                self.counters.decode_tokens += n as u64;
+                self.counters.decode_tokens += fed as u64;
             }
-            s.fed += n;
+            s.fed += fed;
+            s.drafts.clear();
             if s.snap_at.first() == Some(&s.fed) {
                 s.snap_at.remove(0);
                 self.keep_prefix(ri);
@@ -793,30 +921,45 @@ impl Scheduler {
             if s.fed < s.total() {
                 continue; // mid-prompt chunk: its pick is not a token yet
             }
-            let tok = match &s.forced {
-                Some(f) => {
-                    if let Some(sc) = scored.get_mut(si).and_then(Option::take) {
-                        s.scored.push(sc);
+            let mut finished = false;
+            for pick in toks {
+                let tok = match &s.forced {
+                    Some(f) => {
+                        if let Some(sc) = scored.get_mut(si).and_then(Option::take) {
+                            s.scored.push(sc);
+                        }
+                        f[s.generated.len()]
                     }
-                    f[s.generated.len()]
+                    None => pick,
+                };
+                let stop = s.forced.is_none() && self.eos.contains(&tok);
+                if !stop {
+                    s.generated.push(tok);
+                    if s.req.sampling.adjusts_logits() {
+                        *s.counts.entry(tok).or_default() += 1;
+                    }
+                    let _ = s.req.tx.send(Event::Token(tok));
                 }
-                None => picked[si],
-            };
-            let stop = s.forced.is_none() && self.eos.contains(&tok);
-            if !stop {
-                s.generated.push(tok);
-                if s.req.sampling.adjusts_logits() {
-                    *s.counts.entry(tok).or_default() += 1;
+                if stop || s.generated.len() >= s.req.max_new {
+                    let _ = s.req.tx.send(Event::Done {
+                        finish: if stop { Finish::Stop } else { Finish::Length },
+                        prompt_tokens: s.req.prompt.len(),
+                        completion_tokens: s.generated.len(),
+                    });
+                    finished = true;
+                    break;
                 }
-                let _ = s.req.tx.send(Event::Token(tok));
             }
-            if stop || s.generated.len() >= s.req.max_new {
-                let _ = s.req.tx.send(Event::Done {
-                    finish: if stop { Finish::Stop } else { Finish::Length },
-                    prompt_tokens: s.req.prompt.len(),
-                    completion_tokens: s.generated.len(),
-                });
+            if finished {
                 done.push(ri);
+            } else if let Some(d) = drafts
+                && self.meta.spec > 1
+                && s.forced.is_none()
+                && !s.req.sampling.adjusts_logits()
+            {
+                let n = step.rows.len();
+                s.drafts
+                    .extend((0..self.meta.spec - 1).map(|k| d[k * n + si] as u32));
             }
         }
         done.sort_unstable_by(|a, b| b.cmp(a));
@@ -884,6 +1027,7 @@ mod tests {
             max_tokens,
             max_seqs,
             max_blocks: 8,
+            spec: 1,
         };
         Scheduler::new(meta, 8 * BLOCK_SIZE, blocks, vec![EOS])
     }
@@ -917,7 +1061,7 @@ mod tests {
         let mut m = vec![0; s.meta.words()];
         s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
         let (t, n) = (step.tokens, step.seqs());
-        let done = s.finish(step, &vec![pick; n], Vec::new());
+        let done = s.finish(step, &vec![pick; n], None, Vec::new());
         (t, n, done)
     }
 
@@ -927,6 +1071,7 @@ mod tests {
             max_tokens: 1024,
             max_seqs: 4,
             max_blocks: 64,
+            spec: 1,
         };
         let mut s =
             Scheduler::new(meta, 64 * BLOCK_SIZE, 64, vec![EOS]).with_prefix_cache(5..9, 999);
@@ -961,6 +1106,7 @@ mod tests {
             max_tokens: 512,
             max_seqs: 4,
             max_blocks: 64,
+            spec: 1,
         };
         let mut s = Scheduler::new(meta, 64 * BLOCK_SIZE, 64, vec![EOS]).with_prefix_cache(5..7, 0);
         let base: Vec<u32> = (1..=150).collect();
@@ -974,7 +1120,7 @@ mod tests {
         assert_eq!(st.tokens, 22);
         let mut m = vec![0; s.meta.words()];
         s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
-        s.finish(st, &[7], Vec::new());
+        s.finish(st, &[7], None, Vec::new());
         step(&mut s, 7);
         assert_eq!(tokens(&mut ra).0, vec![7, 7]);
         // The finished request's blocks past the prefix are free again; the
@@ -994,12 +1140,12 @@ mod tests {
         s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
         // Positions continue after the prefix, in the cache's blocks.
         assert_eq!(m[s.meta.pos()], 128);
-        s.finish(st, &[3], Vec::new());
+        s.finish(st, &[3], None, Vec::new());
         let st = s.plan().expect("work");
         assert_eq!(st.copies, vec![(0, 6)], "second entry");
         let mut m = vec![0; s.meta.words()];
         s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
-        s.finish(st, &[3], Vec::new());
+        s.finish(st, &[3], None, Vec::new());
         assert_eq!(tokens(&mut rb).0, vec![3]);
         // Both entries hold blocks; the second shares the first's 8.
         assert_eq!(s.load().free_kv_blocks, 64 - 12);
@@ -1050,7 +1196,7 @@ mod tests {
         // Tokens 0..16 fill the sequence's first block exactly.
         let first = m[me.block_table()];
         assert_eq!(m[me.slot_map() + 15], first * BLOCK_SIZE as i32 + 15);
-        s.finish(step, &[0], Vec::new());
+        s.finish(step, &[0], None, Vec::new());
         let step = s.plan().unwrap();
         s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
         assert_eq!(m[me.fresh()], 0, "second chunk continues the state");
@@ -1114,12 +1260,12 @@ mod tests {
             argmax: 3,
             top: vec![],
         };
-        s.finish(step1, &[3], vec![Some(sc)]);
+        s.finish(step1, &[3], None, vec![Some(sc)]);
         let step2 = s.plan().unwrap();
         let mut m = vec![0; s.meta.words()];
         s.fill(&step2, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
         assert_eq!(m[s.meta.ids()], 11, "the forced token, not the pick");
-        let done = s.finish(step2, &[4], vec![None]);
+        let done = s.finish(step2, &[4], None, vec![None]);
         assert_eq!(done[0].scored.len(), 1);
         assert_eq!(tokens(&mut ra), (vec![11, 12], Some(Finish::Length)));
     }
@@ -1141,7 +1287,7 @@ mod tests {
             let step = s.plan().unwrap();
             let mut m = vec![0; s.meta.words()];
             s.fill(&step, &mut m, &mut Pen::split(&mut words));
-            s.finish(step, &[pick], Vec::new());
+            s.finish(step, &[pick], None, Vec::new());
         }
         let step = s.plan().unwrap();
         let mut m = vec![0; s.meta.words()];
@@ -1166,7 +1312,7 @@ mod tests {
     fn padding_rows_point_at_the_scratch_slot() {
         let s = sched(4, 64, 64);
         let mut m = vec![0; s.meta.words()];
-        s.pad(&mut m, 0, 3);
+        s.pad(&mut m, 0, 3, 1);
         let me = s.meta;
         assert_eq!(&m[me.cu()..me.cu() + 4], &[0, 1, 2, 3]);
         assert_eq!(m[me.slots() + 2], 4);

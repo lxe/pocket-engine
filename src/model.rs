@@ -13,6 +13,9 @@ pub const GDN_DIM: usize = 128;
 pub const HEAD_DIM: usize = 256;
 pub const ROPE_DIM: usize = 64;
 pub const BLOCK_SIZE: usize = 16;
+/// Tokens drafts pick from (see Mtp::head): on Qwen3.5-9B, 65,536 keep
+/// almost every accepted draft of the full 248,320 at a quarter of the cost.
+const DRAFT_VOCAB: usize = 65_536;
 /// Keys per range of split decode attention.
 const ATTN_RANGE: usize = 2048;
 
@@ -53,6 +56,9 @@ pub struct Config {
     pub mrope_section: [usize; 3],
     /// Linear-attention value heads in GGUF's tiled order (see Source).
     pub tiled_v: bool,
+    /// Whether the model runs its multi-token-prediction layer, whose
+    /// attention takes one more KV cache layer.
+    pub mtp: bool,
 }
 
 impl Config {
@@ -109,6 +115,7 @@ impl Config {
                 _ => [11, 11, 10],
             },
             tiled_v: false,
+            mtp: false,
         };
         let check = |ok: bool, what: &str| {
             if ok {
@@ -236,6 +243,7 @@ impl Config {
                 [11, 11, 10]
             },
             tiled_v: true,
+            mtp: false,
         };
         let ok = u("attention.key_length")? == HEAD_DIM
             && u("ssm.state_size")? == GDN_DIM
@@ -269,7 +277,7 @@ impl Config {
         self.attn_layers.iter().filter(|a| !**a).count()
     }
     pub fn kv_layers(&self) -> usize {
-        self.attn_layers.iter().filter(|a| **a).count()
+        self.attn_layers.iter().filter(|a| **a).count() + self.mtp as usize
     }
     /// Recurrent and convolution state bytes per sequence slot, with the
     /// recurrent state in f32 or bf16.
@@ -311,8 +319,28 @@ struct Layer {
     w_down: Linear,
 }
 
+/// The multi-token-prediction layer: it drafts the token after next from a
+/// token's embedding and the model's final hidden state before it.
+struct Mtp {
+    /// [hidden x 2 hidden], over [norm_e(embedding) | norm_h(hidden)].
+    fc: Linear,
+    norm_e: Buf,
+    norm_h: Buf,
+    layer: Layer,
+    norm: Buf,
+    /// The output layer over the first `vocab` tokens only, which drafts
+    /// pick from: in BPE order these are the most common, and the full
+    /// output layer is the costliest part of a draft.
+    head: Linear,
+    vocab: usize,
+}
+
 struct Kernels {
     embed: Kernel,
+    mtp_tokens: Kernel,
+    mtp_input: Kernel,
+    mtp_accept: Kernel,
+    mtp_next: Kernel,
     rmsnorm: Kernel,
     silu_mul: Kernel,
     gdn_conv: Kernel,
@@ -343,6 +371,7 @@ pub struct Model {
     final_norm: Buf,
     inv_freq: Buf,
     layers: Vec<Layer>,
+    mtp: Option<Mtp>,
     k: Kernels,
     quants: Quants,
     /// Bytes of weights on the device.
@@ -378,35 +407,61 @@ impl Model {
         let up = |v: &[f32]| gpu.upload(&f32_bytes(v));
         let mut layers = Vec::with_capacity(cfg.layers);
         let (mut n_state, mut n_cache) = (0, 0);
+        let attn = |p: &str, quants: &mut Quants, cache: usize, load: Load| -> Result<Mixer> {
+            let a = format!("{p}self_attn.");
+            Ok(Mixer::Attn {
+                w_qkv: src.linear(
+                    gpu,
+                    quants,
+                    &[
+                        (&format!("{a}q_proj.weight"), 2 * cfg.hq * HEAD_DIM),
+                        (&format!("{a}k_proj.weight"), cfg.hkv * HEAD_DIM),
+                        (&format!("{a}v_proj.weight"), cfg.hkv * HEAD_DIM),
+                    ],
+                    h,
+                    load,
+                )?,
+                q_norm: up(&src.norm(&format!("{a}q_norm.weight"), HEAD_DIM)?)?,
+                k_norm: up(&src.norm(&format!("{a}k_norm.weight"), HEAD_DIM)?)?,
+                w_o: src.linear(
+                    gpu,
+                    quants,
+                    &[(&format!("{a}o_proj.weight"), h)],
+                    cfg.hq * HEAD_DIM,
+                    load,
+                )?,
+                cache,
+            })
+        };
+        let layer = |p: &str, mixer: Mixer, quants: &mut Quants, load: Load| -> Result<Layer> {
+            Ok(Layer {
+                mixer,
+                in_norm: up(&src.norm(&format!("{p}input_layernorm.weight"), h)?)?,
+                post_norm: up(&src.norm(&format!("{p}post_attention_layernorm.weight"), h)?)?,
+                w_gu: src.linear(
+                    gpu,
+                    quants,
+                    &[
+                        (&format!("{p}mlp.gate_proj.weight"), i),
+                        (&format!("{p}mlp.up_proj.weight"), i),
+                    ],
+                    h,
+                    load,
+                )?,
+                w_down: src.linear(
+                    gpu,
+                    quants,
+                    &[(&format!("{p}mlp.down_proj.weight"), h)],
+                    i,
+                    load,
+                )?,
+            })
+        };
         for l in 0..cfg.layers {
             let p = format!("layers.{l}.");
             let mixer = if cfg.attn_layers[l] {
-                let a = format!("{p}self_attn.");
-                let m = Mixer::Attn {
-                    w_qkv: src.linear(
-                        gpu,
-                        &mut quants,
-                        &[
-                            (&format!("{a}q_proj.weight"), 2 * cfg.hq * HEAD_DIM),
-                            (&format!("{a}k_proj.weight"), cfg.hkv * HEAD_DIM),
-                            (&format!("{a}v_proj.weight"), cfg.hkv * HEAD_DIM),
-                        ],
-                        h,
-                        load,
-                    )?,
-                    q_norm: up(&src.norm(&format!("{a}q_norm.weight"), HEAD_DIM)?)?,
-                    k_norm: up(&src.norm(&format!("{a}k_norm.weight"), HEAD_DIM)?)?,
-                    w_o: src.linear(
-                        gpu,
-                        &mut quants,
-                        &[(&format!("{a}o_proj.weight"), h)],
-                        cfg.hq * HEAD_DIM,
-                        load,
-                    )?,
-                    cache: n_cache,
-                };
                 n_cache += 1;
-                m
+                attn(&p, &mut quants, n_cache - 1, load)?
             } else {
                 let a = format!("{p}linear_attn.");
                 let hv = cfg.lin_v_heads;
@@ -440,29 +495,39 @@ impl Model {
                 n_state += 1;
                 m
             };
-            layers.push(Layer {
-                mixer,
-                in_norm: up(&src.norm(&format!("{p}input_layernorm.weight"), h)?)?,
-                post_norm: up(&src.norm(&format!("{p}post_attention_layernorm.weight"), h)?)?,
-                w_gu: src.linear(
-                    gpu,
-                    &mut quants,
-                    &[
-                        (&format!("{p}mlp.gate_proj.weight"), i),
-                        (&format!("{p}mlp.up_proj.weight"), i),
-                    ],
-                    h,
-                    load,
-                )?,
-                w_down: src.linear(
-                    gpu,
-                    &mut quants,
-                    &[(&format!("{p}mlp.down_proj.weight"), h)],
-                    i,
-                    load,
-                )?,
-            });
+            layers.push(layer(&p, mixer, &mut quants, load)?);
         }
+        let mtp = if load.mtp {
+            if !src.has("/mtp.fc.weight") {
+                return Err(Error::Config(
+                    "--mtp: this checkpoint has no multi-token-prediction layer".into(),
+                ));
+            }
+            let p = "/mtp.layers.0.";
+            // The fc input has no FP8 copy, so it stays in bf16.
+            let plain = Load {
+                quantize: false,
+                fp4: false,
+                ..load
+            };
+            let fc = src.linear(gpu, &mut quants, &[("/mtp.fc.weight", h)], 2 * h, plain)?;
+            if fc.fp8().is_some() {
+                return Err(Error::Config(
+                    "--mtp needs a bf16 or GGUF-quantized mtp.fc".into(),
+                ));
+            }
+            let mixer = attn(p, &mut quants, n_cache, load)?;
+            Some((
+                fc,
+                up(&src.norm("/mtp.pre_fc_norm_embedding.weight", h)?)?,
+                up(&src.norm("/mtp.pre_fc_norm_hidden.weight", h)?)?,
+                layer(p, mixer, &mut quants, load)?,
+                up(&src.norm("/mtp.norm.weight", h)?)?,
+            ))
+        } else {
+            None
+        };
+        cfg.mtp = mtp.is_some();
         let (embed, embed_kind) =
             src.shared(gpu, &mut quants, "embed_tokens.weight", cfg.vocab, h)?;
         // The output layer is its own tensor, or tied to the embedding.
@@ -480,6 +545,39 @@ impl Model {
                 cols: h,
             }
         };
+        let mtp = match mtp {
+            Some((fc, norm_e, norm_h, layer, norm)) => {
+                let vocab = DRAFT_VOCAB.min(cfg.vocab);
+                // Rows of a bf16 or row-blocked quantized matrix are a prefix.
+                let sliceable = lm_head.parts.len() == 1
+                    && matches!(lm_head.parts[0].kind, Kind::Bf16 | Kind::Quant(_));
+                let vocab = if sliceable { vocab } else { cfg.vocab };
+                let head = Linear {
+                    parts: lm_head
+                        .parts
+                        .iter()
+                        .map(|p| Part {
+                            buf: p.buf.clone(),
+                            kind: p.kind,
+                            scales: p.scales.clone(),
+                            rows: if sliceable { vocab } else { p.rows },
+                            off: p.off,
+                        })
+                        .collect(),
+                    cols: lm_head.cols,
+                };
+                Some(Mtp {
+                    fc,
+                    norm_e,
+                    norm_h,
+                    layer,
+                    norm,
+                    head,
+                    vocab,
+                })
+            }
+            None => None,
+        };
         let inv_freq: Vec<f32> = (0..ROPE_DIM / 2)
             .map(|d| 1f32 / cfg.rope_theta.powf((2 * d) as f64 / ROPE_DIM as f64) as f32)
             .collect();
@@ -494,6 +592,10 @@ impl Model {
         };
         let k = Kernels {
             embed: embed_kernel,
+            mtp_tokens: gpu.kernel("mtp_tokens")?,
+            mtp_input: gpu.kernel("mtp_input")?,
+            mtp_accept: gpu.kernel("mtp_accept")?,
+            mtp_next: gpu.kernel("mtp_next")?,
             rmsnorm: gpu.kernel("rmsnorm")?,
             silu_mul: gpu.kernel("silu_mul")?,
             gdn_conv: gpu.kernel("gdn_conv")?,
@@ -524,6 +626,7 @@ impl Model {
         };
         let largest = layers
             .iter()
+            .chain(mtp.as_ref().map(|m| &m.layer))
             .flat_map(|l| {
                 let mut v = vec![&l.w_gu, &l.w_down];
                 match &l.mixer {
@@ -533,12 +636,13 @@ impl Model {
                 v
             })
             .chain(std::iter::once(&lm_head))
+            .chain(mtp.as_ref().map(|m| &m.fc))
             .flat_map(|l| l.parts.iter().map(move |p| p.rows * l.cols))
             .max()
             .unwrap_or(0);
         quants.prepare(gpu, largest)?;
-        let mut weight_bytes = embed.bytes;
-        for l in &layers {
+        let mut weight_bytes = embed.bytes + mtp.as_ref().map_or(0, |m| m.fc.bytes());
+        for l in layers.iter().chain(mtp.as_ref().map(|m| &m.layer)) {
             weight_bytes += l.w_gu.bytes() + l.w_down.bytes();
             weight_bytes += match &l.mixer {
                 Mixer::Gdn { w_in, w_out, .. } => w_in.bytes() + w_out.bytes(),
@@ -556,6 +660,7 @@ impl Model {
             embed,
             lm_head,
             layers,
+            mtp,
             k,
             quants,
             weight_bytes,
@@ -653,14 +758,24 @@ impl State {
 
 /// Batch metadata layout (i32 words) in one device buffer, filled from a pinned
 /// staging buffer with a single copy per step.
+///
+/// Each sequence yields one output row (logits and a pick), or one per token
+/// when it verifies drafts: up to `spec` (drafts + 1), so per-output arrays
+/// hold `max_outs()`.
 #[derive(Clone, Copy, Debug)]
 pub struct Meta {
     pub max_tokens: usize,
     pub max_seqs: usize,
     pub max_blocks: usize,
+    /// Tokens a sequence verifying drafts feeds per step (drafts + 1); 1
+    /// without multi-token prediction.
+    pub spec: usize,
 }
 
 impl Meta {
+    pub fn max_outs(&self) -> usize {
+        self.max_seqs * self.spec
+    }
     pub fn ids(&self) -> usize {
         0
     }
@@ -681,8 +796,17 @@ impl Meta {
     pub fn rope(&self) -> usize {
         5 * self.max_tokens
     }
-    pub fn cu(&self) -> usize {
+    /// Per token, the token after it for the draft layer: an id, or -(r + 1)
+    /// for the pick of output row r.
+    pub fn mtp_ids(&self) -> usize {
         8 * self.max_tokens
+    }
+    /// Per token, the image pool row of the token after it, or -1.
+    pub fn mtp_src(&self) -> usize {
+        9 * self.max_tokens
+    }
+    pub fn cu(&self) -> usize {
+        10 * self.max_tokens
     }
     pub fn slots(&self) -> usize {
         self.cu() + self.max_seqs + 1
@@ -690,30 +814,44 @@ impl Meta {
     pub fn fresh(&self) -> usize {
         self.slots() + self.max_seqs
     }
-    pub fn last(&self) -> usize {
+    /// Per sequence, `spec` state slots to keep its state in after each of
+    /// its tokens when it verifies drafts; -1 first otherwise.
+    pub fn outs(&self) -> usize {
         self.fresh() + self.max_seqs
     }
+    /// Offsets of each sequence's output rows.
+    pub fn ocu(&self) -> usize {
+        self.outs() + self.max_outs()
+    }
+    /// Per output row, its token row.
+    pub fn last(&self) -> usize {
+        self.ocu() + self.max_seqs + 1
+    }
     pub fn temps(&self) -> usize {
-        self.last() + self.max_seqs
+        self.last() + self.max_outs()
     }
     pub fn seeds(&self) -> usize {
-        self.temps() + self.max_seqs
+        self.temps() + self.max_outs()
     }
     pub fn top_ks(&self) -> usize {
-        self.seeds() + self.max_seqs
+        self.seeds() + self.max_outs()
     }
     pub fn top_ps(&self) -> usize {
-        self.top_ks() + self.max_seqs
+        self.top_ks() + self.max_outs()
     }
     pub fn min_ps(&self) -> usize {
-        self.top_ps() + self.max_seqs
+        self.top_ps() + self.max_outs()
     }
-    /// Offsets of each sequence's penalty entries (see [`Act::pen_capacity`]).
+    /// Offsets of each output row's penalty entries (see [`Act::pen_capacity`]).
     pub fn pen_cu(&self) -> usize {
-        self.min_ps() + self.max_seqs
+        self.min_ps() + self.max_outs()
+    }
+    /// Per sequence, the last position it holds KV for (-1 for padding).
+    pub fn limits(&self) -> usize {
+        self.pen_cu() + self.max_outs() + 1
     }
     pub fn block_table(&self) -> usize {
-        self.pen_cu() + self.max_seqs + 1
+        self.limits() + self.max_seqs
     }
     pub fn words(&self) -> usize {
         self.block_table() + self.max_seqs * self.max_blocks
@@ -751,6 +889,30 @@ pub struct Act {
     pub pen_capacity: usize,
     /// FP8 copies of the projections' inputs, when the model has FP8 layers.
     fp8: Option<Fp8Acts>,
+    /// The draft layer's buffers, with multi-token prediction.
+    mtp: Option<MtpActs>,
+}
+
+struct MtpActs {
+    /// Per token row: the token its draft input embeds.
+    tok: Buf,
+    /// Per token row: [norm_e(embedding) | norm_h(hidden)].
+    cat: Buf,
+    /// Per sequence: the token row it drafts from.
+    rows: Buf,
+    /// Zero temperatures: drafts are greedy.
+    zeros: Buf,
+    logits: Buf,
+    /// `spec - 1` drafts per sequence, draft k of sequence s at k * S + s.
+    drafts: Buf,
+    pub drafts_host: Pinned,
+    /// Later draft passes' metadata: positions, KV slots, rotary positions
+    /// (three rows of S), 0..=S (token-to-sequence map and offsets), and -1s.
+    dpos: Buf,
+    dslot: Buf,
+    drope: Buf,
+    iota: Buf,
+    neg: Buf,
 }
 
 /// FP8 values and scales of each projection input: the normalized hidden
@@ -762,7 +924,7 @@ struct Fp8Acts {
     act: (Buf, Buf),
     core: (Buf, Buf),
     ao: (Buf, Buf),
-    /// The final norm's output, one row per sequence, for an FP8 or FP4
+    /// The final norm's output, one per output row, for an FP8 or FP4
     /// output layer.
     fin: (Buf, Buf),
 }
@@ -778,6 +940,7 @@ impl Act {
         fp8: Option<Fp8Mode>,
     ) -> Result<Self> {
         let (t, s) = (meta.max_tokens, meta.max_seqs);
+        let outs = meta.max_outs();
         let fp8 = match fp8 {
             None => None,
             Some(mode) => {
@@ -789,7 +952,7 @@ impl Act {
                         gpu.alloc_zeroed(mode.act_scale_bytes(rows, k))?,
                     ))
                 };
-                let fin_rows = (s + 4).next_multiple_of(128);
+                let fin_rows = (outs + 4).next_multiple_of(128);
                 Some(Fp8Acts {
                     mode,
                     xn: pair(cfg.hidden)?,
@@ -808,7 +971,7 @@ impl Act {
         let pen_capacity = s * (meta.max_blocks * BLOCK_SIZE + 1024);
         let ranges = attn_ranges(meta.max_blocks * BLOCK_SIZE);
         let attn_part = if ranges > 1 {
-            Some(gpu.alloc(s * cfg.hq * ranges * (HEAD_DIM + 2) * 4)?)
+            Some(gpu.alloc(outs * cfg.hq * ranges * (HEAD_DIM + 2) * 4)?)
         } else {
             None
         };
@@ -826,15 +989,37 @@ impl Act {
             ao: b(t * cfg.hq * HEAD_DIM)?,
             gu: b(t * 2 * cfg.inter)?,
             act: b(t * cfg.inter)?,
-            fin: b(s * cfg.hidden)?,
-            logits: gpu.alloc_zeroed(s * cfg.vocab * 4)?,
+            fin: b(outs * cfg.hidden)?,
+            logits: gpu.alloc_zeroed(outs * cfg.vocab * 4)?,
             pool: gpu.alloc_zeroed(pool_rows.max(1) * cfg.hidden * 2)?,
-            ids_out: gpu.alloc_zeroed(s * 4)?,
-            ids_host: gpu.pinned(s * 4)?,
+            ids_out: gpu.alloc_zeroed(outs * 4)?,
+            ids_host: gpu.pinned(outs * 4)?,
             pen_dev: gpu.alloc_zeroed(3 * pen_capacity * 4)?,
             pen_staging: gpu.pinned(3 * pen_capacity * 4)?,
             pen_capacity,
             fp8,
+            mtp: if cfg.mtp {
+                Some(MtpActs {
+                    tok: gpu.alloc_zeroed(t * 4)?,
+                    cat: b(t * 2 * cfg.hidden)?,
+                    rows: gpu.alloc_zeroed(s * 4)?,
+                    zeros: gpu.alloc_zeroed(s * 4)?,
+                    logits: gpu.alloc_zeroed(s * cfg.vocab * 4)?,
+                    drafts: gpu.alloc_zeroed(outs * 4)?,
+                    drafts_host: gpu.pinned(outs * 4)?,
+                    dpos: gpu.alloc_zeroed(s * 4)?,
+                    dslot: gpu.alloc_zeroed(s * 4)?,
+                    drope: gpu.alloc_zeroed(3 * s * 4)?,
+                    iota: gpu.upload(
+                        &(0..=s as i32)
+                            .flat_map(|i| i.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                    )?,
+                    neg: gpu.upload(&vec![0xffu8; outs * 4])?,
+                })
+            } else {
+                None
+            },
             meta,
         })
     }
@@ -894,24 +1079,82 @@ impl Act {
         Ok(())
     }
 
-    /// Queues the copy of the picked tokens of the first `s` sequences.
-    pub fn download_ids(&mut self, gpu: &Gpu, s: usize) -> Result<()> {
-        gpu.dtoh(&mut self.ids_host, self.ids_out.ptr, s * 4)
+    /// Queues the copy of the picks of the first `r` output rows, and of the
+    /// first `s` sequences' drafts.
+    pub fn download_ids(&mut self, gpu: &Gpu, r: usize, s: usize) -> Result<()> {
+        gpu.dtoh(&mut self.ids_host, self.ids_out.ptr, r * 4)?;
+        let k = self.meta.spec - 1;
+        if let Some(m) = &mut self.mtp {
+            gpu.dtoh(&mut m.drafts_host, m.drafts.ptr, k * s * 4)?;
+        }
+        Ok(())
+    }
+
+    /// The drafts downloaded with the last step's picks, if the model drafts:
+    /// draft k of sequence i at k * s + i.
+    pub fn drafts(&self, s: usize) -> Option<&[i32]> {
+        let k = self.meta.spec - 1;
+        self.mtp
+            .as_ref()
+            .map(|m| &m.drafts_host.as_slice::<i32>()[..k * s])
+    }
+}
+
+/// Where a layer reads its batch metadata: the step's (see [`Meta`]), or a
+/// draft pass's, which the GPU computes.
+#[derive(Clone, Copy)]
+struct View {
+    pos: u64,
+    slot_map: u64,
+    tok_seq: u64,
+    rope: u64,
+    rope_stride: usize,
+    cu: u64,
+    slots: u64,
+    fresh: u64,
+    outs: u64,
+    block_table: u64,
+}
+
+impl View {
+    fn of(a: &Act) -> Self {
+        let me = &a.meta;
+        Self {
+            pos: a.m(me.pos()),
+            slot_map: a.m(me.slot_map()),
+            tok_seq: a.m(me.tok_seq()),
+            rope: a.m(me.rope()),
+            rope_stride: me.max_tokens,
+            cu: a.m(me.cu()),
+            slots: a.m(me.slots()),
+            fresh: a.m(me.fresh()),
+            outs: a.m(me.outs()),
+            block_table: a.m(me.block_table()),
+        }
     }
 }
 
 impl Model {
     /// Queues one step over `t` tokens from `s` sequences, as described by the
-    /// uploaded metadata, ending with one picked token per sequence. Issues no
-    /// host synchronization and no allocation, so it can be captured.
-    pub fn forward(&self, gpu: &Gpu, st: &State, a: &Act, t: usize, s: usize) -> Result<()> {
+    /// uploaded metadata, ending with picks for `r` output rows (one per
+    /// sequence, or one per token of a sequence verifying drafts) and, with
+    /// multi-token prediction, one draft per sequence. Issues no host
+    /// synchronization and no allocation, so it can be captured.
+    pub fn forward(
+        &self,
+        gpu: &Gpu,
+        st: &State,
+        a: &Act,
+        t: usize,
+        s: usize,
+        r: usize,
+    ) -> Result<()> {
         use Arg::{F, I, P};
         let c = &self.cfg;
         let k = &self.k;
-        let q = &self.quants;
         let me = &a.meta;
         let (h, eps) = (c.hidden, c.eps);
-        let (ti, si) = (t as u32, s as u32);
+        let (ti, ri) = (t as u32, r as u32);
         gpu.launch(
             k.embed,
             (ti, 1, 1),
@@ -926,6 +1169,359 @@ impl Model {
                 I(h as i32),
             ],
         )?;
+        let v = View::of(a);
+        for (li, layer) in self.layers.iter().enumerate() {
+            self.layer(gpu, st, a, &v, layer, li > 0, t, s)?;
+        }
+        gpu.launch(
+            k.rmsnorm,
+            (ri, 1, 1),
+            256,
+            0,
+            &[
+                P(a.h.ptr),
+                P(a.res.ptr),
+                P(self.final_norm.ptr),
+                P(a.fin.ptr),
+                P(a.m(me.last())),
+                I(h as i32),
+                F(eps),
+                I(1),
+                I(0),
+            ]
+            .into_iter()
+            .chain(a.fp8_args(|f| &f.fin, r))
+            .collect::<Vec<_>>(),
+        )?;
+        self.lm_head.forward(
+            gpu,
+            &self.quants,
+            a.input(&a.fin, |f| &f.fin),
+            r,
+            a.logits.ptr,
+            c.vocab,
+            true,
+        )?;
+        let cap = (4 * a.pen_capacity) as u64;
+        gpu.launch(
+            k.penalize,
+            (ri, 1, 1),
+            256,
+            0,
+            &[
+                P(a.logits.ptr),
+                I(c.vocab as i32),
+                P(a.m(me.pen_cu())),
+                P(a.pen_dev.ptr),
+                P(a.pen_dev.ptr + cap),
+                P(a.pen_dev.ptr + 2 * cap),
+            ],
+        )?;
+        gpu.launch(
+            k.sample,
+            (ri, 1, 1),
+            1024,
+            0,
+            &[
+                P(a.logits.ptr),
+                I(c.vocab as i32),
+                P(a.m(me.temps())),
+                P(a.m(me.top_ks())),
+                P(a.m(me.top_ps())),
+                P(a.m(me.min_ps())),
+                P(a.m(me.seeds())),
+                P(a.ids_out.ptr),
+            ],
+        )?;
+        if let (Some(m), Some(ma)) = (&self.mtp, &a.mtp) {
+            self.draft(gpu, st, a, m, ma, t, s)?;
+        }
+        Ok(())
+    }
+
+    /// The draft layer over every token row: each row's input is the token
+    /// after it (known, or just picked) and the model's final hidden state
+    /// at it, so its KV cache follows the model's. Each sequence then drafts
+    /// greedily from one row: its last, or its last accepted one.
+    #[allow(clippy::too_many_arguments)]
+    fn draft(
+        &self,
+        gpu: &Gpu,
+        st: &State,
+        a: &Act,
+        m: &Mtp,
+        ma: &MtpActs,
+        t: usize,
+        s: usize,
+    ) -> Result<()> {
+        use Arg::{F, I, P};
+        let c = &self.cfg;
+        let k = &self.k;
+        let me = &a.meta;
+        let (h, eps) = (c.hidden, c.eps);
+        let (ti, si) = (t as u32, s as u32);
+        gpu.launch(
+            k.mtp_tokens,
+            (ti.div_ceil(256), 1, 1),
+            256,
+            0,
+            &[
+                P(a.m(me.mtp_ids())),
+                P(a.ids_out.ptr),
+                P(ma.tok.ptr),
+                I(t as i32),
+            ],
+        )?;
+        gpu.launch(
+            k.embed,
+            (ti, 1, 1),
+            256,
+            0,
+            &[
+                P(ma.tok.ptr),
+                P(self.embed.ptr),
+                P(a.m(me.mtp_src())),
+                P(a.pool.ptr),
+                P(a.xn.ptr),
+                I(h as i32),
+            ],
+        )?;
+        gpu.launch(
+            k.mtp_input,
+            (ti, 1, 1),
+            256,
+            0,
+            &[
+                P(a.xn.ptr),
+                P(a.h.ptr),
+                P(a.res.ptr),
+                P(self.final_norm.ptr),
+                P(m.norm_e.ptr),
+                P(m.norm_h.ptr),
+                P(ma.cat.ptr),
+                I(h as i32),
+                F(eps),
+            ],
+        )?;
+        m.fc.forward(
+            gpu,
+            &self.quants,
+            Input::bf16(ma.cat.ptr),
+            t,
+            a.res.ptr,
+            h,
+            false,
+        )?;
+        self.layer(gpu, st, a, &View::of(a), &m.layer, false, t, s)?;
+        gpu.launch(
+            k.mtp_accept,
+            (si.div_ceil(128), 1, 1),
+            128,
+            0,
+            &[
+                P(a.m(me.ids())),
+                P(a.m(me.cu())),
+                P(a.m(me.ocu())),
+                P(a.ids_out.ptr),
+                P(a.m(me.outs())),
+                I(me.spec as i32),
+                P(ma.rows.ptr),
+                I(s as i32),
+            ],
+        )?;
+        gpu.launch(
+            k.rmsnorm,
+            (si, 1, 1),
+            256,
+            0,
+            &[
+                P(a.h.ptr),
+                P(a.res.ptr),
+                P(m.norm.ptr),
+                P(a.fin.ptr),
+                P(ma.rows.ptr),
+                I(h as i32),
+                F(eps),
+                I(1),
+                I(0),
+            ]
+            .into_iter()
+            .chain(a.fp8_args(|f| &f.fin, s))
+            .collect::<Vec<_>>(),
+        )?;
+        m.head.forward(
+            gpu,
+            &self.quants,
+            a.input(&a.fin, |f| &f.fin),
+            s,
+            ma.logits.ptr,
+            m.vocab,
+            true,
+        )?;
+        gpu.launch(
+            k.sample,
+            (si, 1, 1),
+            1024,
+            0,
+            &[
+                P(ma.logits.ptr),
+                I(m.vocab as i32),
+                P(ma.zeros.ptr),
+                P(a.m(me.top_ks())),
+                P(a.m(me.top_ps())),
+                P(a.m(me.min_ps())),
+                P(a.m(me.seeds())),
+                P(ma.drafts.ptr),
+            ],
+        )?;
+        // Further drafts: each from the last draft and the draft layer's own
+        // output, one position on.
+        let view = View {
+            pos: ma.dpos.ptr,
+            slot_map: ma.dslot.ptr,
+            tok_seq: ma.iota.ptr,
+            rope: ma.drope.ptr,
+            rope_stride: s,
+            cu: ma.iota.ptr,
+            slots: a.m(me.slots()),
+            fresh: a.m(me.fresh()),
+            outs: ma.neg.ptr,
+            block_table: a.m(me.block_table()),
+        };
+        for d in 1..me.spec - 1 {
+            gpu.launch(
+                k.mtp_next,
+                (si.div_ceil(128), 1, 1),
+                128,
+                0,
+                &[
+                    P(ma.rows.ptr),
+                    P(a.m(me.pos())),
+                    P(a.m(me.rope())),
+                    I(me.max_tokens as i32),
+                    P(a.m(me.block_table())),
+                    I(me.max_blocks as i32),
+                    I(BLOCK_SIZE as i32),
+                    P(a.m(me.limits())),
+                    I(d as i32),
+                    P(ma.dpos.ptr),
+                    P(ma.dslot.ptr),
+                    P(ma.drope.ptr),
+                    I(s as i32),
+                ],
+            )?;
+            gpu.launch(
+                k.embed,
+                (si, 1, 1),
+                256,
+                0,
+                &[
+                    P(ma.drafts.ptr + (4 * (d - 1) * s) as u64),
+                    P(self.embed.ptr),
+                    P(ma.neg.ptr),
+                    P(a.pool.ptr),
+                    P(a.xn.ptr),
+                    I(h as i32),
+                ],
+            )?;
+            gpu.launch(
+                k.mtp_input,
+                (si, 1, 1),
+                256,
+                0,
+                &[
+                    P(a.xn.ptr),
+                    P(0),
+                    P(a.fin.ptr),
+                    P(self.final_norm.ptr),
+                    P(m.norm_e.ptr),
+                    P(m.norm_h.ptr),
+                    P(ma.cat.ptr),
+                    I(h as i32),
+                    F(eps),
+                ],
+            )?;
+            m.fc.forward(
+                gpu,
+                &self.quants,
+                Input::bf16(ma.cat.ptr),
+                s,
+                a.res.ptr,
+                h,
+                false,
+            )?;
+            self.layer(gpu, st, a, &view, &m.layer, false, s, s)?;
+            gpu.launch(
+                k.rmsnorm,
+                (si, 1, 1),
+                256,
+                0,
+                &[
+                    P(a.h.ptr),
+                    P(a.res.ptr),
+                    P(m.norm.ptr),
+                    P(a.fin.ptr),
+                    P(0),
+                    I(h as i32),
+                    F(eps),
+                    I(1),
+                    I(0),
+                ]
+                .into_iter()
+                .chain(a.fp8_args(|f| &f.fin, s))
+                .collect::<Vec<_>>(),
+            )?;
+            m.head.forward(
+                gpu,
+                &self.quants,
+                a.input(&a.fin, |f| &f.fin),
+                s,
+                ma.logits.ptr,
+                m.vocab,
+                true,
+            )?;
+            gpu.launch(
+                k.sample,
+                (si, 1, 1),
+                1024,
+                0,
+                &[
+                    P(ma.logits.ptr),
+                    I(m.vocab as i32),
+                    P(ma.zeros.ptr),
+                    P(a.m(me.top_ks())),
+                    P(a.m(me.top_ps())),
+                    P(a.m(me.min_ps())),
+                    P(a.m(me.seeds())),
+                    P(ma.drafts.ptr + (4 * d * s) as u64),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// One decoder layer over the step's tokens. The first layer's input
+    /// norm reads the residual stream alone (`add` false).
+    #[allow(clippy::too_many_arguments)]
+    fn layer(
+        &self,
+        gpu: &Gpu,
+        st: &State,
+        a: &Act,
+        v: &View,
+        layer: &Layer,
+        add: bool,
+        t: usize,
+        s: usize,
+    ) -> Result<()> {
+        use Arg::{F, I, P};
+        let c = &self.cfg;
+        let k = &self.k;
+        let q = &self.quants;
+        let me = &a.meta;
+        let (h, eps) = (c.hidden, c.eps);
+        let (ti, si) = (t as u32, s as u32);
+        let outs = [P(v.outs), I(me.spec as i32)];
         let xn_in = a.input(&a.xn, |f| &f.xn);
         let norm = |x: u64, w: &Buf, add: bool| -> Result<()> {
             let mut args = vec![
@@ -942,8 +1538,8 @@ impl Model {
             args.extend(a.fp8_args(|f| &f.xn, t));
             gpu.launch(k.rmsnorm, (ti, 1, 1), 256, 0, &args)
         };
-        for (li, layer) in self.layers.iter().enumerate() {
-            norm(a.h.ptr, &layer.in_norm, li > 0)?;
+        {
+            norm(a.h.ptr, &layer.in_norm, add)?;
             match &layer.mixer {
                 Mixer::Gdn {
                     w_in,
@@ -967,10 +1563,12 @@ impl Model {
                             P(conv_w.ptr),
                             P(st.conv[*state].ptr),
                             P(a.conv.ptr),
-                            P(a.m(me.cu())),
-                            P(a.m(me.slots())),
-                            P(a.m(me.fresh())),
+                            P(v.cu),
+                            P(v.slots),
+                            P(v.fresh),
                             I(cd as i32),
+                            outs[0],
+                            outs[1],
                         ],
                     )?;
                     let args = [
@@ -985,9 +1583,9 @@ impl Model {
                         P(norm_w.ptr),
                         P(st.rec[*state].ptr),
                         I(st.state_bf16 as i32),
-                        P(a.m(me.cu())),
-                        P(a.m(me.slots())),
-                        P(a.m(me.fresh())),
+                        P(v.cu),
+                        P(v.slots),
+                        P(v.fresh),
                         P(a.core.ptr),
                         F(eps),
                         I(c.tiled_v as i32),
@@ -999,7 +1597,7 @@ impl Model {
                             (si, hv as u32, 1),
                             2 * GDN_DIM as u32,
                             GDN_CHUNK_SMEM as u32,
-                            &[args.as_slice(), &a.fp8_args(|f| &f.core, t)].concat(),
+                            &[args.as_slice(), &a.fp8_args(|f| &f.core, t), &outs].concat(),
                         )?;
                         gpu.launch(
                             k.gdn_norm,
@@ -1016,11 +1614,12 @@ impl Model {
                                     P(a.core.ptr),
                                     I(t as i32),
                                     F(eps),
-                                    P(a.m(me.cu())),
-                                    P(a.m(me.tok_seq())),
+                                    P(v.cu),
+                                    P(v.tok_seq),
                                 ]
                                 .as_slice(),
                                 &a.fp8_args(|f| &f.core, t),
+                                &outs,
                             ]
                             .concat(),
                         )?;
@@ -1030,7 +1629,7 @@ impl Model {
                             (si, hv as u32, 1),
                             2 * GDN_DIM as u32,
                             0,
-                            &[args.as_slice(), &a.fp8_args(|f| &f.core, t)].concat(),
+                            &[args.as_slice(), &a.fp8_args(|f| &f.core, t), &outs].concat(),
                         )?;
                     }
                     w_out.forward(gpu, q, a.input(&a.core, |f| &f.core), t, a.h.ptr, h, false)?;
@@ -1057,11 +1656,11 @@ impl Model {
                             I(c.hkv as i32),
                             P(q_norm.ptr),
                             P(k_norm.ptr),
-                            P(a.m(me.rope())),
-                            I(me.max_tokens as i32),
+                            P(v.rope),
+                            I(v.rope_stride as i32),
                             I(c.mrope_section[1] as i32),
                             I(c.mrope_section[2] as i32),
-                            P(a.m(me.slot_map())),
+                            P(v.slot_map),
                             P(self.inv_freq.ptr),
                             P(a.q.ptr),
                             P(st.kc[*cache].ptr),
@@ -1088,9 +1687,9 @@ impl Model {
                             I(qs as i32),
                             I(c.hq as i32),
                             I(c.hkv as i32),
-                            P(a.m(me.pos())),
-                            P(a.m(me.tok_seq())),
-                            P(a.m(me.block_table())),
+                            P(v.pos),
+                            P(v.tok_seq),
+                            P(v.block_table),
                             I(me.max_blocks as i32),
                             I(BLOCK_SIZE as i32),
                             P(a.ao.ptr),
@@ -1103,10 +1702,12 @@ impl Model {
                             [P(0), P(0), I(0), I(0)]
                         })
                         .chain([
-                            P(a.m(me.cu())),
+                            P(v.cu),
                             I((t > s) as i32),
                             I(ATTN_RANGE as i32),
                             P(part),
+                            outs[0],
+                            outs[1],
                         ])
                         .collect::<Vec<_>>(),
                     )?;
@@ -1125,14 +1726,15 @@ impl Model {
                                     P(a.proj.ptr),
                                     I(qs as i32),
                                     I(c.hq as i32),
-                                    P(a.m(me.pos())),
-                                    P(a.m(me.tok_seq())),
-                                    P(a.m(me.cu())),
+                                    P(v.pos),
+                                    P(v.tok_seq),
+                                    P(v.cu),
                                     I((t > s) as i32),
                                     P(a.ao.ptr),
                                 ]
                                 .as_slice(),
                                 &a.fp8_args(|f| &f.ao, t),
+                                &outs,
                             ]
                             .concat(),
                         )?;
@@ -1160,14 +1762,16 @@ impl Model {
                                 I(qs as i32),
                                 I(c.hq as i32),
                                 I(c.hkv as i32),
-                                P(a.m(me.pos())),
-                                P(a.m(me.cu())),
+                                P(v.pos),
+                                P(v.cu),
                                 I(s as i32),
-                                P(a.m(me.block_table())),
+                                P(v.block_table),
                                 I(me.max_blocks as i32),
                                 I(BLOCK_SIZE as i32),
                                 P(a.ao.ptr),
                                 F(1.0 / (HEAD_DIM as f32).sqrt()),
+                                outs[0],
+                                outs[1],
                             ],
                         )?;
                         if a.fp8.is_some() {
@@ -1214,66 +1818,7 @@ impl Model {
                 .w_down
                 .forward(gpu, q, a.input(&a.act, |f| &f.act), t, a.h.ptr, h, false)?;
         }
-        gpu.launch(
-            k.rmsnorm,
-            (si, 1, 1),
-            256,
-            0,
-            &[
-                P(a.h.ptr),
-                P(a.res.ptr),
-                P(self.final_norm.ptr),
-                P(a.fin.ptr),
-                P(a.m(me.last())),
-                I(h as i32),
-                F(eps),
-                I(1),
-                I(0),
-            ]
-            .into_iter()
-            .chain(a.fp8_args(|f| &f.fin, s))
-            .collect::<Vec<_>>(),
-        )?;
-        self.lm_head.forward(
-            gpu,
-            q,
-            a.input(&a.fin, |f| &f.fin),
-            s,
-            a.logits.ptr,
-            c.vocab,
-            true,
-        )?;
-        let cap = (4 * a.pen_capacity) as u64;
-        gpu.launch(
-            k.penalize,
-            (si, 1, 1),
-            256,
-            0,
-            &[
-                P(a.logits.ptr),
-                I(c.vocab as i32),
-                P(a.m(me.pen_cu())),
-                P(a.pen_dev.ptr),
-                P(a.pen_dev.ptr + cap),
-                P(a.pen_dev.ptr + 2 * cap),
-            ],
-        )?;
-        gpu.launch(
-            k.sample,
-            (si, 1, 1),
-            1024,
-            0,
-            &[
-                P(a.logits.ptr),
-                I(c.vocab as i32),
-                P(a.m(me.temps())),
-                P(a.m(me.top_ks())),
-                P(a.m(me.top_ps())),
-                P(a.m(me.min_ps())),
-                P(a.m(me.seeds())),
-                P(a.ids_out.ptr),
-            ],
-        )
+        Ok(())
     }
 }
 
@@ -1334,6 +1879,7 @@ mod tests {
             max_tokens: 64,
             max_seqs: 8,
             max_blocks: 4,
+            spec: 3,
         };
         let starts = [
             m.ids(),
@@ -1342,9 +1888,13 @@ mod tests {
             m.tok_seq(),
             m.emb_src(),
             m.rope(),
+            m.mtp_ids(),
+            m.mtp_src(),
             m.cu(),
             m.slots(),
             m.fresh(),
+            m.outs(),
+            m.ocu(),
             m.last(),
             m.temps(),
             m.seeds(),
@@ -1352,6 +1902,7 @@ mod tests {
             m.top_ps(),
             m.min_ps(),
             m.pen_cu(),
+            m.limits(),
             m.block_table(),
             m.words(),
         ];

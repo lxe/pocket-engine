@@ -84,6 +84,14 @@ __device__ __forceinline__ uint4 pack8(const float* f) {
 
 #include "fp8.cuh"
 
+// Speculative decoding: a sequence that verifies drafts names, in
+// outs[s * spec + i], the state slot to keep its state in after its token i.
+// Its tokens are decode tokens (paged attention, the per-token recurrence)
+// even though there are several. outs[s * spec] < 0 for other sequences.
+__device__ __forceinline__ bool is_spec(const int* outs, int spec, int s) {
+    return outs && outs[(size_t)s * spec] >= 0;
+}
+
 // out[t] = table[ids[t]], or row emb_src[t] of the image embedding pool when
 // that is not negative.
 extern "C" __global__ void embed(const int* __restrict__ ids, const bf16* __restrict__ table,
@@ -182,13 +190,14 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
                                     const float* __restrict__ w, bf16* __restrict__ state,
                                     bf16* __restrict__ out, const int* __restrict__ cu,
                                     const int* __restrict__ slots, const int* __restrict__ fresh,
-                                    int C) {
+                                    int C, const int* __restrict__ outs, int spec) {
     const int s = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const int t0 = cu[s], t1 = cu[s + 1];
     if (t0 == t1) return;
     bf16* st = state + (size_t)slots[s] * 3 * C;
+    const bool keep = is_spec(outs, spec, s);
     float x0 = 0.f, x1 = 0.f, x2 = 0.f;
     if (!fresh[s]) {
         x0 = b2f(st[c]);
@@ -215,8 +224,15 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
             x0 = x1;
             x1 = x2;
             x2 = x3;
+            if (keep) {
+                bf16* o = state + (size_t)outs[(size_t)s * spec + (t + u - t0)] * 3 * C;
+                o[c] = f2b(x0);
+                o[C + c] = f2b(x1);
+                o[2 * C + c] = f2b(x2);
+            }
         }
     }
+    if (keep) return;
     st[c] = f2b(x0);
     st[C + c] = f2b(x1);
     st[2 * C + c] = f2b(x2);
@@ -237,7 +253,7 @@ __device__ __forceinline__ void gdn_one(int s, int h, const bf16* __restrict__ c
                                         void* __restrict__ state, int state_bf16, const int* __restrict__ cu,
                                         const int* __restrict__ slots, const int* __restrict__ fresh,
                                         bf16* __restrict__ out, float eps, int tiled, uint8_t* fq, void* fs,
-                                        int fmode, int frows) {
+                                        int fmode, int frows, const int* __restrict__ outs, int spec) {
     __shared__ float qs[GDN_DIM], ks[GDN_DIM], sh[32], ys[GDN_DIM];
     const Fp8Out fo{fq, fs, fmode, frows};
     const int tid = threadIdx.x;
@@ -257,8 +273,9 @@ __device__ __forceinline__ void gdn_one(int s, int h, const bf16* __restrict__ c
         const int at = (i0 + i) * GDN_DIM + j;
         r[i] = is_fresh ? 0.f : state_bf16 ? b2f(Sb[at]) : S[at];
     }
-    // Prefill rounds the normalized q and k to bf16; single-token decode keeps f32.
-    const bool round_qk = (t1 - t0) > 1 || is_fresh;
+    // Prefill rounds the normalized q and k to bf16; decode keeps f32.
+    const bool keep = is_spec(outs, spec, s);
+    const bool round_qk = ((t1 - t0) > 1 && !keep) || is_fresh;
     const float na = neg_a[h], db = dt_bias[h], nw = norm_w[j];
     const float qscale = rsqrtf((float)GDN_DIM);
     for (int t = t0; t < t1; t++) {
@@ -323,7 +340,18 @@ __device__ __forceinline__ void gdn_one(int s, int h, const bf16* __restrict__ c
             }
             __syncthreads();
         }
+        if (keep) {
+            // The state after each token, so rejected drafts cost nothing.
+            const size_t kb = ((size_t)outs[(size_t)s * spec + (t - t0)] * Hv + h) * GDN_DIM * GDN_DIM;
+#pragma unroll
+            for (int i = 0; i < GDN_HALF; i++) {
+                const int at = (i0 + i) * GDN_DIM + j;
+                if (state_bf16) ((bf16*)state)[kb + at] = f2b(r[i]);
+                else ((float*)state)[kb + at] = r[i];
+            }
+        }
     }
+    if (keep) return;
 #pragma unroll
     for (int i = 0; i < GDN_HALF; i++) {
         const int at = (i0 + i) * GDN_DIM + j;
@@ -332,23 +360,18 @@ __device__ __forceinline__ void gdn_one(int s, int h, const bf16* __restrict__ c
     }
 }
 
-extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
-    gdn_recurrent(const bf16* __restrict__ conv, const bf16* __restrict__ proj, int pstride, int C, int Hk, int Hv,
-                  const float* __restrict__ neg_a, const float* __restrict__ dt_bias, const float* __restrict__ norm_w,
-                  void* __restrict__ state, int state_bf16, const int* __restrict__ cu, const int* __restrict__ slots,
-                  const int* __restrict__ fresh, bf16* __restrict__ out, float eps, int tiled, uint8_t* fq, void* fs,
-                  int fmode, int frows) {
-    gdn_one(blockIdx.x, blockIdx.y, conv, proj, pstride, C, Hk, Hv, neg_a, dt_bias, norm_w, state, state_bf16, cu,
-            slots, fresh, out, eps, tiled, fq, fs, fmode, frows);
-}
-
 #define GDN_ARGS                                                                                       \
     const bf16 *__restrict__ conv, const bf16 *__restrict__ proj, int pstride, int C, int Hk, int Hv,  \
         const float *__restrict__ neg_a, const float *__restrict__ dt_bias,                            \
         const float *__restrict__ norm_w, void *__restrict__ state, int state_bf16,                    \
         const int *__restrict__ cu, const int *__restrict__ slots, const int *__restrict__ fresh,       \
-        bf16 *__restrict__ out, float eps, int tiled, uint8_t *fq, void *fs, int fmode, int frows
-#define GDN_PASS conv, proj, pstride, C, Hk, Hv, neg_a, dt_bias, norm_w, state, state_bf16, cu, slots, fresh, out, eps, tiled, fq, fs, fmode, frows
+        bf16 *__restrict__ out, float eps, int tiled, uint8_t *fq, void *fs, int fmode, int frows,       \
+        const int *__restrict__ outs, int spec
+#define GDN_PASS conv, proj, pstride, C, Hk, Hv, neg_a, dt_bias, norm_w, state, state_bf16, cu, slots, fresh, out, eps, tiled, fq, fs, fmode, frows, outs, spec
+
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_recurrent(GDN_ARGS) {
+    gdn_one(blockIdx.x, blockIdx.y, GDN_PASS);
+}
 
 // The gated delta rule for prompts, in chunks of GC tokens on tensor cores
 // (the chunked form FLA and FlashInfer use). With G the cumulative log decay
@@ -427,9 +450,8 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_chunk(GDN_ARGS) {
     const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
     const int t0 = cu[s], t1 = cu[s + 1];
     if (t0 == t1) return;
-    if (t1 - t0 == 1) {
-        gdn_one(s, h, conv, proj, pstride, C, Hk, Hv, neg_a, dt_bias, norm_w, state, state_bf16, cu, slots, fresh,
-                out, eps, tiled, fq, fs, fmode, frows);
+    if (t1 - t0 == 1 || is_spec(outs, spec, s)) {
+        gdn_one(s, h, GDN_PASS);
         return;
     }
     const int kh = tiled ? h % Hk : h / (Hv / Hk);
@@ -697,7 +719,7 @@ __device__ __forceinline__ void gdn_gate8(float* o, int t, int h, int Hv, const 
 extern "C" __global__ void gdn_norm(const bf16* __restrict__ proj, int pstride, int C, int Hv,
                                     const float* __restrict__ norm_w, bf16* __restrict__ out, int T, float eps,
                                     const int* __restrict__ cu, const int* __restrict__ tok_seq, uint8_t* fq,
-                                    void* fs, int fmode, int frows) {
+                                    void* fs, int fmode, int frows, const int* __restrict__ outs, int spec) {
     const Fp8Out fo{fq, fs, fmode, frows};
     const int lane = threadIdx.x & 31;
     const long long n = (long long)T * Hv;
@@ -705,7 +727,7 @@ extern "C" __global__ void gdn_norm(const bf16* __restrict__ proj, int pstride, 
          e += ((long long)gridDim.x * blockDim.x) >> 5) {
         const int t = (int)(e / Hv), h = (int)(e % Hv);
         const int sq = tok_seq[t];
-        if (cu[sq + 1] - cu[sq] == 1) continue;  // finished by gdn_one
+        if (cu[sq + 1] - cu[sq] == 1 || is_spec(outs, spec, sq)) continue;  // finished by gdn_one
         float o[8];
         if (lane < 16) unpack8(*reinterpret_cast<const uint4*>(out + (size_t)t * Hv * GDN_DIM + h * GDN_DIM + 8 * lane), o);
         else
@@ -807,13 +829,14 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
                                           int block_size, bf16* __restrict__ out, float scale,
                                           uint8_t* fq, void* fs, int fmode, int frows,
                                           const int* __restrict__ cu, int skip_prompts, int zchunk,
-                                          float* __restrict__ part) {
+                                          float* __restrict__ part, const int* __restrict__ outs, int spec) {
     __shared__ float sm_m[WARPS][G], sm_s[WARPS][G];
     __shared__ float sm_acc[WARPS][G][HEAD_DIM];
     const int t = blockIdx.x, kvh = blockIdx.y;
-    // With skip_prompts, tokens of sequences with more than one (prompts)
-    // are left to attn_flash.
-    if (skip_prompts && cu[tok_seq[t] + 1] - cu[tok_seq[t]] > 1) return;
+    // With skip_prompts, tokens of prompt sequences (more than one token,
+    // not verifying drafts) are left to attn_flash.
+    const int sq = tok_seq[t];
+    if (skip_prompts && cu[sq + 1] - cu[sq] > 1 && !is_spec(outs, spec, sq)) return;
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
     const int L = pos[t] + 1;
     // With `part`, keys split into ranges of zchunk across blockIdx.z
@@ -890,7 +913,9 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
             }
             const int h = kvh * G + g;
             if (part) {
-                float* pp = part + (((size_t)tok_seq[t] * Hq + h) * gridDim.z + blockIdx.z) * (HEAD_DIM + 2);
+                // Partials per decode token: up to `spec` per sequence.
+                const size_t row = (size_t)sq * spec + (t - cu[sq]);
+                float* pp = part + ((row * Hq + h) * gridDim.z + blockIdx.z) * (HEAD_DIM + 2);
                 if (d == 0) {
                     pp[0] = M;
                     pp[1] = S;
@@ -928,10 +953,11 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
         const bf16* __restrict__ qkv, int qstride, int Hq, int Hkv, const int* __restrict__ pos,      \
         const int* __restrict__ tok_seq, const int* __restrict__ block_table, int max_blocks,         \
         int block_size, bf16* __restrict__ out, float scale, uint8_t* fq, void* fs, int fmode,         \
-        int frows, const int* __restrict__ cu, int skip_prompts, int zchunk, float* part) {            \
+        int frows, const int* __restrict__ cu, int skip_prompts, int zchunk, float* part,              \
+        const int* __restrict__ outs, int spec) {                                                      \
         attn_body<G, WARPS, F8>(q, kcache, vcache, kscale, vscale, qkv, qstride, Hq, Hkv, pos,         \
                                 tok_seq, block_table, max_blocks, block_size, out, scale, fq, fs,      \
-                                fmode, frows, cu, skip_prompts, zchunk, part);                         \
+                                fmode, frows, cu, skip_prompts, zchunk, part, outs, spec);             \
     }
 // attn_paged_g<G> reads a bf16 cache, attn_paged8_g<G> an E4M3 one.
 #define ATTN_KERNEL(G, WARPS)                                                                          \
@@ -962,8 +988,8 @@ __device__ __forceinline__ uint32_t fa_bf2(float lo, float hi) {
         const float *__restrict__ kscale, const float *__restrict__ vscale, const bf16 *__restrict__ qkv, \
         int qstride, int Hq, int Hkv, const int *__restrict__ pos, const int *__restrict__ cu, int seqs,  \
         const int *__restrict__ block_table, int max_blocks, int block_size, bf16 *__restrict__ out,      \
-        float scale
-#define ATTN_FLASH_PASS q, kcache, vcache, kscale, vscale, qkv, qstride, Hq, Hkv, pos, cu, seqs, block_table, max_blocks, block_size, out, scale
+        float scale, const int *__restrict__ outs, int spec
+#define ATTN_FLASH_PASS q, kcache, vcache, kscale, vscale, qkv, qstride, Hq, Hkv, pos, cu, seqs, block_table, max_blocks, block_size, out, scale, outs, spec
 
 #define FG_BN 16
 template <int G>
@@ -981,7 +1007,8 @@ __device__ __forceinline__ void attn_flash_group(
     const bf16* __restrict__ q, const void* __restrict__ kcache, const void* __restrict__ vcache,
     const float* __restrict__ kscale, const float* __restrict__ vscale, const bf16* __restrict__ qkv, int qstride,
     int Hq, int Hkv, const int* __restrict__ pos, const int* __restrict__ cu, int seqs,
-    const int* __restrict__ block_table, int max_blocks, int block_size, bf16* __restrict__ out, float scale) {
+    const int* __restrict__ block_table, int max_blocks, int block_size, bf16* __restrict__ out, float scale,
+    const int* __restrict__ outs, int spec) {
     extern __shared__ __align__(16) unsigned char fsm[];
     bf16* sQ = (bf16*)fsm;                 // [G][16][FA_STR]
     bf16* sK = sQ + G * 16 * FA_STR;       // [2][FG_BN][FA_STR]
@@ -992,7 +1019,7 @@ __device__ __forceinline__ void attn_flash_group(
     int s = -1, tile = blockIdx.x;
     for (int i = 0; i < seqs; i++) {
         const int n = cu[i + 1] - cu[i];
-        if (n <= 1) continue;
+        if (n <= 1 || is_spec(outs, spec, i)) continue;
         const int tiles = (n + 15) / 16;
         if (tile < tiles) {
             s = i;
@@ -1167,13 +1194,13 @@ extern "C" __global__ void __launch_bounds__(HEAD_DIM)
     attn_merge(const float* __restrict__ part, int Z, int zchunk, const bf16* __restrict__ qkv, int qstride,
                int Hq, const int* __restrict__ pos, const int* __restrict__ tok_seq,
                const int* __restrict__ cu, int skip_prompts, bf16* __restrict__ out, uint8_t* fq, void* fs,
-               int fmode, int frows) {
+               int fmode, int frows, const int* __restrict__ outs, int spec) {
     __shared__ float ys[HEAD_DIM];
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const int sq = tok_seq[t];
-    if (skip_prompts && cu[sq + 1] - cu[sq] > 1) return;
+    if (skip_prompts && cu[sq + 1] - cu[sq] > 1 && !is_spec(outs, spec, sq)) return;
     const int nz = (pos[t] + zchunk) / zchunk;  // ranges holding keys 0 .. pos[t]
-    const float* pp = part + ((size_t)sq * Hq + h) * Z * (HEAD_DIM + 2);
+    const float* pp = part + (((size_t)sq * spec + (t - cu[sq])) * Hq + h) * Z * (HEAD_DIM + 2);
     float M = -INFINITY;
     for (int z = 0; z < nz; z++) M = fmaxf(M, pp[z * (HEAD_DIM + 2)]);
     float S = 0.f, A = 0.f;
@@ -1370,6 +1397,116 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS)
         }
         if (l == 0) out[blockIdx.x] = bi;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-token prediction: one extra layer drafts the token after next from a
+// token and the model's final hidden state before it.
+
+// The token each row's draft input takes: mtp_ids[t] when not negative, else
+// the pick of output row -mtp_ids[t] - 1.
+extern "C" __global__ void mtp_tokens(const int* __restrict__ mtp_ids, const int* __restrict__ picked,
+                                      int* __restrict__ out, int T) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    const int x = mtp_ids[t];
+    out[t] = x >= 0 ? x : picked[-x - 1];
+}
+
+// The draft layer's input row: [norm_e(embedding) | norm_h(hidden)], where
+// hidden is the model's final norm of x + res (unrounded f32 sum), rounded to
+// bf16 as the model's output is; or, with x null, res itself (a draft's own
+// normalized output, for the next draft). Weights are f32 multipliers.
+extern "C" __global__ void mtp_input(const bf16* __restrict__ emb, const bf16* __restrict__ x,
+                                     const bf16* __restrict__ res, const float* __restrict__ final_w,
+                                     const float* __restrict__ we, const float* __restrict__ wh,
+                                     bf16* __restrict__ out, int hidden, float eps) {
+    __shared__ float sh[32];
+    const size_t r = blockIdx.x;
+    float e[4][8], v[4][8];
+    float se = 0.f, sv = 0.f;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int i = (c * blockDim.x + threadIdx.x) * 8;
+        if (i < hidden) {
+            float a[8];
+            unpack8(*reinterpret_cast<const uint4*>(emb + r * hidden + i), e[c]);
+            unpack8(*reinterpret_cast<const uint4*>(res + r * hidden + i), v[c]);
+            if (x) unpack8(*reinterpret_cast<const uint4*>(x + r * hidden + i), a);
+#pragma unroll
+            for (int k = 0; k < 8; k++) {
+                if (x) v[c][k] += a[k];
+                se += e[c][k] * e[c][k];
+                sv += v[c][k] * v[c][k];
+            }
+        }
+    }
+    se = block_sum(se, sh);
+    sv = block_sum(sv, sh);
+    const float ie = 1.f / sqrtf(se / hidden + eps), iv = 1.f / sqrtf(sv / hidden + eps);
+    float sf = 0.f;
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int i = (c * blockDim.x + threadIdx.x) * 8;
+        if (i < hidden) {
+#pragma unroll
+            for (int k = 0; k < 8; k++) {
+                if (x) v[c][k] = rbf(v[c][k] * iv * final_w[i + k]);
+                sf += v[c][k] * v[c][k];
+            }
+        }
+    }
+    sf = block_sum(sf, sh);
+    const float iff = 1.f / sqrtf(sf / hidden + eps);
+#pragma unroll
+    for (int c = 0; c < 4; c++) {
+        const int i = (c * blockDim.x + threadIdx.x) * 8;
+        if (i < hidden) {
+            float a[8], b[8];
+#pragma unroll
+            for (int k = 0; k < 8; k++) {
+                a[k] = e[c][k] * ie * we[i + k];
+                b[k] = v[c][k] * iff * wh[i + k];
+            }
+            *reinterpret_cast<uint4*>(out + r * 2 * hidden + i) = pack8(a);
+            *reinterpret_cast<uint4*>(out + r * 2 * hidden + hidden + i) = pack8(b);
+        }
+    }
+}
+
+// For each sequence, the token row whose draft output becomes its next draft:
+// a sequence verifying drafts accepts draft j + 1 while the pick at its
+// token j equals it, and drafts from the last accepted row; others draft from
+// their last row.
+extern "C" __global__ void mtp_accept(const int* __restrict__ ids, const int* __restrict__ cu,
+                                      const int* __restrict__ ocu, const int* __restrict__ picked,
+                                      const int* __restrict__ outs, int spec, int* __restrict__ rows, int S) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= S) return;
+    const int t0 = cu[s], n = cu[s + 1] - t0;
+    int j = n - 1;
+    if (is_spec(outs, spec, s)) {
+        j = 0;
+        while (j < n - 1 && picked[ocu[s] + j] == ids[t0 + j + 1]) j++;
+    }
+    rows[s] = t0 + j;
+}
+
+// Metadata of draft pass k (k >= 1): one row per sequence at k positions past
+// its draft row, writing the draft layer's KV only up to `limits` (the last
+// position the sequence holds; -1 for padding).
+extern "C" __global__ void mtp_next(const int* __restrict__ rows, const int* __restrict__ pos,
+                                    const int* __restrict__ rope, int rope_stride,
+                                    const int* __restrict__ block_table, int max_blocks, int block_size,
+                                    const int* __restrict__ limits, int k, int* __restrict__ dpos,
+                                    int* __restrict__ dslot, int* __restrict__ drope, int S) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= S) return;
+    const int r = rows[s], p = pos[r] + k;
+    dpos[s] = p;
+    dslot[s] = p <= limits[s] ? block_table[(size_t)s * max_blocks + p / block_size] * block_size + p % block_size
+                              : -1;
+    for (int axis = 0; axis < 3; axis++) drope[axis * S + s] = rope[axis * rope_stride + r] + k;
 }
 
 // ---------------------------------------------------------------------------

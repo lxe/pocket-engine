@@ -45,6 +45,9 @@ pub struct EngineConfig {
     /// State slots for prefix-cache snapshots; None picks a quarter of
     /// max_seqs (2 to 64), 0 turns the cache off.
     pub prefix_cache: Option<usize>,
+    /// Drafts per step from the multi-token-prediction layer; 0 turns
+    /// speculative decoding off.
+    pub mtp: usize,
 }
 
 impl EngineConfig {
@@ -66,6 +69,7 @@ impl EngineConfig {
             kv_fp8: false,
             state_bf16: true,
             prefix_cache: None,
+            mtp: 0,
         }
     }
 }
@@ -114,6 +118,8 @@ pub struct Engine {
     act: Act,
     cfg: EngineConfig,
     graphs: HashMap<usize, Graph>,
+    /// Steps where every sequence verifies drafts, by padded sequence count.
+    verify_graphs: HashMap<usize, Graph>,
     vision: Option<Vision>,
     pub sched: Scheduler,
     pub stats: Stats,
@@ -143,7 +149,11 @@ impl Engine {
             fp8: gpu.fp8_mode(),
             quantize: cfg.fp8 || cfg.fp4,
             fp4: cfg.fp4,
+            mtp: cfg.mtp > 0,
         };
+        if cfg.mtp > 7 {
+            return Err(Error::Config("--mtp takes 1 to 7 drafts per step".into()));
+        }
         if cfg.fp4 && load.fp8 != Some(crate::gpu::Fp8Mode::Mx32) {
             return Err(Error::Config(
                 "--fp4 needs a Blackwell GPU (RTX 50-series)".into(),
@@ -167,6 +177,8 @@ impl Engine {
         };
         gpu.end_uploads()?;
         let pool_rows = if vision.is_some() { cfg.image_pool } else { 0 };
+        // A sequence verifying drafts feeds up to `spec` tokens a step.
+        let spec = cfg.mtp + 1;
         // Each sequence holds a recurrent state slot (tens of MB on larger
         // models). Keep slots within half of what is left after the weights,
         // and leave the KV cache at least one full context.
@@ -191,9 +203,13 @@ impl Engine {
         let max_blocks = cfg.max_context.div_ceil(BLOCK_SIZE);
         let meta = Meta {
             // A multiple of 4, so FP8 matmuls padded to 4 rows stay in bounds.
-            max_tokens: cfg.max_batch_tokens.max(cfg.max_seqs).next_multiple_of(4),
+            max_tokens: cfg
+                .max_batch_tokens
+                .max(cfg.max_seqs * spec)
+                .next_multiple_of(4),
             max_seqs: cfg.max_seqs,
             max_blocks,
+            spec,
         };
         let act = Act::new(&gpu, &mc, meta, pool_rows, model.fp8)?;
         // One extra slot absorbs the padding rows of graph replays; the
@@ -231,6 +247,7 @@ impl Engine {
             state,
             act,
             graphs: HashMap::new(),
+            verify_graphs: HashMap::new(),
             vision,
             sched,
             stats: Stats::default(),
@@ -266,23 +283,34 @@ impl Engine {
     fn capture(&mut self) -> Result<()> {
         let t0 = Instant::now();
         let max = self.cfg.max_seqs;
-        for &b in BUCKETS.iter().filter(|&&b| b <= max) {
-            self.sched.pad(self.act.staging.as_mut_slice(), 0, b);
-            self.act.upload_meta(&self.gpu)?;
-            // A plain run first, so cuBLAS settles its kernels outside capture.
-            self.model
-                .forward(&self.gpu, &self.state, &self.act, b, b)?;
-            self.gpu.sync()?;
-            self.gpu.begin_capture()?;
-            let r = self.model.forward(&self.gpu, &self.state, &self.act, b, b);
-            let g = self.gpu.end_capture();
-            r?;
-            self.graphs.insert(b, g?);
+        let spec = self.act.meta.spec;
+        let shapes = if spec > 1 { vec![1, spec] } else { vec![1] };
+        for n in shapes {
+            for &b in BUCKETS.iter().filter(|&&b| b <= max) {
+                self.sched.pad(self.act.staging.as_mut_slice(), 0, b, n);
+                self.act.upload_meta(&self.gpu)?;
+                let t = b * n;
+                // A plain run first, so cuBLAS settles its kernels outside capture.
+                self.model
+                    .forward(&self.gpu, &self.state, &self.act, t, b, t)?;
+                self.gpu.sync()?;
+                self.gpu.begin_capture()?;
+                let r = self
+                    .model
+                    .forward(&self.gpu, &self.state, &self.act, t, b, t);
+                let g = self.gpu.end_capture();
+                r?;
+                if n == 1 {
+                    self.graphs.insert(b, g?);
+                } else {
+                    self.verify_graphs.insert(b, g?);
+                }
+            }
         }
         self.gpu.sync()?;
         eprintln!(
             "captured {} decode graphs in {:.2}s",
-            self.graphs.len(),
+            self.graphs.len() + self.verify_graphs.len(),
             t0.elapsed().as_secs_f64()
         );
         Ok(())
@@ -297,54 +325,62 @@ impl Engine {
         for &(from, to) in &step.copies {
             self.state.copy_slot(&self.gpu, from, to)?;
         }
-        let (t, s) = (step.tokens, step.seqs());
+        let (t, s, r) = (step.tokens, step.seqs(), step.outs);
         let pens = self.sched.fill(
             &step,
             self.act.staging.as_mut_slice(),
             &mut Pen::split(self.act.pen_staging.as_mut_slice()),
         );
-        let bucket = if step.decode_only() && self.cfg.graphs {
+        let spec = self.act.meta.spec;
+        let (graphs, n) = if step.verify_only(spec) {
+            (&self.verify_graphs, spec)
+        } else {
+            (&self.graphs, 1)
+        };
+        let bucket = if (step.decode_only() || n > 1) && self.cfg.graphs {
             BUCKETS
                 .iter()
                 .copied()
-                .find(|&b| b >= s && self.graphs.contains_key(&b))
+                .find(|&b| b >= s && graphs.contains_key(&b))
         } else {
             None
         };
         let t0 = Instant::now();
         match bucket {
             Some(b) => {
-                self.sched.pad(self.act.staging.as_mut_slice(), s, b);
+                self.sched.pad(self.act.staging.as_mut_slice(), s, b, n);
                 self.act.upload_pen(&self.gpu, pens)?;
                 self.act.upload_meta(&self.gpu)?;
-                self.gpu.replay(&self.graphs[&b])?;
+                self.gpu.replay(&graphs[&b])?;
                 self.stats.graph_steps += 1;
             }
             None => {
                 self.act.upload_pen(&self.gpu, pens)?;
                 self.act.upload_meta(&self.gpu)?;
                 self.model
-                    .forward(&self.gpu, &self.state, &self.act, t, s)?;
+                    .forward(&self.gpu, &self.state, &self.act, t, s, r)?;
             }
         }
-        self.act.download_ids(&self.gpu, s)?;
+        self.act.download_ids(&self.gpu, r, s)?;
         self.gpu.sync()?;
         self.stats.step_seconds += t0.elapsed().as_secs_f64();
-        let picked: Vec<u32> = self.act.ids_host.as_slice::<i32>()[..s]
+        let picked: Vec<u32> = self.act.ids_host.as_slice::<i32>()[..r]
             .iter()
             .map(|&x| x as u32)
             .collect();
         let mut scored = Vec::with_capacity(s);
-        for (si, &pick) in picked.iter().enumerate() {
+        for si in 0..s {
+            let row = step.out_row(si);
             scored.push(
                 if self.sched.is_forced(&step, si) && self.sched.yields(&step, si) {
-                    Some(score(pick, &self.logits_row(si)?))
+                    Some(score(picked[row], &self.logits_row(row)?))
                 } else {
                     None
                 },
             );
         }
-        Ok(self.sched.finish(step, &picked, scored))
+        let drafts = self.act.drafts(s);
+        Ok(self.sched.finish(step, &picked, drafts, scored))
     }
 
     /// Runs the vision encoder for newly admitted requests, in batches the
@@ -503,8 +539,16 @@ pub fn spawn(cfg: EngineConfig) -> Result<(mpsc::Sender<Request>, Info, Arc<Mute
                     let c = &engine.sched.counters;
                     let st = &engine.stats;
                     let load = engine.sched.load();
+                    let drafts = if c.drafted > 0 {
+                        format!(
+                            ", drafts {:.0}% accepted",
+                            100.0 * c.accepted as f64 / c.drafted as f64
+                        )
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "steps {} (graph {}), decode {} tok, prompt {} tok (+{} cached), {:.1} ms/step, running {}, waiting {}",
+                        "steps {} (graph {}), decode {} tok, prompt {} tok (+{} cached){drafts}, {:.1} ms/step, running {}, waiting {}",
                         c.steps,
                         st.graph_steps,
                         c.decode_tokens,

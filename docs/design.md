@@ -13,12 +13,44 @@ The engine (`src/engine.rs`) copies that metadata to the device and runs the ste
 Each layer runs three or four cuBLAS GEMMs over all of the step's tokens, plus a few kernels of its own (`src/kernels/qwen35.cu`):
 
 - **Fused projections.** One GEMM computes all linear-attention inputs (q, k, v, z, b, a). One computes the attention inputs (query with its gate, key, value). One computes the MLP's gate and up projections.
-- **Linear attention (gated delta rule), two kernels.**
+- **Linear attention (gated delta rule), three kernels.**
   - The causal convolution walks each sequence's tokens and carries the last three inputs across steps.
-  - The recurrence keeps each head's 128×128 state in registers while it walks a sequence's tokens, then applies the gated RMSNorm.
+  - The recurrence. A decode token updates each head's 128×128 state in registers. A prompt runs in chunks of 32 tokens on tensor cores, in the chunked form FlashInfer and FLA use: with G the cumulative log decay, the chunk solves (I + A)D = β(V − e^G K S₀), outputs e^G Q S₀ + tril(QKᵀ ⊙ Γ) D and carries e^{G_last} S₀ + (K ⊙ e^{G_last − G})ᵀ D to the next chunk. Operands are bf16 and every product accumulates in f32.
+  - The gated RMSNorm, in place on the recurrence's output.
   - Each sequence's states live in a slot: about 18.6 MB for the 2B model.
-- **Full attention, two kernels.** One applies the q/k norms and rotary embedding and writes keys and values into a paged cache of 16-token blocks. The other is paged attention with the output gate fused in.
+- **Full attention, two or three kernels.** One applies the q/k norms and rotary embedding and writes keys and values into a paged cache of 16-token blocks. Decode tokens then run paged attention with the output gate fused in; past 2,048 keys the keys split into ranges of 2,048 that run in parallel, and a merge kernel combines them. Prompt tokens run flash attention: a block takes 16 query tokens of one key/value head with one warp per query head of the group, so each key tile is read once for the whole group, double-buffered with `cp.async`, and the probabilities feed the second product straight from the accumulators.
 - **Norms and activation.** The residual add is folded into the next RMSNorm, and SiLU-and-multiply is one kernel.
+
+## Prefix cache
+
+A request whose prompt begins like an earlier one skips the shared part. Attention needs only the earlier keys and values, but linear attention needs its recurrent state as it stood at the end of the prefix, and that state is overwritten token by token. So the cache keeps snapshots:
+
+- **Where.** Prompts are hashed in units of 64 tokens, each unit's hash chained to the one before. A prompt can leave up to two prefixes: the end of the last whole unit before its final message (the last `<|im_start|>`), which the next turn of a conversation or another question under the same system prompt shares, and the last whole unit before its final token.
+- **What.** The scheduler ends a prompt chunk at each of those points. Before the next step the engine copies the sequence's recurrent and convolution state into a spare state slot (`--prefix-cache` of them), and the prefix's full KV blocks gain a reference.
+- **Reuse.** At admission the scheduler finds the longest cached prefix, copies the snapshot into the new sequence's slot, points its block table at the shared blocks and starts the prompt after them. Blocks are refcounted; the least recently used prefix is evicted when slots or blocks run short.
+
+Output with a cached prefix is identical to output without one (`tests/gpu.rs`). On an RTX 5090 with Qwen3.5-9B (bf16, `scripts/workloads.py`):
+
+| Workload | Cache off | Cache on |
+|---|---|---|
+| 2,000-token system prompt, 128 short questions, 16 at a time | 174 output tok/s, first token 0.49 s | 992 tok/s, 0.059 s |
+| 16 conversations of 8 turns, each turn resending the history | 606 tok/s, 0.49 s | 955 tok/s, 0.28 s |
+
+Without the cache, time to first token in the conversations grows from 0.34 s to 0.59 s by the fourth turn; with it, it stays between 0.23 and 0.35 s.
+
+## Long contexts
+
+Three changes made long prompts and long-context decoding fast: the chunked recurrence above (the per-token recurrence ran a 64k prompt's linear attention one token at a time), flash attention for prompt tokens, and split-key decode attention, which spreads one long sequence's keys over the whole GPU instead of one block per head. The split runs inside CUDA graphs: the grid is sized for `--max-context` and ranges past a sequence's length exit at once.
+
+Qwen3.5-9B, bf16, one request at a time on an RTX 5090, 128 output tokens (`scripts/workloads.py long`):
+
+| Prompt | First token, before | First token, now | Prefill | Decode, before | Decode, now |
+|---:|---:|---:|---:|---:|---:|
+| 8k | 0.95 s | 0.73 s | 11,200 tok/s | 57 tok/s | 78 tok/s |
+| 32k | 7.2 s | 3.5 s | 9,500 tok/s | 28 tok/s | 76 tok/s |
+| 64k | 24.1 s | 8.6 s | 7,700 tok/s | 17 tok/s | 76 tok/s |
+
+At 8k, prefill is close to what the GEMMs alone allow. Four 32k prompts at once share the GPU at 9,400 prompt tokens per second.
 
 ## Images
 

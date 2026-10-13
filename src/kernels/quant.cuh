@@ -554,11 +554,16 @@ extern "C" __global__ void repack_blocks(const uint8_t* __restrict__ src, uint8_
 //   Q4_0 (2304 bytes): 2048 of nibbles, then per row 8 halves, d per step.
 //   Q4_K (2368 bytes): 2048 of nibbles, then per row 16 bytes (the 8 steps'
 //   6-bit scales, then their mins), then per row (d, dmin) as two halves.
+//   Q6_K (3392 bytes): 2048 of low nibbles; 1024 of high bits, 16 bytes per
+//   lane per four steps, a word per step with row g in its low half and row
+//   g + 8 in its high half, two bits per input; then per row the 16 int8
+//   scales (one per 16 inputs) and d.
 // Weights are computed in f32 exactly as the decoders compute them, so tiled
 // and plain dequantization agree bit for bit.
 template <int T> struct Tiled;
 template <> struct Tiled<T_Q4_0> { static constexpr int CHUNK = 2304; };
 template <> struct Tiled<T_Q4_K> { static constexpr int CHUNK = 2368; };
+template <> struct Tiled<T_Q6_K> { static constexpr int CHUNK = 3392; };
 
 // Byte offset of the nibble word for (row r of the tile, step s, lane t).
 __device__ __forceinline__ int tile_word(int r, int s, int t) {
@@ -572,13 +577,17 @@ __device__ __forceinline__ float nibf(uint32_t w, int sh) {
 // The 8 weights of a word, rounded as the decoders round them: Q4_K as
 // q * scale - min in one step, Q4_0 as (q - 8) * d (which keeps the sign of
 // a zero weight, as the decoder does).
+// Q6_K: (q - 32) * scale, with q's two high bits from `hi` (input i at bit 2i).
 template <int T>
-__device__ __forceinline__ void tile_dec8(uint32_t w, float sc, float mn, float* o) {
+__device__ __forceinline__ void tile_dec8(uint32_t w, float sc, float mn, float* o, uint32_t hi = 0) {
 #pragma unroll
     for (int i = 0; i < 8; i++) {
         const int sh = (i & 1) * 16 + (i >> 1) * 4;
         if constexpr (T == T_Q4_0) {
             o[i] = (__uint_as_float(((w >> sh) & 0xFu) | 0x4B000000u) - 8388616.f) * sc;
+        } else if constexpr (T == T_Q6_K) {
+            const uint32_t q = ((w >> sh) & 0xFu) | (((hi >> (2 * i)) & 3u) << 4);
+            o[i] = (__uint_as_float(q | 0x4B000000u) - 8388640.f) * sc;
         } else {
             o[i] = fmaf(nibf(w, sh), sc, -mn);
         }
@@ -593,16 +602,22 @@ struct TileRow {
 template <int T>
 __device__ __forceinline__ TileRow tile_row(const uint8_t* c, int r) {
     TileRow x;
-    x.a = *reinterpret_cast<const uint4*>(c + 2048 + 16 * r);
-    x.b = T == T_Q4_K ? *reinterpret_cast<const uint32_t*>(c + 2304 + 4 * r) : 0u;
+    constexpr int SC = T == T_Q6_K ? 3072 : 2048, D = T == T_Q6_K ? 3328 : 2304;
+    x.a = *reinterpret_cast<const uint4*>(c + SC + 16 * r);
+    x.b = T == T_Q4_0 ? 0u : *reinterpret_cast<const uint32_t*>(c + D + 4 * r);
     return x;
 }
 __device__ __forceinline__ uint32_t word_of(uint4 v, int i) {
     return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
 }
 template <int T>
-__device__ __forceinline__ void tile_scale(const TileRow& x, int s, float& sc, float& mn) {
-    if constexpr (T == T_Q4_K) {
+__device__ __forceinline__ void tile_scale(const TileRow& x, int s, int t, float& sc, float& mn) {
+    if constexpr (T == T_Q6_K) {
+        const int k = 2 * s + (t >> 1);
+        const int8_t q = (int8_t)((word_of(x.a, k >> 2) >> (8 * (k & 3))) & 0xFF);
+        sc = __half2float(__ushort_as_half((unsigned short)x.b)) * q;
+        mn = 0.f;
+    } else if constexpr (T == T_Q4_K) {
         const float2 dm = __half22float2(*reinterpret_cast<const half2*>(&x.b));
         sc = dm.x * (float)((word_of(x.a, s >> 2) >> (8 * (s & 3))) & 0xFF);
         mn = dm.y * (float)((word_of(x.a, 2 + (s >> 2)) >> (8 * (s & 3))) & 0xFF);
@@ -623,7 +638,25 @@ __device__ void tile_rewrite(const uint8_t* __restrict__ src, int N, int K, uint
         const int row = (int)(e / steps), gs = (int)(e % steps), kb = gs / 8, s = gs % 8, r = row & 15;
         uint8_t* c = dst + ((size_t)(row / 16) * (K / 256) + kb) * Tiled<T>::CHUNK;
         uint8_t q[32];
-        if constexpr (T == T_Q4_K) {
+        if constexpr (T == T_Q6_K) {
+            const block_q6_K* b = reinterpret_cast<const block_q6_K*>(src) + (size_t)row * (K / 256) + kb;
+            const int ip = s / 4, g = s % 4;
+            uint8_t h[32];
+            for (int l = 0; l < 32; l++) {
+                q[l] = (b->ql[64 * ip + 32 * (g & 1) + l] >> (4 * (g >> 1))) & 0xF;
+                h[l] = (b->qh[32 * ip + l] >> (2 * g)) & 3;
+            }
+            for (int t = 0; t < 4; t++) {
+                uint32_t w = 0;
+                for (int i = 0; i < 8; i++) w |= (uint32_t)h[8 * t + i] << (2 * i);
+                *reinterpret_cast<uint16_t*>(c + 2048 + (s >> 2) * 512 + (4 * (r & 7) + t) * 16 + (s & 3) * 4 +
+                                             (r >> 3) * 2) = (uint16_t)w;
+            }
+            if (s == 0) {
+                for (int i = 0; i < 16; i++) c[3072 + 16 * r + i] = (uint8_t)b->scales[i];
+                *reinterpret_cast<half*>(c + 3328 + 4 * r) = b->d;
+            }
+        } else if constexpr (T == T_Q4_K) {
             const block_q4_K* b = reinterpret_cast<const block_q4_K*>(src) + (size_t)row * (K / 256) + kb;
             const int il = s / 2, hi = s & 1;
             for (int i = 0; i < 32; i++) q[i] = (b->qs[32 * il + i] >> (4 * hi)) & 0xF;
@@ -657,8 +690,12 @@ __device__ void tile_dequant(const uint8_t* __restrict__ W, int r0, int rows, in
         const int kb = k8 / 32, s = (k8 / 4) % 8, t = k8 % 4;
         const uint8_t* c = W + ((size_t)(row / 16) * (cols / 256) + kb) * Tiled<T>::CHUNK;
         float sc, mn, v[8];
-        tile_scale<T>(tile_row<T>(c, row & 15), s, sc, mn);
-        tile_dec8<T>(*reinterpret_cast<const uint32_t*>(c + tile_word(row & 15, s, t)), sc, mn, v);
+        tile_scale<T>(tile_row<T>(c, row & 15), s, t, sc, mn);
+        uint32_t hi = 0;
+        if constexpr (T == T_Q6_K)
+            hi = *reinterpret_cast<const uint16_t*>(c + 2048 + (s >> 2) * 512 + (4 * ((row & 15) & 7) + t) * 16 +
+                                                    (s & 3) * 4 + ((row & 15) >> 3) * 2);
+        tile_dec8<T>(*reinterpret_cast<const uint32_t*>(c + tile_word(row & 15, s, t)), sc, mn, v, hi);
         *reinterpret_cast<uint4*>(out + (size_t)r * cols + 8 * k8) = pack8(v);
     }
 }
@@ -700,12 +737,17 @@ __device__ void qtile(const uint8_t* __restrict__ W, int N, int K, const bf16* _
     // Two chunks in flight: while one is computed, the next two are loading.
     struct Chunk {
         uint4 q[4];
+        uint4 h[T == T_Q6_K ? 2 : 1];
         TileRow ra, rb;
     };
     auto fetch = [&](int kb, Chunk& ch) {
         const uint8_t* c = base + (size_t)kb * CH;
 #pragma unroll
         for (int i = 0; i < 4; i++) ch.q[i] = ld_stream(c + 512 * i + 16 * lane);
+        if constexpr (T == T_Q6_K) {
+#pragma unroll
+            for (int i = 0; i < 2; i++) ch.h[i] = ld_stream(c + 2048 + 512 * i + 16 * lane);
+        }
         ch.ra = tile_row<T>(c, g);
         ch.rb = tile_row<T>(c, g + 8);
     };
@@ -717,10 +759,11 @@ __device__ void qtile(const uint8_t* __restrict__ W, int N, int K, const bf16* _
             for (int j = 0; j < MT / 8; j++)
                 xv[j] = xok[j] ? *reinterpret_cast<const uint4*>(xr[j] + 256 * kb + 32 * s) : make_uint4(0, 0, 0, 0);
             float sa, ma, sb, mb, wa[8], wb[8];
-            tile_scale<T>(ch.ra, s, sa, ma);
-            tile_scale<T>(ch.rb, s, sb, mb);
-            tile_dec8<T>(word_of(ch.q[s >> 1], 2 * (s & 1)), sa, ma, wa);
-            tile_dec8<T>(word_of(ch.q[s >> 1], 2 * (s & 1) + 1), sb, mb, wb);
+            tile_scale<T>(ch.ra, s, t, sa, ma);
+            tile_scale<T>(ch.rb, s, t, sb, mb);
+            const uint32_t hw = T == T_Q6_K ? word_of(ch.h[(s >> 2) & (T == T_Q6_K ? 1 : 0)], s & 3) : 0u;
+            tile_dec8<T>(word_of(ch.q[s >> 1], 2 * (s & 1)), sa, ma, wa, hw & 0xFFFFu);
+            tile_dec8<T>(word_of(ch.q[s >> 1], 2 * (s & 1) + 1), sb, mb, wb, hw >> 16);
 #pragma unroll
             for (int h = 0; h < 2; h++) {
                 const uint32_t a[4] = {bf2(wa[4 * h], wa[4 * h + 1]), bf2(wb[4 * h], wb[4 * h + 1]),
@@ -775,6 +818,7 @@ __device__ void qtile(const uint8_t* __restrict__ W, int N, int K, const bf16* _
     QTILE(T, name, 8) QTILE(T, name, 16) QTILE(T, name, 32) QTILE(T, name, 64)
 TILED_KERNELS(T_Q4_0, q4_0)
 TILED_KERNELS(T_Q4_K, q4_k)
+TILED_KERNELS(T_Q6_K, q6_k)
 
 #define QUANT_KERNELS(T, name)                                                                         \
     extern "C" __global__ void dequant_##name(const uint8_t* W, int r0, int rows, int cols, bf16* out) { \

@@ -37,7 +37,7 @@ A quantized matrix multiply picks one of three paths by the number of rows in th
 
 - **Up to 4 rows: matrix-vector kernel.** A warp per output feature streams the row once and decodes in registers, at about 1.75 TB/s on an RTX 5090.
 - **5 to 160 rows: tensor cores, decoding into registers.** Each warp owns 16 output features and does mma.sync m16n8k16 in bf16. A dot product does not depend on the order of K, so each 32-wide step of K is assigned to fragment slots such that each lane needs 8 consecutive weights of its two rows and 8 consecutive inputs: two decodes and one 16-byte load per step. There is no shared memory and no barrier. When the grid alone would leave SMs idle, K is split across blocks into an f32 workspace.
-- **Q4_0 and Q4_K: a tiled layout, 1 to 160 rows on tensor cores.** At load these two formats are rewritten in chunks of 16 rows × 256 inputs, in the order the tensor-core loop consumes them. One 16-byte load per lane fetches its nibbles for two steps, and a warp's load covers 512 contiguous bytes. Q4_K's packed 6-bit scales are unpacked to bytes, which costs 4.6 bits per weight instead of 4.5; Q4_0 stays at 4.5. A nibble becomes an exact float without an integer conversion (`bits(0x4B000000 | q) - 2^23`), then one FMA (or, for Q4_0, a subtract and a multiply). That is the same arithmetic as the decoders, so tiled and plain dequantization agree bit for bit, and `dequant` checks it. Each warp loads the next two chunks while it computes the current one.
+- **Q4_0, Q4_K and Q6_K: a tiled layout, 1 to 160 rows on tensor cores.** At load these two formats are rewritten in chunks of 16 rows × 256 inputs, in the order the tensor-core loop consumes them. One 16-byte load per lane fetches its nibbles for two steps, and a warp's load covers 512 contiguous bytes. Q4_K's packed 6-bit scales are unpacked to bytes, which costs 4.6 bits per weight instead of 4.5; Q4_0 stays at 4.5. Q6_K adds a word of high bits per lane and step, at 6.6 bits instead of 6.56. A nibble becomes an exact float without an integer conversion (`bits(0x4B000000 | q) - 2^23`), then one FMA (or, for Q4_0, a subtract and a multiply). That is the same arithmetic as the decoders, so tiled and plain dequantization agree bit for bit, and `dequant` checks it. Each warp loads the next two chunks while it computes the current one.
 - **Above 160 rows (prompt chunks): cuBLAS.** The matrix is dequantized to bf16 scratch and handed to cuBLAS; one decode then serves the whole chunk.
 
 All three issue no allocation and no host synchronization, so quantized decode steps run inside CUDA graphs like bf16 ones.
@@ -52,7 +52,15 @@ All three issue no allocation and no host synchronization, so quantized decode s
 | 32 | 65.4 µs | 29.5 µs | 66.8 µs |
 | 64 | 71.3 µs | 49.9 µs | 78.9 µs |
 
-The larger Qwen3.8-27B `ffn_gate` (17408 × 5120) at 8 rows takes 34 µs tiled, against 77 µs plain and 109 µs in bf16. Small matrices gain less: a 0.8B matrix gives too few warps to hide latency. Whole models gain where the tiled formats dominate. Q4_K_M files keep about a third of their weights in Q6_K, which is not tiled. Qwen3.5-9B Q4_K_M went from 573 to 680 tok/s at 8 in flight, 863 to 978 at 16 and 1,232 to 1,361 at 32; a single request runs at the same speed.
+The larger Qwen3.8-27B `ffn_gate` (17408 × 5120) at 8 rows takes 34 µs tiled, against 77 µs plain and 109 µs in bf16. Small matrices gain less: a 0.8B matrix gives too few warps to hide latency. Q6_K (a third of a Q4_K_M file) gains the most: 9B's `ffn_down` takes 33.5 µs at 8 rows tiled, against 77 µs plain and 64 µs in bf16. 27B's 1 GB output layer takes 0.70 ms at 8 rows against 1.80. Whole models:
+
+| Qwen3.5-9B Q4_K_M, RTX 5090 | 1 | 8 | 16 | 32 | 64 in flight |
+|---|---:|---:|---:|---:|---:|
+| plain blocks | 166 | 573 | 863 | 1,232 | 1,566 tok/s |
+| Q4_K tiled | 166 | 680 | 978 | 1,361 | 1,598 |
+| Q4_K and Q6_K tiled | 170 | 782 | 1,087 | 1,444 | 1,666 |
+
+Qwen3.8-27B Q4_K_M rises from 155 to 183 tok/s at 8 in flight. The tiles are about 2% larger, so 29 requests fit beside it instead of 33.
 
 ## FP8
 

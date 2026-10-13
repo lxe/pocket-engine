@@ -55,8 +55,9 @@ Activations are bf16 with f32 accumulation, rounded where the bf16 reference rou
 | Qwen3.5-2B | 217 | 214 | 3 of 3 | 0.0015, 0.043 |
 | Qwen3.5-4B | 210 | 209 | 1 of 1 | 0.0004, 0.032 |
 | Qwen3.5-9B | 220 | 219 | 1 of 1 | 0.0003, 0.032 |
+| Qwen3.8-27B | 213 | 211 | 2 of 2 | 0.0004, 0.035 |
 
-These ran on an RTX 5090. An H100 build of the 2B model agreed on 215 of 217.
+The small models ran on an RTX 5090. Qwen3.8-27B in bf16 does not fit there, so its reference and run used a rented H100. An H100 build of the 2B model agreed on 215 of 217.
 
 The same comparison with image prompts covers three images. Two keep their sides; the third (300×211) is resized. Prompt tokens match Transformers' processor exactly for all three models:
 
@@ -66,8 +67,18 @@ The same comparison with image prompts covers three images. Two keep their sides
 | Qwen3.5-2B | 87 | 87 | none | 0.0003, 0.088 |
 | Qwen3.5-4B | 62 | 62 | none | 0.0005, 0.043 |
 | Qwen3.5-9B | 85 | 85 | none | 0.0000, 0.040 |
+| Qwen3.8-27B | 91 | 91 | none | 0.0001, 0.050 |
 
-GGUF quantizations are measured against the same bf16 references, so they show the quantization's own error. For 0.8B: Q8_0 agrees on 217 of 222 positions (every miss within one bf16 step), Q4_K_M on 199 and Q4_0 on 195.
+GGUF quantizations are measured against the same bf16 references, so they show the quantization's own error:
+
+| GGUF | Top-1 agreement | Median, p95 log-prob difference |
+|---|---|---|
+| Qwen3.5-0.8B Q8_0 | 217 of 222 (every miss within one bf16 step) | 0.0035, 0.051 |
+| Qwen3.5-0.8B Q4_K_M | 199 of 222 | 0.044, 0.57 |
+| Qwen3.5-0.8B Q4_0 | 195 of 222 | 0.068, 0.78 |
+| Qwen3.8-27B Q4_K_M | 207 of 213 | 0.0019, 0.17 |
+| Qwen3.8-27B UD-Q4_K_XL | 210 of 213 | 0.0011, 0.16 |
+| Qwen3.8-27B UD-IQ4_XS | 207 of 213 | 0.0022, 0.19 |
 
 ## Throughput
 
@@ -96,3 +107,17 @@ Qwen3.5-9B under the same load, output tokens per second and median time to firs
 | 32 | 1,284 | 1,285 | 982 |
 | 64 | 1,519, 0.34 s | 1,562, 0.15 s | 1,301, 0.17 s |
 | burst of 64 | 1,294 | 1,546 | 1,150 |
+
+### Qwen3.8-27B
+
+Output tokens per second under the same load, and median time to first token. [Receipt](receipts/qwen3.8-27b.json).
+
+| In flight | RTX 5090, Q4_K_M (GGUF) | H100, bf16 |
+|---:|---|---|
+| 1 | 54, 0.07 s | 46, 0.05 s |
+| 8 | 154, 0.14 s | 256, 0.07 s |
+| 16 | 226, 0.18 s | 450, 0.08 s |
+| 32 | 241, 1.6 s | 662, 0.10 s |
+| 64 | 231, 4.7 s | 898, 0.15 s |
+
+A request holds 146 MB of recurrent state (48 linear-attention layers × 48 heads × 128 × 128 × f32) plus 64 KB of KV cache per token (16 attention layers). On the 5090, the Q4_K_M weights (19 GB) leave room for 17 requests at once, so throughput levels off from 16 in flight and later requests wait. The H100 holds 63 beside the bf16 weights.

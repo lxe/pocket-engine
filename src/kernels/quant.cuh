@@ -419,7 +419,8 @@ __device__ void qgemv(const uint8_t* __restrict__ W, int N, int K, const bf16* _
 // consecutive weights 8t .. 8t + 7 of rows g and g + 8 (one decode each), and
 // the 8 consecutive inputs 8t .. 8t + 7 of each X row it holds (one 16-byte
 // load). Weights are read once, still quantized, and decoded in registers.
-// Small grids split K across blocks, accumulating in an f32 workspace.
+// Small grids split K across blocks; each slice writes its partial sums to an
+// f32 workspace and qmma_finish adds them in a fixed order.
 __device__ __forceinline__ uint32_t bf2(float lo, float hi) {
     __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
     return *reinterpret_cast<uint32_t*>(&v);
@@ -481,7 +482,7 @@ __device__ void qmma(const uint8_t* __restrict__ W, int N, int K, const bf16* __
         for (int e = 0; e < 4; e++) {
             const int n = n0 + g + (e >> 1) * 8, m = m0 + 8 * j + 2 * t + (e & 1);
             if (n < N && m < M) {
-                if (ksplit > 1) atomicAdd(acc_ws + (size_t)m * N + n, acc[j][e]);
+                if (ksplit > 1) acc_ws[((size_t)blockIdx.z * M + m) * N + n] = acc[j][e];
                 else if (f32_out) ((float*)Y)[(size_t)m * ldy + off + n] = acc[j][e];
                 else ((bf16*)Y)[(size_t)m * ldy + off + n] = f2b(acc[j][e]);
             }
@@ -489,14 +490,17 @@ __device__ void qmma(const uint8_t* __restrict__ W, int N, int K, const bf16* __
     }
 }
 
-// Writes split-K sums from the f32 workspace into the output.
-extern "C" __global__ void qmma_finish(const float* __restrict__ acc_ws, int M, int N, void* __restrict__ Y,
-                                       int ldy, int off, int f32_out) {
+// Sums the split-K slices' partial results in slice order (so results do
+// not depend on scheduling) and writes them to the output.
+extern "C" __global__ void qmma_finish(const float* __restrict__ acc_ws, int M, int N, int ksplit,
+                                       void* __restrict__ Y, int ldy, int off, int f32_out) {
     const long long total = (long long)M * N;
     for (long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (long long)gridDim.x * blockDim.x) {
+        float v = 0.f;
+        for (int z = 0; z < ksplit; z++) v += acc_ws[z * total + e];
         const int m = (int)(e / N), n = (int)(e % N);
-        if (f32_out) ((float*)Y)[(size_t)m * ldy + off + n] = acc_ws[e];
-        else ((bf16*)Y)[(size_t)m * ldy + off + n] = f2b(acc_ws[e]);
+        if (f32_out) ((float*)Y)[(size_t)m * ldy + off + n] = v;
+        else ((bf16*)Y)[(size_t)m * ldy + off + n] = f2b(v);
     }
 }
 

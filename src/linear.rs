@@ -42,8 +42,8 @@ pub struct QuantKernels {
 
 const MMA_TILES: [usize; 4] = [8, 16, 32, 64];
 
-/// Split-K partial sums accumulate here (f32), for up to 64 rows.
-const SPLIT_WORKSPACE: usize = 64 * 65_536 * 4;
+/// Split-K partial sums, one f32 slice per split.
+const SPLIT_WORKSPACE: usize = 64 << 20;
 
 fn args_mma(base: &[Arg], ws: u64, split: usize) -> Vec<Arg> {
     let mut v = base.to_vec();
@@ -245,13 +245,9 @@ impl Linear {
                         let mut split = (target * q.sms)
                             .div_ceil(warps)
                             .clamp(1, (steps / min_steps).clamp(1, 32));
-                        if rows * p.rows * 4 > SPLIT_WORKSPACE {
-                            split = 1;
-                        }
+                        // Every slice keeps its own partial sums.
+                        split = split.min(SPLIT_WORKSPACE / (rows * p.rows * 4)).max(1);
                         let ws = q.workspace.as_ref().map_or(0, |b| b.ptr);
-                        if split > 1 {
-                            gpu.memset(ws, rows * p.rows * 4)?;
-                        }
                         gpu.launch(
                             k.mma[ti],
                             (
@@ -274,6 +270,7 @@ impl Linear {
                                     P(ws),
                                     I(rows as i32),
                                     I(p.rows as i32),
+                                    I(split as i32),
                                     P(y),
                                     I(ldy as i32),
                                     I(p.off as i32),

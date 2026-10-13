@@ -160,7 +160,8 @@ impl Config {
                 .position(|v| v.as_str() == Some(t))
                 .map(|i| i as u32)
         };
-        let layers = u("block_count")?;
+        // Multi-token-prediction layers (nextn) follow the decoder layers.
+        let layers = u("block_count")? - u("nextn_predict_layers").unwrap_or(0);
         let every = u("full_attention_interval").unwrap_or(4);
         let vocab = g
             .tensors

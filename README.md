@@ -6,9 +6,9 @@ An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. I
 
 | | |
 |---|---|
-| Models | Qwen3.5 0.8B, 2B, 4B and 9B, with images. The 27B shapes (Qwen3.5, 3.6 and 3.8-27B) load but are not yet checked |
-| Architecture | Dense. Mixture-of-experts Qwen3.5 models are not supported |
-| Weights | Hugging Face safetensors checkpoints (bf16; f32 tensors are converted), or a GGUF file (text only; projector files are not read yet) |
+| Models | Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B (Qwen3.5- and 3.6-27B share its architecture), with images. All dense |
+| Not supported | Mixture-of-experts models (Qwen3.5-35B-A3B and larger), video, Qwen's FP8 and GPTQ checkpoints |
+| Weights | Hugging Face safetensors checkpoints (bf16; f32 tensors are converted), or a GGUF file (text only; projector files are not read yet). GGUF files with a multi-token-prediction layer load; the layer is skipped |
 | Images | JPEG, PNG, WebP, GIF or BMP, as `data:` or `http(s)` URLs. Images are resized so each side is a multiple of 32 pixels, and every 32×32 block becomes one prompt token. The area is held between 65,536 and `--max-image-pixels` (default 4,194,304). |
 | Quantization | GGUF weights stay quantized on the GPU: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely within a file. Activations run in bf16 with f32 accumulation; recurrent state is f32 |
 | Context | Up to `--max-context` tokens per request (default 4,096) |
@@ -86,7 +86,7 @@ Filters apply in order: min_p, then top_k, then top_p. Each one judges the token
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--max-seqs` | 256 | Most requests decoding at once; lowered at startup so their recurrent state fits in half of the free memory (49 MB per request on 9B) |
+| `--max-seqs` | 256 | Most requests decoding at once; lowered at startup so their recurrent state fits in half of the free memory (49 MB per request on 9B, 146 MB on 27B) |
 | `--max-batch-tokens` | 4096 | Most tokens in one step, decode rows plus prompt chunks |
 | `--max-context` | 4096 | Longest prompt plus output, in tokens |
 | `--memory-fraction` | 0.9 | Share of GPU memory to use; the KV cache gets what is left after the weights |
@@ -104,7 +104,7 @@ POCKET_ENGINE_MODEL=models/qwen3.5-2b \
   CUDA_COMPUTE_CAP=120a cargo test --release --features cuda
 ```
 
-With a model directory set, `tests/gpu.rs` runs six checks against the model, which can be 0.8B, 2B, 4B or 9B:
+With a model set, `tests/gpu.rs` runs six checks against it. The model can be Qwen3.5 0.8B, 2B, 4B or 9B or Qwen3.8-27B, as a directory or a GGUF file:
 
 - its predictions match stored Transformers reference outputs;
 - image prompts tokenize exactly as Transformers' processor does, and their predictions match too;
@@ -112,6 +112,8 @@ With a model directory set, `tests/gpu.rs` runs six checks against the model, wh
 - the samplers keep exactly the right tokens and draw them in proportion to the model's probabilities;
 - penalties cut repetition;
 - the HTTP API streams and reports usage correctly.
+
+A GGUF model is held to a looser bar on the accuracy check: 85% of picks agree with bf16 Transformers and the median log-probability difference stays under 0.1. Its image check is skipped.
 
 To check a model or prompt that isn't in the fixtures, `scripts/accuracy.py` makes new reference data with Transformers:
 

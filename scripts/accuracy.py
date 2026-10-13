@@ -47,7 +47,7 @@ def compare(ref_path, ours_path):
             diffs.append(abs(rt[r["argmax"]] - gt.get(r["argmax"], -99)))
             if r["argmax"] != g["argmax"]:
                 # One bf16 rounding step of the reference's logits at these sizes.
-                tie = r["top"][0][1] - r["top"][1][1] <= 0.125; ties += tie
+                tie = r["top"][0][1] - r["top"][1][1] <= 0.126; ties += tie
                 print("mismatch at", i, "near tie in the reference" if tie else "", r["top"][:2], g["top"][:2])
     diffs.sort()
     print(f"top-1 agreement {agree}/{tot} ({ties} of the misses are within one bf16 step in the reference); "

@@ -1,0 +1,169 @@
+{
+ "model": "Qwen/Qwen3.8-27B",
+ "workload": "scripts/load.py, greedy, thinking off",
+ "rtx5090_q4_k_m": {
+  "file": "ggml-org/Qwen3.8-27B-GGUF Qwen3.8-27B-Q4_K_M.gguf",
+  "max_seqs": 17,
+  "kv_blocks": 1953,
+  "results": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 6.95,
+    "out_tok_s": 54.4,
+    "ttft_p50": 0.065,
+    "ttft_p95": 0.097,
+    "lat_p50": 0.399,
+    "lat_p95": 0.564,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 10.29,
+    "out_tok_s": 154.1,
+    "ttft_p50": 0.144,
+    "ttft_p95": 0.317,
+    "lat_p50": 1.123,
+    "lat_p95": 2.253,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 10.72,
+    "out_tok_s": 226.0,
+    "ttft_p50": 0.176,
+    "ttft_p95": 0.588,
+    "lat_p50": 1.549,
+    "lat_p95": 3.206,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 13.05,
+    "out_tok_s": 241.2,
+    "ttft_p50": 1.647,
+    "ttft_p95": 1.938,
+    "lat_p50": 2.913,
+    "lat_p95": 4.867,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 19.93,
+    "out_tok_s": 231.2,
+    "ttft_p50": 4.737,
+    "ttft_p95": 5.222,
+    "lat_p50": 6.065,
+    "lat_p95": 7.848,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 6.75,
+    "out_tok_s": 234.6,
+    "ttft_p50": 2.515,
+    "ttft_p95": 5.587,
+    "lat_p50": 4.148,
+    "lat_p95": 6.573,
+    "first_error": null
+   }
+  ]
+ },
+ "h100_bf16": {
+  "host": "RunPod H100 80GB HBM3 SXM, driver 580.126.09, 2026-10-12",
+  "max_seqs": 63,
+  "kv_blocks": 8434,
+  "results": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 8.38,
+    "out_tok_s": 46.4,
+    "ttft_p50": 0.045,
+    "ttft_p95": 0.054,
+    "lat_p50": 0.416,
+    "lat_p95": 0.677,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 6.58,
+    "out_tok_s": 256.4,
+    "ttft_p50": 0.067,
+    "ttft_p95": 0.133,
+    "lat_p50": 0.633,
+    "lat_p95": 1.346,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 5.81,
+    "out_tok_s": 450.3,
+    "ttft_p50": 0.08,
+    "ttft_p95": 0.25,
+    "lat_p50": 0.757,
+    "lat_p95": 1.735,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.19,
+    "out_tok_s": 662.4,
+    "ttft_p50": 0.102,
+    "ttft_p95": 0.431,
+    "lat_p50": 0.979,
+    "lat_p95": 2.136,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 5.62,
+    "out_tok_s": 897.8,
+    "ttft_p50": 0.152,
+    "ttft_p95": 0.779,
+    "lat_p50": 1.353,
+    "lat_p95": 3.131,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.4,
+    "out_tok_s": 700.4,
+    "ttft_p50": 0.743,
+    "ttft_p95": 0.825,
+    "lat_p50": 1.447,
+    "lat_p95": 2.07,
+    "first_error": null
+   }
+  ]
+ },
+ "accuracy_vs_transformers_bf16": {
+  "h100_bf16_text": "211/213 top-1; misses: one exact tie, one 0.12500006 apart (one bf16 step); median |dlogprob| 0.0004, p95 0.035",
+  "h100_bf16_images": "91/91 top-1; prompt tokens identical; median 0.0001, p95 0.050",
+  "rtx5090_Q4_K_M_text": "207/213, median 0.0019, p95 0.17",
+  "rtx5090_UD-Q4_K_XL_text": "210/213, median 0.0011, p95 0.16",
+  "rtx5090_UD-IQ4_XS_text": "207/213, median 0.0022, p95 0.19"
+ }
+}

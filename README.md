@@ -1,9 +1,10 @@
 # pocket-engine
 
-An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API, for text and images, from bf16, FP8, FP4 or GGUF weights. It is ready 2 to 5 seconds after launch.
+An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API, for text and images, from bf16, FP8, FP4 or GGUF weights.
 
 On one H100, against vLLM 0.31.0 on the same machine:
 
+- **Startup.** Serving 2.7 s after launch on Qwen3.5-9B and 5.4 s on Qwen3.8-27B, against vLLM's 89 to 165 s.
 - **Throughput.** Qwen3.5-2B serves 7,530 output tokens per second with 64 requests in flight, against vLLM's 5,172; it leads on every dense model in bf16 up to 9B and in FP8.
 - **First token.** A short prompt's first token arrives in 13.5 ms on Qwen3.5-9B, against vLLM's 57.5. Long prompts prefill at about the same speed: a 64k-token prompt takes 2.29 s on 9B, against 2.28, and 7.27 s on 27B, against 6.93.
 - **Speculative decoding.** With the checkpoint's multi-token-prediction layer drafting two tokens a step (`--mtp`), one 9B stream decodes at 293 tokens per second, against vLLM's 253 with the same drafting, and 64 in flight reach 4,155 against 2,882.
@@ -30,16 +31,17 @@ Output tokens per second with 64 requests in flight on one H100, from `scripts/l
 
 ¹ From [a separate H100 run](docs/h100-comparison.md#27b-multi-token-prediction-and-shared-prefixes), with vLLM at `--max-num-seqs 256`. ² Both engines drafting two tokens a step with their multi-token prediction (pocket-engine `--mtp 2`, vLLM's `mtp` method with 2 speculative tokens); [all loads and draft counts](docs/design.md#multi-token-prediction).
 
-Time to first token, one request at a time, bf16 ([receipt](docs/receipts/h100-mtp-ttft.json)):
+Startup and time to first token, one request at a time, bf16 ([receipt](docs/receipts/h100-mtp-ttft.json)):
 
-| Prompt | Qwen3.5-9B | vLLM | Qwen3.8-27B | vLLM |
+| | Qwen3.5-9B | vLLM | Qwen3.8-27B | vLLM |
 |---|---:|---:|---:|---:|
+| Launch to serving³ | **2.7 s** | 89–165 s | **5.4 s** | 96–124 s |
 | 60 to 200 tokens (median) | **13.5 ms** | 57.5 ms | **36.5 ms** | 97.4 ms |
 | 8k tokens | **0.29 s** | 0.34 s | 0.81 s | **0.79 s** |
 | 32k tokens | **1.06 s** | 1.10 s | 3.28 s | **3.22 s** |
 | 64k tokens | 2.29 s | **2.28 s** | 7.27 s | **6.93 s** |
 
-Prompts run on a FlashAttention-3-style warp-specialized flash kernel and a two-pass chunked linear-attention recurrence, both written for this engine ([long contexts](docs/design.md#long-contexts)).
+³ Weights in the page cache; vLLM's time counts from its first log line, after Python's imports. Prompts run on a FlashAttention-3-style warp-specialized flash kernel and a two-pass chunked linear-attention recurrence, both written for this engine ([long contexts](docs/design.md#long-contexts)).
 
 ## Supported
 

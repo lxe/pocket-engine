@@ -10,6 +10,7 @@ pub mod linear;
 pub mod model;
 pub mod sched;
 pub mod server;
+pub mod source;
 pub mod vision;
 
 #[derive(Debug, thiserror::Error)]

@@ -184,13 +184,15 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
                   int Hk, int Hv, const float* __restrict__ neg_a, const float* __restrict__ dt_bias,
                   const float* __restrict__ norm_w, float* __restrict__ state,
                   const int* __restrict__ cu, const int* __restrict__ slots,
-                  const int* __restrict__ fresh, bf16* __restrict__ out, float eps) {
+                  const int* __restrict__ fresh, bf16* __restrict__ out, float eps, int tiled) {
     __shared__ float qs[GDN_DIM], ks[GDN_DIM], sh[32];
     const int s = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
     const int j = tid >> 1, half = tid & 1, i0 = half * GDN_HALF;
     const int t0 = cu[s], t1 = cu[s + 1];
     if (t0 == t1) return;
-    const int kh = h / (Hv / Hk);
+    // Value head h reads key head h / (Hv / Hk) (grouped order), or h % Hk in
+    // the tiled order GGUF files use.
+    const int kh = tiled ? h % Hk : h / (Hv / Hk);
     float* S = state + ((size_t)slots[s] * Hv + h) * GDN_DIM * GDN_DIM;
     float r[GDN_HALF];
     const bool is_fresh = fresh[s] != 0;
@@ -314,15 +316,15 @@ extern "C" __global__ void __launch_bounds__(128)
 // are split across warps with an online softmax per warp, then merged. The
 // output is gated: out = bf16(bf16(attn) * sigmoid(gate)).
 // Cache layout: [block * block_size + offset][Hkv][256].
-template <int G>
+template <int G, int WARPS>
 __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16* __restrict__ kcache,
                                           const bf16* __restrict__ vcache, const bf16* __restrict__ qkv,
                                           int qstride, int Hq, int Hkv, const int* __restrict__ pos,
                                           const int* __restrict__ tok_seq,
                                           const int* __restrict__ block_table, int max_blocks,
                                           int block_size, bf16* __restrict__ out, float scale) {
-    __shared__ float sm_m[ATTN_WARPS][G], sm_s[ATTN_WARPS][G];
-    __shared__ float sm_acc[ATTN_WARPS][G][HEAD_DIM];
+    __shared__ float sm_m[WARPS][G], sm_s[WARPS][G];
+    __shared__ float sm_acc[WARPS][G][HEAD_DIM];
     const int t = blockIdx.x, kvh = blockIdx.y;
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
     const int L = pos[t] + 1;
@@ -340,7 +342,7 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16
         m[g] = -INFINITY;
         ssum[g] = 0.f;
     }
-    for (int j = w; j < L; j += ATTN_WARPS) {
+    for (int j = w; j < L; j += WARPS) {
         const size_t slot = (size_t)bt[j / block_size] * block_size + (j % block_size);
         const size_t off = (slot * Hkv + kvh) * HEAD_DIM + l * 8;
         float kf[8], vf[8];
@@ -371,35 +373,43 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16
         for (int e = 0; e < 8; e++) sm_acc[w][g][l * 8 + e] = acc[g][e];
     }
     __syncthreads();
-    const int d = threadIdx.x;  // blockDim.x == HEAD_DIM
+    for (int d = threadIdx.x; d < HEAD_DIM; d += WARPS * 32) {
 #pragma unroll
-    for (int g = 0; g < G; g++) {
-        float M = -INFINITY;
+        for (int g = 0; g < G; g++) {
+            float M = -INFINITY;
 #pragma unroll
-        for (int k = 0; k < ATTN_WARPS; k++) M = fmaxf(M, sm_m[k][g]);
-        float S = 0.f, A = 0.f;
+            for (int k = 0; k < WARPS; k++) M = fmaxf(M, sm_m[k][g]);
+            float S = 0.f, A = 0.f;
 #pragma unroll
-        for (int k = 0; k < ATTN_WARPS; k++) {
-            const float f = sm_m[k][g] == -INFINITY ? 0.f : expf(sm_m[k][g] - M);
-            S += sm_s[k][g] * f;
-            A += sm_acc[k][g][d] * f;
+            for (int k = 0; k < WARPS; k++) {
+                const float f = sm_m[k][g] == -INFINITY ? 0.f : expf(sm_m[k][g] - M);
+                S += sm_s[k][g] * f;
+                A += sm_acc[k][g][d] * f;
+            }
+            const int h = kvh * G + g;
+            const float o = rbf(A / S);
+            const float gate = b2f(qkv[(size_t)t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d]);
+            out[((size_t)t * Hq + h) * HEAD_DIM + d] = f2b(o / (1.f + expf(-gate)));
         }
-        const int h = kvh * G + g;
-        const float o = rbf(A / S);
-        const float gate = b2f(qkv[(size_t)t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d]);
-        out[((size_t)t * Hq + h) * HEAD_DIM + d] = f2b(o / (1.f + expf(-gate)));
     }
 }
 
-extern "C" __global__ void __launch_bounds__(ATTN_WARPS * 32)
-    attn_paged_g4(const bf16* __restrict__ q, const bf16* __restrict__ kcache,
-                  const bf16* __restrict__ vcache, const bf16* __restrict__ qkv, int qstride, int Hq,
-                  int Hkv, const int* __restrict__ pos, const int* __restrict__ tok_seq,
-                  const int* __restrict__ block_table, int max_blocks, int block_size,
-                  bf16* __restrict__ out, float scale) {
-    attn_body<4>(q, kcache, vcache, qkv, qstride, Hq, Hkv, pos, tok_seq, block_table, max_blocks,
-                 block_size, out, scale);
-}
+// Query heads per kv head (G) select the kernel; the per-warp merge buffers
+// must fit in 48 KB of shared memory, so larger groups use fewer warps.
+#define ATTN_KERNEL(G, WARPS)                                                                          \
+    extern "C" __global__ void __launch_bounds__(WARPS * 32) attn_paged_g##G(                          \
+        const bf16* __restrict__ q, const bf16* __restrict__ kcache, const bf16* __restrict__ vcache,  \
+        const bf16* __restrict__ qkv, int qstride, int Hq, int Hkv, const int* __restrict__ pos,      \
+        const int* __restrict__ tok_seq, const int* __restrict__ block_table, int max_blocks,         \
+        int block_size, bf16* __restrict__ out, float scale) {                                         \
+        attn_body<G, WARPS>(q, kcache, vcache, qkv, qstride, Hq, Hkv, pos, tok_seq, block_table,       \
+                            max_blocks, block_size, out, scale);                                       \
+    }
+ATTN_KERNEL(1, 8)
+ATTN_KERNEL(2, 8)
+ATTN_KERNEL(4, 8)
+ATTN_KERNEL(6, 4)
+ATTN_KERNEL(8, 4)
 
 __device__ __forceinline__ uint32_t mix32(uint32_t x) {
     x ^= x >> 16;
@@ -655,30 +665,31 @@ extern "C" __global__ void layernorm(const bf16* __restrict__ x, const float* __
     }
 }
 
-// Splits the qkv projection into head-major q, k, v ([head][patch][64]),
-// adding the bias and applying 2D rotary embedding to q and k in f32: dims
-// d and d + 32 rotate together with frequency d % 16 of the patch's row
-// (d % 32 < 16) or column position. One block of 64 threads per (patch, head).
-extern "C" __global__ void __launch_bounds__(VIT_HEAD)
+// Splits the qkv projection into head-major q, k, v ([head][patch][hd]),
+// adding the bias and applying 2D rotary embedding to q and k in f32. With
+// half = hd / 2, dims d and d + half rotate together; frequency f = d % half
+// uses the patch's row for f < hd / 4 and its column otherwise, with inverse
+// frequency index f % (hd / 4). One block of hd threads per (patch, head).
+extern "C" __global__ void __launch_bounds__(128)
     vit_qkv_rope(const float* __restrict__ y, const float* __restrict__ bias,
                  const int* __restrict__ pos_hw, const float* __restrict__ inv_freq,
                  bf16* __restrict__ q, bf16* __restrict__ k, bf16* __restrict__ v, int P, int H) {
-    __shared__ float qs[VIT_HEAD], ks[VIT_HEAD];
-    const int p = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
-    const int D = H * VIT_HEAD;
+    __shared__ float qs[128], ks[128];
+    const int p = blockIdx.x, h = blockIdx.y, d = threadIdx.x, hd = blockDim.x;
+    const int D = H * hd, half = hd / 2, quarter = hd / 4;
     const float* row = y + (size_t)p * 3 * D;
-    const float qv = rbf(row[h * VIT_HEAD + d] + bias[h * VIT_HEAD + d]);
-    const float kv = rbf(row[D + h * VIT_HEAD + d] + bias[D + h * VIT_HEAD + d]);
-    const float vv = rbf(row[2 * D + h * VIT_HEAD + d] + bias[2 * D + h * VIT_HEAD + d]);
+    const float qv = rbf(row[h * hd + d] + bias[h * hd + d]);
+    const float kv = rbf(row[D + h * hd + d] + bias[D + h * hd + d]);
+    const float vv = rbf(row[2 * D + h * hd + d] + bias[2 * D + h * hd + d]);
     qs[d] = qv;
     ks[d] = kv;
     __syncthreads();
-    const int f = d % 32;
-    const float angle = (float)(f < 16 ? pos_hw[2 * p] : pos_hw[2 * p + 1]) * inv_freq[f % 16];
+    const int f = d % half;
+    const float angle = (float)(f < quarter ? pos_hw[2 * p] : pos_hw[2 * p + 1]) * inv_freq[f % quarter];
     const float c = cosf(angle), s = sinf(angle);
-    const float qr = d < 32 ? -qs[d + 32] : qs[d - 32];
-    const float kr = d < 32 ? -ks[d + 32] : ks[d - 32];
-    const size_t o = ((size_t)h * P + p) * VIT_HEAD + d;
+    const float qr = d < half ? -qs[d + half] : qs[d - half];
+    const float kr = d < half ? -ks[d + half] : ks[d - half];
+    const size_t o = ((size_t)h * P + p) * hd + d;
     q[o] = f2b(qv * c + qr * s);
     k[o] = f2b(kv * c + kr * s);
     v[o] = f2b(vv);

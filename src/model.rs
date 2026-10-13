@@ -1,12 +1,13 @@
 //! Qwen3.5 text decoder: configuration, fused weights, per-sequence state and
 //! one forward step over a flat token batch.
 
+use crate::gguf::Gguf;
 use crate::gpu::{Arg, Buf, Gpu, Kernel, Pinned};
+use crate::linear::{Kind, Linear, Part, Quants};
+use crate::source::Source;
 use crate::{Error, Result};
-use half::bf16;
-use safetensors::{Dtype, SafeTensors};
-use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 pub const GDN_DIM: usize = 128;
 pub const HEAD_DIM: usize = 256;
@@ -31,6 +32,8 @@ pub struct Config {
     pub image_token: u32,
     /// Rotary frequencies per axis (time, height, width), interleaved.
     pub mrope_section: [usize; 3],
+    /// Linear-attention value heads in GGUF's tiled order (see Source).
+    pub tiled_v: bool,
 }
 
 impl Config {
@@ -85,6 +88,7 @@ impl Config {
                 }
                 _ => [11, 11, 10],
             },
+            tiled_v: false,
         };
         let check = |ok: bool, what: &str| {
             if ok {
@@ -99,8 +103,8 @@ impl Config {
             "linear head dims must be 128",
         )?;
         check(
-            cfg.hq == 4 * cfg.hkv,
-            "expected four query heads per kv head",
+            cfg.hq.is_multiple_of(cfg.hkv) && matches!(cfg.hq / cfg.hkv, 1 | 2 | 4 | 6 | 8),
+            "query heads per kv head must be 1, 2, 4, 6 or 8",
         )?;
         check(
             cfg.lin_v_heads.is_multiple_of(cfg.lin_k_heads),
@@ -121,6 +125,112 @@ impl Config {
         )?;
         Ok(cfg)
     }
+    /// The configuration of a model directory or GGUF file.
+    pub fn for_model(path: &Path) -> Result<Self> {
+        match crate::source::gguf_path(path) {
+            Some(g) => Self::from_gguf(&Gguf::open(&g)?),
+            None => Self::load(path),
+        }
+    }
+
+    /// Reads a GGUF file's metadata (architecture qwen35).
+    pub fn from_gguf(g: &Gguf) -> Result<Self> {
+        let arch = g
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        if arch != "qwen35" {
+            return Err(Error::Config(format!(
+                "unsupported GGUF architecture {arch}"
+            )));
+        }
+        let u = |k: &str| -> Result<usize> {
+            g.get(&format!("qwen35.{k}"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .ok_or_else(|| Error::Config(format!("GGUF lacks qwen35.{k}")))
+        };
+        let tokens = g
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&[]);
+        let find = |t: &str| {
+            tokens
+                .iter()
+                .position(|v| v.as_str() == Some(t))
+                .map(|i| i as u32)
+        };
+        let layers = u("block_count")?;
+        let every = u("full_attention_interval").unwrap_or(4);
+        let vocab = g
+            .tensors
+            .get("token_embd.weight")
+            .and_then(|t| t.dims.get(1).copied())
+            .ok_or_else(|| Error::Config("GGUF lacks token_embd.weight".into()))?;
+        let sections: Vec<usize> = g
+            .get("qwen35.rope.dimension_sections")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64())
+                    .map(|x| x as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut eos: Vec<u32> = [find("<|im_end|>"), find("<|endoftext|>")]
+            .into_iter()
+            .flatten()
+            .collect();
+        if let Some(e) = g
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_u64())
+            && !eos.contains(&(e as u32))
+        {
+            eos.push(e as u32);
+        }
+        let cfg = Self {
+            hidden: u("embedding_length")?,
+            layers,
+            inter: u("feed_forward_length")?,
+            vocab,
+            hq: u("attention.head_count")?,
+            hkv: u("attention.head_count_kv")?,
+            lin_k_heads: u("ssm.group_count")?,
+            lin_v_heads: u("ssm.time_step_rank")?,
+            eps: g
+                .get("qwen35.attention.layer_norm_rms_epsilon")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6) as f32,
+            rope_theta: g
+                .get("qwen35.rope.freq_base")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e7),
+            attn_layers: (0..layers).map(|i| (i + 1) % every == 0).collect(),
+            eos,
+            image_token: find("<|image_pad|>").unwrap_or(248056),
+            mrope_section: if sections.len() >= 3 {
+                [sections[0], sections[1], sections[2]]
+            } else {
+                [11, 11, 10]
+            },
+            tiled_v: true,
+        };
+        let ok = u("attention.key_length")? == HEAD_DIM
+            && u("ssm.state_size")? == GDN_DIM
+            && u("ssm.inner_size")? == cfg.lin_v_heads * GDN_DIM
+            && u("rope.dimension_count")? == ROPE_DIM
+            && u("ssm.conv_kernel")? == 4
+            && cfg.hq.is_multiple_of(cfg.hkv)
+            && matches!(cfg.hq / cfg.hkv, 1 | 2 | 4 | 6 | 8)
+            && cfg.lin_v_heads.is_multiple_of(cfg.lin_k_heads)
+            && cfg.hidden.is_multiple_of(256)
+            && cfg.inter.is_multiple_of(256);
+        if !ok {
+            return Err(Error::Config("unsupported qwen35 GGUF shape".into()));
+        }
+        Ok(cfg)
+    }
+
     /// Convolution channels: q, k (key heads) and v (value heads).
     pub fn conv_dim(&self) -> usize {
         (2 * self.lin_k_heads + self.lin_v_heads) * GDN_DIM
@@ -151,19 +261,19 @@ impl Config {
 
 enum Mixer {
     Gdn {
-        w_in: Buf,
+        w_in: Linear,
         conv_w: Buf,
         neg_a: Buf,
         dt_bias: Buf,
         norm_w: Buf,
-        w_out: Buf,
+        w_out: Linear,
         state: usize,
     },
     Attn {
-        w_qkv: Buf,
+        w_qkv: Linear,
         q_norm: Buf,
         k_norm: Buf,
-        w_o: Buf,
+        w_o: Linear,
         cache: usize,
     },
 }
@@ -172,8 +282,8 @@ struct Layer {
     mixer: Mixer,
     in_norm: Buf,
     post_norm: Buf,
-    w_gu: Buf,
-    w_down: Buf,
+    w_gu: Linear,
+    w_down: Linear,
 }
 
 struct Kernels {
@@ -190,132 +300,15 @@ struct Kernels {
 
 pub struct Model {
     pub cfg: Config,
-    embed: Buf,
+    embed: Rc<Buf>,
+    lm_head: Linear,
     final_norm: Buf,
     inv_freq: Buf,
     layers: Vec<Layer>,
     k: Kernels,
-}
-
-pub(crate) struct Checkpoint {
-    maps: Vec<memmap2::Mmap>,
-    index: HashMap<String, usize>,
-    prefix: String,
-}
-
-impl Checkpoint {
-    pub(crate) fn open(dir: &Path) -> Result<Self> {
-        let mut files: Vec<String> = std::fs::read_dir(dir)?
-            .filter_map(|e| e.ok()?.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(Error::Config(format!(
-                "no safetensors in {}",
-                dir.display()
-            )));
-        }
-        let mut maps = Vec::new();
-        let mut index = HashMap::new();
-        for (i, f) in files.iter().enumerate() {
-            let file = std::fs::File::open(dir.join(f))?;
-            // SAFETY-free: memmap2::Mmap::map is unsafe only for concurrent file
-            // mutation, which the model directory does not see while serving.
-            let map = map_file(&file)?;
-            let names: Vec<String> = SafeTensors::deserialize(&map)?
-                .names()
-                .into_iter()
-                .map(String::from)
-                .collect();
-            for n in names {
-                index.insert(n, i);
-            }
-            maps.push(map);
-        }
-        let prefix = if index.contains_key("model.language_model.embed_tokens.weight") {
-            "model.language_model."
-        } else {
-            "model."
-        };
-        Ok(Self {
-            maps,
-            index,
-            prefix: prefix.into(),
-        })
-    }
-
-    /// Whether a tensor exists, by its full name.
-    pub(crate) fn has(&self, full: &str) -> bool {
-        self.index.contains_key(full)
-    }
-
-    fn view(&self, name: &str) -> Result<(Dtype, Vec<usize>, &[u8])> {
-        let full = match name.strip_prefix('/') {
-            Some(full) => full.to_string(),
-            None => format!("{}{name}", self.prefix),
-        };
-        let i = *self
-            .index
-            .get(&full)
-            .ok_or_else(|| Error::Config(format!("missing tensor {full}")))?;
-        let st = SafeTensors::deserialize(&self.maps[i])?;
-        let v = st.tensor(&full)?;
-        let (dtype, shape) = (v.dtype(), v.shape().to_vec());
-        let offset = v.data().as_ptr() as usize - self.maps[i].as_ptr() as usize;
-        Ok((dtype, shape, &self.maps[i][offset..offset + v.data().len()]))
-    }
-
-    /// A tensor as bf16 bytes. Names are relative to the text model; a leading
-    /// '/' names a tensor in full.
-    pub(crate) fn bf16(&self, name: &str, numel: usize) -> Result<Vec<u8>> {
-        let (dtype, shape, data) = self.view(name)?;
-        if shape.iter().product::<usize>() != numel {
-            return Err(Error::Config(format!(
-                "{name}: shape {shape:?}, expected {numel} elements"
-            )));
-        }
-        match dtype {
-            Dtype::BF16 => Ok(data.to_vec()),
-            Dtype::F32 => Ok(data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .flat_map(|c| bf16::from_f32(f32::from_le_bytes(*c)).to_le_bytes())
-                .collect()),
-            d => Err(Error::Config(format!("{name}: unsupported dtype {d:?}"))),
-        }
-    }
-
-    pub(crate) fn f32(&self, name: &str, numel: usize) -> Result<Vec<f32>> {
-        let (dtype, shape, data) = self.view(name)?;
-        if shape.iter().product::<usize>() != numel {
-            return Err(Error::Config(format!(
-                "{name}: shape {shape:?}, expected {numel} elements"
-            )));
-        }
-        match dtype {
-            Dtype::BF16 => Ok(data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| bf16::from_le_bytes(*c).to_f32())
-                .collect()),
-            Dtype::F32 => Ok(data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect()),
-            d => Err(Error::Config(format!("{name}: unsupported dtype {d:?}"))),
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-fn map_file(file: &std::fs::File) -> Result<memmap2::Mmap> {
-    // SAFETY: the checkpoint is read-only while the engine runs.
-    Ok(unsafe { memmap2::Mmap::map(file)? })
+    quants: Quants,
+    /// Bytes of weights on the device.
+    pub weight_bytes: usize,
 }
 
 pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -323,22 +316,17 @@ pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 impl Model {
-    pub fn load(gpu: &Gpu, dir: &Path) -> Result<Self> {
-        let cfg = Config::load(dir)?;
-        let ck = Checkpoint::open(dir)?;
+    /// Loads a Hugging Face directory or a GGUF file (or a directory holding one).
+    pub fn load(gpu: &Gpu, path: &Path) -> Result<Self> {
+        let src = Source::open(path)?;
+        let mut cfg = match &src {
+            Source::Gguf(g) => Config::from_gguf(g)?,
+            Source::Safetensors(_) => Config::load(path)?,
+        };
+        cfg.tiled_v = src.tiled_value_heads() && cfg.lin_v_heads != cfg.lin_k_heads;
+        let mut quants = Quants::default();
         let (h, i) = (cfg.hidden, cfg.inter);
-        // Zero-centred RMSNorm weights: the model multiplies by (1 + w).
-        let norm = |name: &str, n: usize| -> Result<Buf> {
-            let w: Vec<f32> = ck.f32(name, n)?.into_iter().map(|x| x + 1.0).collect();
-            gpu.upload(&f32_bytes(&w))
-        };
-        let fused = |names: &[(&str, usize)]| -> Result<Buf> {
-            let mut bytes = Vec::new();
-            for (n, rows) in names {
-                bytes.extend(ck.bf16(n, rows * h)?);
-            }
-            gpu.upload(&bytes)
-        };
+        let up = |v: &[f32]| gpu.upload(&f32_bytes(v));
         let mut layers = Vec::with_capacity(cfg.layers);
         let (mut n_state, mut n_cache) = (0, 0);
         for l in 0..cfg.layers {
@@ -346,15 +334,24 @@ impl Model {
             let mixer = if cfg.attn_layers[l] {
                 let a = format!("{p}self_attn.");
                 let m = Mixer::Attn {
-                    w_qkv: fused(&[
-                        (&format!("{a}q_proj.weight"), 2 * cfg.hq * HEAD_DIM),
-                        (&format!("{a}k_proj.weight"), cfg.hkv * HEAD_DIM),
-                        (&format!("{a}v_proj.weight"), cfg.hkv * HEAD_DIM),
-                    ])?,
-                    q_norm: norm(&format!("{a}q_norm.weight"), HEAD_DIM)?,
-                    k_norm: norm(&format!("{a}k_norm.weight"), HEAD_DIM)?,
-                    w_o: gpu
-                        .upload(&ck.bf16(&format!("{a}o_proj.weight"), h * cfg.hq * HEAD_DIM)?)?,
+                    w_qkv: src.linear(
+                        gpu,
+                        &mut quants,
+                        &[
+                            (&format!("{a}q_proj.weight"), 2 * cfg.hq * HEAD_DIM),
+                            (&format!("{a}k_proj.weight"), cfg.hkv * HEAD_DIM),
+                            (&format!("{a}v_proj.weight"), cfg.hkv * HEAD_DIM),
+                        ],
+                        h,
+                    )?,
+                    q_norm: up(&src.norm(&format!("{a}q_norm.weight"), HEAD_DIM)?)?,
+                    k_norm: up(&src.norm(&format!("{a}k_norm.weight"), HEAD_DIM)?)?,
+                    w_o: src.linear(
+                        gpu,
+                        &mut quants,
+                        &[(&format!("{a}o_proj.weight"), h)],
+                        cfg.hq * HEAD_DIM,
+                    )?,
                     cache: n_cache,
                 };
                 n_cache += 1;
@@ -362,24 +359,29 @@ impl Model {
             } else {
                 let a = format!("{p}linear_attn.");
                 let hv = cfg.lin_v_heads;
-                let conv_w = ck.f32(&format!("{a}conv1d.weight"), cfg.conv_dim() * 4)?;
-                let a_log = ck.f32(&format!("{a}A_log"), hv)?;
-                let neg_a: Vec<f32> = a_log.iter().map(|x| -x.exp()).collect();
                 let m = Mixer::Gdn {
-                    w_in: fused(&[
-                        (&format!("{a}in_proj_qkv.weight"), cfg.conv_dim()),
-                        (&format!("{a}in_proj_z.weight"), hv * GDN_DIM),
-                        (&format!("{a}in_proj_b.weight"), hv),
-                        (&format!("{a}in_proj_a.weight"), hv),
-                    ])?,
-                    conv_w: gpu.upload(&f32_bytes(&conv_w))?,
-                    neg_a: gpu.upload(&f32_bytes(&neg_a))?,
-                    dt_bias: gpu.upload(&f32_bytes(&ck.f32(&format!("{a}dt_bias"), hv)?))?,
+                    w_in: src.linear(
+                        gpu,
+                        &mut quants,
+                        &[
+                            (&format!("{a}in_proj_qkv.weight"), cfg.conv_dim()),
+                            (&format!("{a}in_proj_z.weight"), hv * GDN_DIM),
+                            (&format!("{a}in_proj_b.weight"), hv),
+                            (&format!("{a}in_proj_a.weight"), hv),
+                        ],
+                        h,
+                    )?,
+                    conv_w: up(&src.vec_f32(&format!("{a}conv1d.weight"), cfg.conv_dim() * 4)?)?,
+                    neg_a: up(&src.neg_a(l, hv)?)?,
+                    dt_bias: up(&src.vec_f32(&format!("{a}dt_bias"), hv)?)?,
                     // The gated norm uses its weight directly.
-                    norm_w: gpu
-                        .upload(&f32_bytes(&ck.f32(&format!("{a}norm.weight"), GDN_DIM)?))?,
-                    w_out: gpu
-                        .upload(&ck.bf16(&format!("{a}out_proj.weight"), h * hv * GDN_DIM)?)?,
+                    norm_w: up(&src.vec_f32(&format!("{a}norm.weight"), GDN_DIM)?)?,
+                    w_out: src.linear(
+                        gpu,
+                        &mut quants,
+                        &[(&format!("{a}out_proj.weight"), h)],
+                        hv * GDN_DIM,
+                    )?,
                     state: n_state,
                 };
                 n_state += 1;
@@ -387,35 +389,94 @@ impl Model {
             };
             layers.push(Layer {
                 mixer,
-                in_norm: norm(&format!("{p}input_layernorm.weight"), h)?,
-                post_norm: norm(&format!("{p}post_attention_layernorm.weight"), h)?,
-                w_gu: fused(&[
-                    (&format!("{p}mlp.gate_proj.weight"), i),
-                    (&format!("{p}mlp.up_proj.weight"), i),
-                ])?,
-                w_down: gpu.upload(&ck.bf16(&format!("{p}mlp.down_proj.weight"), h * i)?)?,
+                in_norm: up(&src.norm(&format!("{p}input_layernorm.weight"), h)?)?,
+                post_norm: up(&src.norm(&format!("{p}post_attention_layernorm.weight"), h)?)?,
+                w_gu: src.linear(
+                    gpu,
+                    &mut quants,
+                    &[
+                        (&format!("{p}mlp.gate_proj.weight"), i),
+                        (&format!("{p}mlp.up_proj.weight"), i),
+                    ],
+                    h,
+                )?,
+                w_down: src.linear(
+                    gpu,
+                    &mut quants,
+                    &[(&format!("{p}mlp.down_proj.weight"), h)],
+                    i,
+                )?,
             });
         }
+        let (embed, embed_kind) =
+            src.shared(gpu, &mut quants, "embed_tokens.weight", cfg.vocab, h)?;
+        // The output layer is its own tensor, or tied to the embedding.
+        let lm_head = if src.has("/lm_head.weight") {
+            src.linear(gpu, &mut quants, &[("/lm_head.weight", cfg.vocab)], h)?
+        } else {
+            Linear {
+                parts: vec![Part {
+                    buf: embed.clone(),
+                    kind: embed_kind,
+                    rows: cfg.vocab,
+                    off: 0,
+                }],
+                cols: h,
+            }
+        };
         let inv_freq: Vec<f32> = (0..ROPE_DIM / 2)
             .map(|d| 1f32 / cfg.rope_theta.powf((2 * d) as f64 / ROPE_DIM as f64) as f32)
             .collect();
+        let embed_kernel = match embed_kind {
+            Kind::Bf16 => gpu.kernel("embed")?,
+            Kind::Quant(ty) => quants.get(gpu, ty)?.embed,
+        };
         let k = Kernels {
-            embed: gpu.kernel("embed")?,
+            embed: embed_kernel,
             rmsnorm: gpu.kernel("rmsnorm")?,
             silu_mul: gpu.kernel("silu_mul")?,
             gdn_conv: gpu.kernel("gdn_conv")?,
             gdn_recurrent: gpu.kernel("gdn_recurrent")?,
             attn_prep: gpu.kernel("attn_prep")?,
-            attn: gpu.kernel("attn_paged_g4")?,
+            attn: gpu.kernel(&format!("attn_paged_g{}", cfg.hq / cfg.hkv))?,
             penalize: gpu.kernel("penalize")?,
             sample: gpu.kernel("sample")?,
         };
+        let largest = layers
+            .iter()
+            .flat_map(|l| {
+                let mut v = vec![&l.w_gu, &l.w_down];
+                match &l.mixer {
+                    Mixer::Gdn { w_in, w_out, .. } => v.extend([w_in, w_out]),
+                    Mixer::Attn { w_qkv, w_o, .. } => v.extend([w_qkv, w_o]),
+                }
+                v
+            })
+            .chain(std::iter::once(&lm_head))
+            .flat_map(|l| l.parts.iter().map(move |p| p.rows * l.cols))
+            .max()
+            .unwrap_or(0);
+        quants.prepare(gpu, largest)?;
+        let mut weight_bytes = embed.bytes;
+        for l in &layers {
+            weight_bytes += l.w_gu.bytes() + l.w_down.bytes();
+            weight_bytes += match &l.mixer {
+                Mixer::Gdn { w_in, w_out, .. } => w_in.bytes() + w_out.bytes(),
+                Mixer::Attn { w_qkv, w_o, .. } => w_qkv.bytes() + w_o.bytes(),
+            };
+        }
+        if src.has("/lm_head.weight") {
+            weight_bytes += lm_head.bytes();
+        }
         Ok(Self {
-            embed: gpu.upload(&ck.bf16("embed_tokens.weight", cfg.vocab * h)?)?,
-            final_norm: norm("norm.weight", h)?,
-            inv_freq: gpu.upload(&f32_bytes(&inv_freq))?,
+            final_norm: up(&src.norm("norm.weight", h)?)?,
+            inv_freq: up(&inv_freq)?,
+            embed,
+            lm_head,
             layers,
             k,
+            quants,
+            weight_bytes,
             cfg,
         })
     }
@@ -618,6 +679,7 @@ impl Model {
         use Arg::{F, I, P};
         let c = &self.cfg;
         let k = &self.k;
+        let q = &self.quants;
         let me = &a.meta;
         let (h, eps) = (c.hidden, c.eps);
         let (ti, si) = (t as u32, s as u32);
@@ -667,7 +729,7 @@ impl Model {
                     state,
                 } => {
                     let (pw, cd, hv) = (c.gdn_proj(), c.conv_dim(), c.lin_v_heads);
-                    gpu.gemm(a.xn.ptr, w_in.ptr, a.proj.ptr, t, h, pw, false)?;
+                    w_in.forward(gpu, q, a.xn.ptr, t, a.proj.ptr, pw, false)?;
                     gpu.launch(
                         k.gdn_conv,
                         (cd.div_ceil(128) as u32, si, 1),
@@ -706,9 +768,10 @@ impl Model {
                             P(a.m(me.fresh())),
                             P(a.core.ptr),
                             F(eps),
+                            I(c.tiled_v as i32),
                         ],
                     )?;
-                    gpu.gemm(a.core.ptr, w_out.ptr, a.h.ptr, t, hv * GDN_DIM, h, false)?;
+                    w_out.forward(gpu, q, a.core.ptr, t, a.h.ptr, h, false)?;
                 }
                 Mixer::Attn {
                     w_qkv,
@@ -718,7 +781,7 @@ impl Model {
                     cache,
                 } => {
                     let qs = c.attn_proj();
-                    gpu.gemm(a.xn.ptr, w_qkv.ptr, a.proj.ptr, t, h, qs, false)?;
+                    w_qkv.forward(gpu, q, a.xn.ptr, t, a.proj.ptr, qs, false)?;
                     gpu.launch(
                         k.attn_prep,
                         (ti, (c.hq + 2 * c.hkv) as u32, 1),
@@ -746,7 +809,7 @@ impl Model {
                     gpu.launch(
                         k.attn,
                         (ti, c.hkv as u32, 1),
-                        HEAD_DIM as u32,
+                        if c.hq / c.hkv >= 6 { 128 } else { 256 },
                         0,
                         &[
                             P(a.q.ptr),
@@ -765,11 +828,13 @@ impl Model {
                             F(1.0 / (HEAD_DIM as f32).sqrt()),
                         ],
                     )?;
-                    gpu.gemm(a.ao.ptr, w_o.ptr, a.h.ptr, t, c.hq * HEAD_DIM, h, false)?;
+                    w_o.forward(gpu, q, a.ao.ptr, t, a.h.ptr, h, false)?;
                 }
             }
             norm(a.h.ptr, &layer.post_norm, true)?;
-            gpu.gemm(a.xn.ptr, layer.w_gu.ptr, a.gu.ptr, t, h, 2 * c.inter, false)?;
+            layer
+                .w_gu
+                .forward(gpu, q, a.xn.ptr, t, a.gu.ptr, 2 * c.inter, false)?;
             let blocks = (t * c.inter / 8).div_ceil(256).min(8192) as u32;
             gpu.launch(
                 k.silu_mul,
@@ -778,7 +843,9 @@ impl Model {
                 0,
                 &[P(a.gu.ptr), P(a.act.ptr), I(c.inter as i32), I(t as i32)],
             )?;
-            gpu.gemm(a.act.ptr, layer.w_down.ptr, a.h.ptr, t, c.inter, h, false)?;
+            layer
+                .w_down
+                .forward(gpu, q, a.act.ptr, t, a.h.ptr, h, false)?;
         }
         gpu.launch(
             k.rmsnorm,
@@ -797,7 +864,8 @@ impl Model {
                 I(0),
             ],
         )?;
-        gpu.gemm(a.fin.ptr, self.embed.ptr, a.logits.ptr, s, h, c.vocab, true)?;
+        self.lm_head
+            .forward(gpu, q, a.fin.ptr, s, a.logits.ptr, c.vocab, true)?;
         let cap = (4 * a.pen_capacity) as u64;
         gpu.launch(
             k.penalize,

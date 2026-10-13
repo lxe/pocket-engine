@@ -4,11 +4,10 @@
 
 use crate::gpu::{Arg, Buf, Gpu, Kernel, Mat, Pinned};
 use crate::image::{Image, PATCH_VALUES, position_taps};
-use crate::model::{Checkpoint, f32_bytes};
+use crate::model::f32_bytes;
+use crate::source::Checkpoint;
 use crate::{Error, Result};
 use std::path::Path;
-
-const HEAD: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct VisionConfig {
@@ -19,6 +18,8 @@ pub struct VisionConfig {
     pub out: usize,
     /// Side of the square learned position table.
     pub side: usize,
+    /// Attention head width (64 or 72).
+    pub head: usize,
 }
 
 impl VisionConfig {
@@ -39,8 +40,11 @@ impl VisionConfig {
             heads: u("num_heads")?,
             out: u("out_hidden_size")?,
             side: (u("num_position_embeddings")? as f64).sqrt() as usize,
+            head: u("hidden_size")? / u("num_heads")?,
         };
-        let ok = cfg.hidden == cfg.heads * HEAD
+        let ok = cfg.hidden == cfg.heads * cfg.head
+            && cfg.head.is_multiple_of(4)
+            && cfg.head <= 128
             && u("patch_size")? == 16
             && u("temporal_patch_size")? == 2
             && u("spatial_merge_size")? == 2
@@ -111,6 +115,9 @@ fn staging_per_patch() -> usize {
 
 impl Vision {
     pub fn load(gpu: &Gpu, dir: &Path, max_patches: usize) -> Result<Option<Self>> {
+        if crate::source::gguf_path(dir).is_some() {
+            return Ok(None); // GGUF text models; projector files are not read yet
+        }
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let Some(cfg) = VisionConfig::parse(&raw)? else {
@@ -151,8 +158,9 @@ impl Vision {
                 fc2: pair(&format!("{p}.mlp.linear_fc2"), d, i)?,
             });
         }
-        let inv_freq: Vec<f32> = (0..HEAD / 4)
-            .map(|j| 1.0 / 10000f32.powf((2 * j) as f32 / (HEAD / 2) as f32))
+        let head = cfg.head;
+        let inv_freq: Vec<f32> = (0..head / 4)
+            .map(|j| 1.0 / 10000f32.powf((2 * j) as f32 / (head / 2) as f32))
             .collect();
         let pm = max_patches;
         let score_elems = 64 << 20;
@@ -211,6 +219,7 @@ impl Vision {
         }
         gpu.sync()?;
         let (d, hd, heads) = (self.cfg.hidden, self.cfg.inter, self.cfg.heads);
+        let head = self.cfg.head;
         // Stage pixels, then taps (idx, weights) and row/column per patch.
         {
             let words = self.s.staging.as_mut_slice::<u16>();
@@ -312,7 +321,7 @@ impl Vision {
             gpu.launch(
                 k.qkv_rope,
                 (p as u32, heads as u32, 1),
-                HEAD as u32,
+                head as u32,
                 0,
                 &[
                     P(s.y.ptr),
@@ -334,21 +343,21 @@ impl Vision {
                 let mut c0 = 0;
                 while c0 < n {
                     let cq = chunk.min(n - c0);
-                    let head_stride = p * HEAD;
+                    let head_stride = p * head;
                     gpu.gemm_batched(
                         n,
                         cq,
-                        HEAD,
+                        head,
                         Mat {
-                            ptr: s.k.ptr + (off * HEAD * 2) as u64,
-                            ld: HEAD,
+                            ptr: s.k.ptr + (off * head * 2) as u64,
+                            ld: head,
                             stride: head_stride,
                             trans: true,
                             f32: false,
                         },
                         Mat {
-                            ptr: s.q.ptr + ((off + c0) * HEAD * 2) as u64,
-                            ld: HEAD,
+                            ptr: s.q.ptr + ((off + c0) * head * 2) as u64,
+                            ld: head,
                             stride: head_stride,
                             trans: false,
                             f32: false,
@@ -371,16 +380,16 @@ impl Vision {
                             P(s.scores.ptr),
                             P(s.probs.ptr),
                             I(n as i32),
-                            F(1.0 / (HEAD as f32).sqrt()),
+                            F(1.0 / (head as f32).sqrt()),
                         ],
                     )?;
                     gpu.gemm_batched(
-                        HEAD,
+                        head,
                         cq,
                         n,
                         Mat {
-                            ptr: s.v.ptr + (off * HEAD * 2) as u64,
-                            ld: HEAD,
+                            ptr: s.v.ptr + (off * head * 2) as u64,
+                            ld: head,
                             stride: head_stride,
                             trans: false,
                             f32: false,
@@ -395,7 +404,7 @@ impl Vision {
                         Mat {
                             ptr: s.ao.ptr + ((off + c0) * d * 2) as u64,
                             ld: d,
-                            stride: HEAD,
+                            stride: head,
                             trans: false,
                             f32: false,
                         },

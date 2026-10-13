@@ -23,8 +23,83 @@ pub struct ChatTokenizer {
     template: String,
 }
 
+/// Qwen3.5's pre-tokenizer, normalizer and decoder, as in its tokenizer.json;
+/// GGUF files name this setup "qwen35".
+const QWEN_TOKENIZER_PARTS: &str = r#"{
+  "normalizer": {"type": "NFC"},
+  "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+    {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
+    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}]},
+  "post_processor": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
+  "decoder": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}
+}"#;
+
 impl ChatTokenizer {
-    pub fn load(dir: &Path) -> Result<Self> {
+    /// From a model directory (tokenizer.json, chat_template.jinja) or a GGUF
+    /// file, whose metadata carries the vocabulary, merges and chat template.
+    pub fn load(path: &Path) -> Result<Self> {
+        match crate::source::gguf_path(path) {
+            Some(g) => Self::from_gguf(&crate::gguf::Gguf::open(&g)?),
+            None => Self::from_dir(path),
+        }
+    }
+
+    pub fn from_gguf(g: &crate::gguf::Gguf) -> Result<Self> {
+        let arr = |k: &str| {
+            g.get(k)
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| Error::Config(format!("GGUF lacks {k}")))
+        };
+        let tokens = arr("tokenizer.ggml.tokens")?;
+        let types = arr("tokenizer.ggml.token_type")?;
+        let merges = arr("tokenizer.ggml.merges")?;
+        let model = g
+            .get("tokenizer.ggml.model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if model != "gpt2" {
+            return Err(Error::Config(format!(
+                "unsupported GGUF tokenizer {model:?}"
+            )));
+        }
+        let mut vocab = serde_json::Map::new();
+        let mut added = Vec::new();
+        for (id, (t, ty)) in tokens.iter().zip(types).enumerate() {
+            let t = t.as_str().unwrap_or_default();
+            match ty.as_u64() {
+                // Normal tokens form the BPE vocabulary; control (3) and
+                // user-defined (4) tokens are added tokens; 5 is padding.
+                Some(1) | None => {
+                    vocab.insert(t.to_string(), json!(id));
+                }
+                Some(k @ (3 | 4)) => added
+                    .push(json!({ "id": id, "content": t, "single_word": false,
+                    "lstrip": false, "rstrip": false, "normalized": false, "special": k == 3 })),
+                _ => {}
+            }
+        }
+        let merges: Vec<&str> = merges.iter().filter_map(|m| m.as_str()).collect();
+        let mut doc: Value = serde_json::from_str(QWEN_TOKENIZER_PARTS)?;
+        doc["version"] = json!("1.0");
+        doc["truncation"] = Value::Null;
+        doc["padding"] = Value::Null;
+        doc["added_tokens"] = Value::Array(added);
+        doc["model"] = json!({ "type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": "",
+            "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+            "vocab": vocab, "merges": merges });
+        let tok: tokenizers::Tokenizer = doc
+            .to_string()
+            .parse()
+            .map_err(|e: tokenizers::Error| Error::Config(e.to_string()))?;
+        let template = g
+            .get("tokenizer.chat_template")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Config("GGUF lacks tokenizer.chat_template".into()))?
+            .to_string();
+        Ok(Self { tok, template })
+    }
+
+    pub fn from_dir(dir: &Path) -> Result<Self> {
         Ok(Self {
             tok: tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
                 .map_err(|e| Error::Config(e.to_string()))?,

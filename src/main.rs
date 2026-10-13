@@ -76,6 +76,33 @@ enum Cmd {
         #[arg(long, default_value = "qwen3.5")]
         name: String,
     },
+    /// Dequantizes rows of a GGUF tensor on the GPU and writes them as
+    /// little-endian f32, for checking the quantized formats.
+    Dequant {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        tensor: String,
+        #[arg(long, default_value_t = 64)]
+        rows: usize,
+        output: PathBuf,
+    },
+    /// Times a quantized GGUF matrix against the same matrix in bf16 on cuBLAS,
+    /// for several batch sizes, and checks that their outputs agree.
+    BenchLinear {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        tensor: String,
+        #[arg(long, value_delimiter = ',', default_value = "1,4,8,16,32,64,128,512")]
+        rows: Vec<usize>,
+    },
+    /// Prints the token ids of a chat message, for checking tokenizers.
+    Tokenize {
+        #[arg(long)]
+        model: PathBuf,
+        text: String,
+    },
     /// Teacher-forced scoring for accuracy checks. Reads JSON
     /// [{"prompt": [ids] | "messages": [...], "forced": [ids]}, ...] (images
     /// in messages as data URLs) and writes, per item and position, the
@@ -121,6 +148,140 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?
                 .block_on(server::serve(tok, spec, tx, info, health, name, &bind))?;
         }
+        Cmd::Dequant {
+            model,
+            tensor,
+            rows,
+            output,
+        } => {
+            use pocket_engine::gpu::{Arg, Gpu};
+            let g = pocket_engine::gguf::Gguf::open(&model)?;
+            let (info, data) = g.tensor(&tensor).ok_or("no such tensor")?;
+            let (cols, n) = (info.dims[0], rows.min(info.numel() / info.dims[0]));
+            let gpu = Gpu::new(0)?;
+            let k = pocket_engine::linear::Quants::default().get(&gpu, info.ty)?;
+            let w = gpu.upload(&pocket_engine::gguf::repack(info.ty, data))?;
+            let out = gpu.alloc(n * cols * 2)?;
+            gpu.launch(
+                k.dequant,
+                (((n * cols / 8).div_ceil(256)) as u32, 1, 1),
+                256,
+                0,
+                &[
+                    Arg::P(w.ptr),
+                    Arg::I(0),
+                    Arg::I(n as i32),
+                    Arg::I(cols as i32),
+                    Arg::P(out.ptr),
+                ],
+            )?;
+            let mut host = gpu.pinned(n * cols * 2)?;
+            gpu.dtoh(&mut host, out.ptr, n * cols * 2)?;
+            gpu.sync()?;
+            let f: Vec<u8> = host
+                .as_slice::<u16>()
+                .iter()
+                .flat_map(|&b| half::bf16::from_bits(b).to_f32().to_le_bytes())
+                .collect();
+            std::fs::write(output, f)?;
+            eprintln!("{tensor}: {} rows x {cols}, {}", n, info.ty.name());
+        }
+        Cmd::BenchLinear {
+            model,
+            tensor,
+            rows,
+        } => {
+            use pocket_engine::gpu::{Arg, Gpu};
+            use pocket_engine::linear::{Kind, Linear, Part, Quants};
+            use std::rc::Rc;
+            let g = pocket_engine::gguf::Gguf::open(&model)?;
+            let (info, data) = g.tensor(&tensor).ok_or("no such tensor")?;
+            let (k, n) = (info.dims[0], info.dims[1]);
+            let gpu = Gpu::new(0)?;
+            let mut quants = Quants::default();
+            let qk = quants.get(&gpu, info.ty)?;
+            quants.prepare(&gpu, n * k)?;
+            let w = Rc::new(gpu.upload(&pocket_engine::gguf::repack(info.ty, data))?);
+            let wb = Rc::new(gpu.alloc(n * k * 2)?);
+            gpu.launch(
+                qk.dequant,
+                (((n * k / 8).div_ceil(256)) as u32, 1, 1),
+                256,
+                0,
+                &[
+                    Arg::P(w.ptr),
+                    Arg::I(0),
+                    Arg::I(n as i32),
+                    Arg::I(k as i32),
+                    Arg::P(wb.ptr),
+                ],
+            )?;
+            let quant = Linear {
+                parts: vec![Part {
+                    buf: w,
+                    kind: Kind::Quant(info.ty),
+                    rows: n,
+                    off: 0,
+                }],
+                cols: k,
+            };
+            let dense = Linear {
+                parts: vec![Part {
+                    buf: wb,
+                    kind: Kind::Bf16,
+                    rows: n,
+                    off: 0,
+                }],
+                cols: k,
+            };
+            let max = *rows.iter().max().unwrap_or(&1);
+            let x: Vec<u8> = (0..max * k)
+                .flat_map(|i| {
+                    half::bf16::from_f32(((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
+                        .to_le_bytes()
+                })
+                .collect();
+            let x = gpu.upload(&x)?;
+            let (ya, yb) = (gpu.alloc(max * n * 4)?, gpu.alloc(max * n * 4)?);
+            println!(
+                "{tensor}: {n} x {k} {}, {:.1} MB",
+                info.ty.name(),
+                data.len() as f64 / 1e6
+            );
+            for &m in &rows {
+                let time = |l: &Linear, y: u64| -> Result<f64, Box<dyn std::error::Error>> {
+                    l.forward(&gpu, &quants, x.ptr, m, y, n, true)?;
+                    gpu.sync()?;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..20 {
+                        l.forward(&gpu, &quants, x.ptr, m, y, n, true)?;
+                    }
+                    gpu.sync()?;
+                    Ok(t0.elapsed().as_secs_f64() / 20.0)
+                };
+                let (tq, tb) = (time(&quant, ya.ptr)?, time(&dense, yb.ptr)?);
+                let mut ha = gpu.pinned(m * n * 4)?;
+                let mut hb = gpu.pinned(m * n * 4)?;
+                gpu.dtoh(&mut ha, ya.ptr, m * n * 4)?;
+                gpu.dtoh(&mut hb, yb.ptr, m * n * 4)?;
+                gpu.sync()?;
+                let (a, b) = (ha.as_slice::<f32>(), hb.as_slice::<f32>());
+                let scale = b.iter().fold(0f32, |s, v| s.max(v.abs()));
+                let err =
+                    a.iter().zip(b).fold(0f32, |s, (p, q)| s.max((p - q).abs())) / scale.max(1e-9);
+                println!(
+                    "rows {m:4}: quant {:8.1} us ({:6.0} GB/s of weights)  bf16 cuBLAS {:8.1} us  max rel diff {err:.1e}",
+                    tq * 1e6,
+                    data.len() as f64 / tq / 1e9,
+                    tb * 1e6
+                );
+            }
+        }
+        Cmd::Tokenize { model, text } => {
+            let tok = ChatTokenizer::load(&model)?;
+            let (ids, _) = tok.chat(&[serde_json::json!({ "role": "user", "content": text })])?;
+            println!("{}", serde_json::to_string(&ids)?);
+        }
         Cmd::Score {
             engine: args,
             input,
@@ -129,7 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pairs: Vec<Pair> = serde_json::from_str(&std::fs::read_to_string(input)?)?;
             let tok = ChatTokenizer::load(&args.model)?;
             let spec = Spec::load(&args.model, args.max_image_pixels)?;
-            let placeholder = Config::load(&args.model)?.image_token;
+            let placeholder = Config::for_model(&args.model)?.image_token;
             let mut items = Vec::new();
             let mut prompts = Vec::new();
             for p in pairs {

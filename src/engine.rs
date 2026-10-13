@@ -116,7 +116,7 @@ fn wait_for(path: &std::path::Path) {
 }
 
 impl Engine {
-    pub fn new(cfg: EngineConfig) -> Result<Self> {
+    pub fn new(mut cfg: EngineConfig) -> Result<Self> {
         let gpu = Gpu::new(cfg.device)?;
         if let Some(path) = &cfg.wait_for {
             wait_for(path);
@@ -129,6 +129,23 @@ impl Engine {
             None
         };
         let pool_rows = if vision.is_some() { cfg.image_pool } else { 0 };
+        // Each sequence holds a recurrent state slot (tens of MB on larger
+        // models). Keep slots within half of what is left after the weights,
+        // so the KV cache gets the rest.
+        {
+            let (free, total) = gpu.mem_info()?;
+            let usable = free.saturating_sub((total as f64 * (1.0 - cfg.memory_fraction)) as usize);
+            let fit = (usable / 2 / mc.slot_bytes()).saturating_sub(1).max(1);
+            if fit < cfg.max_seqs {
+                eprintln!(
+                    "{} sequences fit beside the KV cache ({} MB of state each); --max-seqs {} lowered",
+                    fit,
+                    mc.slot_bytes() >> 20,
+                    cfg.max_seqs
+                );
+                cfg.max_seqs = fit;
+            }
+        }
         let max_blocks = cfg.max_context.div_ceil(BLOCK_SIZE);
         let meta = Meta {
             max_tokens: cfg.max_batch_tokens.max(cfg.max_seqs),

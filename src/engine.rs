@@ -137,6 +137,11 @@ fn wait_for(path: &std::path::Path) {
     );
 }
 
+/// State slots for prefix-cache snapshots beside `max_seqs` sequences.
+fn snapshots(cfg: &EngineConfig, max_seqs: usize) -> usize {
+    cfg.prefix_cache.unwrap_or((max_seqs / 4).clamp(2, 64))
+}
+
 impl Engine {
     pub fn new(mut cfg: EngineConfig) -> Result<Self> {
         let started = Instant::now();
@@ -186,10 +191,14 @@ impl Engine {
             let (free, total) = gpu.mem_info()?;
             let usable = free.saturating_sub((total as f64 * (1.0 - cfg.memory_fraction)) as usize);
             let one_context = cfg.max_context.div_ceil(BLOCK_SIZE) * mc.block_bytes(cfg.kv_fp8);
-            let fit = ((usable / 2).min(usable.saturating_sub(one_context + (1 << 30)))
-                / mc.slot_bytes(cfg.state_bf16))
-            .saturating_sub(1)
-            .max(1);
+            let budget = (usable / 2).min(usable.saturating_sub(one_context + (1 << 30)))
+                / mc.slot_bytes(cfg.state_bf16);
+            // Slots: one per sequence, the scratch slot and the prefix
+            // cache's snapshots.
+            let mut fit = budget.saturating_sub(1).max(1);
+            while fit > 1 && fit + 1 + snapshots(&cfg, fit) > budget {
+                fit -= 1;
+            }
             if fit < cfg.max_seqs {
                 eprintln!(
                     "{} sequences fit beside the KV cache ({} MB of state each); --max-seqs {} lowered",
@@ -214,7 +223,7 @@ impl Engine {
         let act = Act::new(&gpu, &mc, meta, pool_rows, model.fp8)?;
         // One extra slot absorbs the padding rows of graph replays; the
         // prefix cache's snapshots follow it.
-        let snaps = cfg.prefix_cache.unwrap_or((cfg.max_seqs / 4).clamp(2, 64));
+        let snaps = snapshots(&cfg, cfg.max_seqs);
         let slots = cfg.max_seqs + 1 + snaps;
         let (free, total) = gpu.mem_info()?;
         let reserve = (total as f64 * (1.0 - cfg.memory_fraction)) as usize;

@@ -21,8 +21,11 @@ fn attn_ranges(n: usize) -> usize {
     n.div_ceil(ATTN_RANGE)
 }
 
-/// Dynamic shared memory of attn_flash (FA_SMEM in qwen35.cu).
-const FA_SMEM: usize = (64 + 2 * 32) * (HEAD_DIM + 8) * 2;
+/// Dynamic shared memory of attn_group_g<G> (fg_smem in qwen35.cu): 16
+/// queries of each of G heads and two buffers of 16 keys and values.
+fn fa_smem(g: usize) -> usize {
+    (g * 16 + 4 * 16) * (HEAD_DIM + 8) * 2
+}
 /// Dynamic shared memory of the chunked gated delta rule (GDN_CHUNK_SMEM in
 /// qwen35.cu).
 const GDN_CHUNK_SMEM: usize =
@@ -505,13 +508,13 @@ impl Model {
             attn: gpu.kernel(&format!("attn_paged_g{}", cfg.hq / cfg.hkv))?,
             attn8: gpu.kernel(&format!("attn_paged8_g{}", cfg.hq / cfg.hkv))?,
             attn_flash: {
-                let k = gpu.kernel("attn_flash")?;
-                gpu.set_smem(k, FA_SMEM)?;
+                let k = gpu.kernel(&format!("attn_group_g{}", cfg.hq / cfg.hkv))?;
+                gpu.set_smem(k, fa_smem(cfg.hq / cfg.hkv))?;
                 k
             },
             attn_flash8: {
-                let k = gpu.kernel("attn_flash8")?;
-                gpu.set_smem(k, FA_SMEM)?;
+                let k = gpu.kernel(&format!("attn_group8_g{}", cfg.hq / cfg.hkv))?;
+                gpu.set_smem(k, fa_smem(cfg.hq / cfg.hkv))?;
                 k
             },
             fp8_rows: gpu.kernel("fp8_activations")?,
@@ -1135,16 +1138,18 @@ impl Model {
                         )?;
                     }
                     if t > s {
-                        // Prompt sequences: flash attention, 64 queries a block.
+                        // Prompt sequences: flash attention, a block per KV
+                        // head and 16 queries.
+                        let group = c.hq / c.hkv;
                         gpu.launch(
                             if st.kv_fp8 {
                                 k.attn_flash8
                             } else {
                                 k.attn_flash
                             },
-                            ((t.div_ceil(64) + s) as u32, c.hq as u32, 1),
-                            128,
-                            FA_SMEM as u32,
+                            ((t.div_ceil(16) + s) as u32, c.hkv as u32, 1),
+                            32 * group as u32,
+                            fa_smem(group) as u32,
                             &[
                                 P(a.q.ptr),
                                 P(st.kc[*cache].ptr),

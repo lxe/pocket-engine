@@ -196,17 +196,26 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
         x2 = b2f(st[2 * C + c]);
     }
     const float4 k = *reinterpret_cast<const float4*>(w + 4 * c);
-    for (int t = t0; t < t1; t++) {
-        const float x3 = b2f(proj[(size_t)t * pstride + c]);
-        float acc = 0.f;
-        acc += x0 * k.x;
-        acc += x1 * k.y;
-        acc += x2 * k.z;
-        acc += x3 * k.w;
-        out[(size_t)t * C + c] = f2b(silu(acc));
-        x0 = x1;
-        x1 = x2;
-        x2 = x3;
+    // Inputs are loaded 8 tokens at a time, so a prompt waits for one load
+    // latency per 8 tokens rather than per token.
+    for (int t = t0; t < t1; t += 8) {
+        float xs[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) xs[u] = t + u < t1 ? b2f(proj[(size_t)(t + u) * pstride + c]) : 0.f;
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+            if (t + u >= t1) break;
+            const float x3 = xs[u];
+            float acc = 0.f;
+            acc += x0 * k.x;
+            acc += x1 * k.y;
+            acc += x2 * k.z;
+            acc += x3 * k.w;
+            out[(size_t)(t + u) * C + c] = f2b(silu(acc));
+            x0 = x1;
+            x1 = x2;
+            x2 = x3;
+        }
     }
     st[c] = f2b(x0);
     st[C + c] = f2b(x1);

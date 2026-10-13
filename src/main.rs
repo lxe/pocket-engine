@@ -583,6 +583,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Arg::P(scratch[3].ptr),
                         Arg::P(scratch[4].ptr),
                         Arg::P(scratch[5].ptr),
+                        Arg::P(0),
                     ],
                 )?;
                 if name != "decode" {

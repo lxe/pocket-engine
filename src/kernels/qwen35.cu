@@ -194,7 +194,8 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
                                     const float* __restrict__ w, bf16* __restrict__ state,
                                     bf16* __restrict__ out, const int* __restrict__ cu,
                                     const int* __restrict__ slots, const int* __restrict__ fresh,
-                                    int C, const int* __restrict__ outs, int spec) {
+                                    int C, const int* __restrict__ outs, int spec,
+                                    const int* __restrict__ snaps) {
     const int s = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
@@ -212,6 +213,20 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
     }
     float x0 = x[0], x1 = x[1], x2 = x[2];
     const float4 k = *reinterpret_cast<const float4*>(w + 4 * c);
+    // Prefix-cache snapshots (snaps: per sequence two (tokens into the row,
+    // slot) pairs, or null): the three inputs before that point.
+    if (snaps && blockIdx.z == 0) {
+        for (int j = 0; j < 2; j++) {
+            const int rel = snaps[4 * s + 2 * j];
+            if (rel < 0) continue;
+            bf16* o = state + (size_t)snaps[4 * s + 2 * j + 1] * 3 * C;
+#pragma unroll
+            for (int i = 0; i < 3; i++) {
+                const int tt = t0 + rel - 3 + i;
+                o[i * C + c] = f2b(tt >= t0 ? b2f(proj[(size_t)tt * pstride + c]) : x[tt - t0 + 3]);
+            }
+        }
+    }
     // Inputs are loaded 8 tokens at a time, so a chunk waits for one load
     // latency per 8 tokens rather than per token.
     for (int t = ta; t < tz; t += 8) {
@@ -601,7 +616,8 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
 template <int NS>
 __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__ Ui, const bf16* __restrict__ Wi,
                                               const bf16* __restrict__ Qi, const bf16* __restrict__ Kwi,
-                                              const bf16* __restrict__ Pi, const float* __restrict__ Gi) {
+                                              const bf16* __restrict__ Pi, const float* __restrict__ Gi,
+                                              const int* __restrict__ snaps) {
     constexpr int VW = GDN_DIM / NS, ON = VW / 32;
     extern __shared__ __align__(16) unsigned char ssm[];
     bf16* sW = (bf16*)ssm;                      // [GC][GSTR]
@@ -645,6 +661,19 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
                 const int row = 16 * warp + g + hf * 8, col = 8 * nn + 2 * t;
                 *reinterpret_cast<__nv_bfloat162*>(sS + (size_t)row * GSTR + col) =
                     __floats2bfloat162_rn(st[nn][2 * hf], st[nn][2 * hf + 1]);
+            }
+    };
+    // This block's share of the state into a slot.
+    auto store_state = [&](int slot) {
+        const size_t b = ((size_t)slot * Hv + h) * GDN_DIM * GDN_DIM;
+#pragma unroll
+        for (int nn = 0; nn < VW / 8; nn++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int row = 16 * warp + g + (e >> 1) * 8, col = v0 + 8 * nn + 2 * t + (e & 1);
+                const size_t at = b + (size_t)row * GDN_DIM + col;
+                if (state_bf16) ((bf16*)state)[at] = f2b(st[nn][e]);
+                else ((float*)state)[at] = st[nn][e];
             }
     };
     store_state_smem();
@@ -760,32 +789,29 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
                 }
             }
         }
+        // A prefix-cache snapshot ending with this chunk.
+        if (snaps)
+            for (int j = 0; j < 2; j++)
+                if (snaps[4 * s + 2 * j] == c0 + n - t0) store_state(snaps[4 * s + 2 * j + 1]);
         __syncthreads();
         store_state_smem();
         zero_state = false;
         __syncthreads();
     }
-#pragma unroll
-    for (int nn = 0; nn < VW / 8; nn++)
-#pragma unroll
-        for (int e = 0; e < 4; e++) {
-            const int row = 16 * warp + g + (e >> 1) * 8, col = v0 + 8 * nn + 2 * t + (e & 1);
-            const size_t at = (size_t)row * GDN_DIM + col;
-            if (state_bf16) Sgb[at] = f2b(st[nn][e]);
-            else Sg[at] = st[nn][e];
-        }
+    store_state(slots[s]);
 }
 #define GDN_SCAN_ARGS                                                                                   \
     GDN_ARGS, const bf16 *__restrict__ Ui, const bf16 *__restrict__ Wi, const bf16 *__restrict__ Qi,  \
-        const bf16 *__restrict__ Kwi, const bf16 *__restrict__ Pi, const float *__restrict__ Gi
+        const bf16 *__restrict__ Kwi, const bf16 *__restrict__ Pi, const float *__restrict__ Gi,        \
+        const int *__restrict__ snaps
 extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan1(GDN_SCAN_ARGS) {
-    gdn_scan_cols<1>(GDN_PASS, Ui, Wi, Qi, Kwi, Pi, Gi);
+    gdn_scan_cols<1>(GDN_PASS, Ui, Wi, Qi, Kwi, Pi, Gi, snaps);
 }
 extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan2(GDN_SCAN_ARGS) {
-    gdn_scan_cols<2>(GDN_PASS, Ui, Wi, Qi, Kwi, Pi, Gi);
+    gdn_scan_cols<2>(GDN_PASS, Ui, Wi, Qi, Kwi, Pi, Gi, snaps);
 }
 extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan4(GDN_SCAN_ARGS) {
-    gdn_scan_cols<4>(GDN_PASS, Ui, Wi, Qi, Kwi, Pi, Gi);
+    gdn_scan_cols<4>(GDN_PASS, Ui, Wi, Qi, Kwi, Pi, Gi, snaps);
 }
 
 // The gated RMSNorm of one (token, head): lane l < 16 holds outputs 8l ..

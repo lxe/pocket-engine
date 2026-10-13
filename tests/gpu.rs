@@ -437,11 +437,29 @@ fn prefix_cache_reuses_without_changing_output() {
     drop(cached);
     let mut plain = Engine::new(EngineConfig {
         prefix_cache: Some(0),
-        ..config(dir)
+        ..config(dir.clone())
     })
     .unwrap();
     let without = generate(&mut plain, std::slice::from_ref(&second), 24);
     assert_eq!(plain.sched.counters.cached_tokens, 0);
+    assert_eq!(with, without);
+    drop(plain);
+    // With whole prompts in one step, the state at a boundary inside the
+    // step is written by the step itself. Prompts now split differently with
+    // and without the cache, so matmul rounding may differ; the first tokens
+    // agree.
+    let big = |prefix_cache| EngineConfig {
+        max_batch_tokens: 1024,
+        prefix_cache,
+        ..config(dir.clone())
+    };
+    let mut cached = Engine::new(big(None)).unwrap();
+    generate(&mut cached, std::slice::from_ref(&first), 8);
+    let with = generate(&mut cached, std::slice::from_ref(&second), 8);
+    assert!(cached.sched.counters.cached_tokens >= pocket_engine::sched::CACHE_UNIT as u64);
+    drop(cached);
+    let mut plain = Engine::new(big(Some(0))).unwrap();
+    let without = generate(&mut plain, std::slice::from_ref(&second), 8);
     assert_eq!(with, without);
 }
 

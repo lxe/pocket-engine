@@ -226,6 +226,10 @@ pub struct Step {
     /// State slot copies (from, to) to make, in order, before the step runs:
     /// prefix-cache snapshots and restores.
     pub copies: Vec<(usize, usize)>,
+    /// Prefix-cache snapshots the step writes itself: (row, prefix length,
+    /// state slot). The recurrence keeps its state at the prefix's end, which
+    /// falls on its chunk grid, so the prompt need not stop there.
+    snaps: Vec<(usize, usize, usize)>,
 }
 
 impl Step {
@@ -263,6 +267,10 @@ pub struct Counters {
 /// drafts save (Qwen3.5-9B on an RTX 5090: three drafts each for 32
 /// sequences, 128 rows, ran 6% slower than plain decoding).
 const VERIFY_ROWS: usize = 96;
+
+/// The recurrence's chunk length (GC in qwen35.cu): it can keep its state at
+/// any multiple of it inside a step.
+const SNAP_GRID: usize = 32;
 
 /// Prompt tokens per prefix-cache unit: entries cover whole units, a
 /// multiple of the KV block.
@@ -696,9 +704,19 @@ impl Scheduler {
                 s.drafts.len().min(s.req.max_new - s.generated.len() - 1)
             };
             let mut n = (s.total() - s.fed + ahead).min(budget);
-            if let Some(&at) = s.snap_at.first() {
-                // Stop the chunk at the boundary, so the state can be kept.
-                n = n.min(at - s.fed);
+            // Cache boundaries inside the chunk: the step keeps the state at
+            // those on the recurrence's 32-token chunk grid (or at the
+            // chunk's end); the chunk stops at the first other one, whose
+            // state is copied after the step.
+            for &at in &s.snap_at {
+                if at > s.fed + n {
+                    break;
+                }
+                let rel = at - s.fed;
+                if n < 2 || (!rel.is_multiple_of(SNAP_GRID) && rel != n) {
+                    n = n.min(rel);
+                    break;
+                }
             }
             if n == 0 {
                 break;
@@ -715,8 +733,62 @@ impl Scheduler {
                     .collect();
             }
         }
+        // Reserve the in-step snapshots' slots.
+        for si in 0..step.rows.len() {
+            let (ri, n) = step.rows[si];
+            let fed = self.running[ri].fed;
+            while let Some(&at) = self.running[ri].snap_at.first() {
+                let rel = at - fed;
+                if at > fed + n || n < 2 || (!rel.is_multiple_of(SNAP_GRID) && rel != n) {
+                    break;
+                }
+                self.running[ri].snap_at.remove(0);
+                let prefix = self.running[ri].req.prompt[..at].to_vec();
+                if let Some(slot) = self.reserve_snap(&prefix) {
+                    step.snaps.push((si, at, slot));
+                }
+            }
+        }
         step.copies = std::mem::take(&mut self.pending_copies);
         Some(step)
+    }
+
+    /// A free snapshot slot for a new cache entry of `prefix`, evicting the
+    /// least recently used entry if needed; None if the entry exists.
+    fn reserve_snap(&mut self, prefix: &[u32]) -> Option<usize> {
+        let h = *unit_hashes(prefix).last()?;
+        if self.prefixes.entries.contains_key(&h) {
+            return None;
+        }
+        if self.prefixes.free_snaps.is_empty() && !self.evict_one() {
+            return None;
+        }
+        self.prefixes.free_snaps.pop()
+    }
+
+    /// Makes the first `len` prompt tokens of running sequence `ri` a cache
+    /// entry whose state is (or will be, before the next step) in `snap`.
+    fn add_entry(&mut self, ri: usize, len: usize, snap: usize) {
+        let s = &self.running[ri];
+        let Some(&h) = unit_hashes(&s.req.prompt[..len]).last() else {
+            self.prefixes.free_snaps.push(snap);
+            return;
+        };
+        let blocks = s.blocks[..len / BLOCK_SIZE].to_vec();
+        let tokens = s.req.prompt[..len].to_vec();
+        for &b in &blocks {
+            self.block_refs[b as usize] += 1;
+        }
+        self.prefixes.clock += 1;
+        self.prefixes.entries.insert(
+            h,
+            Entry {
+                tokens,
+                blocks,
+                snap,
+                used: self.prefixes.clock,
+            },
+        );
     }
 
     /// Writes the step's batch metadata (see [`Meta`]) into `m`, and the
@@ -796,6 +868,12 @@ impl Scheduler {
                 m[me.pen_cu() + o + 1] = e as i32;
             }
             m[me.limits() + si] = (s.blocks.len() * BLOCK_SIZE) as i32 - 1;
+            let snaps = me.snaps() + 4 * si;
+            m[snaps..snaps + 4].fill(-1);
+            for (j, &(_, at, slot)) in step.snaps.iter().filter(|x| x.0 == si).enumerate() {
+                m[snaps + 2 * j] = (at - s.fed) as i32;
+                m[snaps + 2 * j + 1] = slot as i32;
+            }
             let row = me.block_table() + si * me.max_blocks;
             for (dst, &b) in m[row..row + s.blocks.len()].iter_mut().zip(&s.blocks) {
                 *dst = b as i32;
@@ -843,6 +921,7 @@ impl Scheduler {
             m[me.slots() + i] = scratch;
             m[me.fresh() + i] = 1;
             m[me.limits() + i] = -1;
+            m[me.snaps() + 4 * i..me.snaps() + 4 * i + 4].fill(-1);
             m[me.block_table() + i * me.max_blocks..me.block_table() + (i + 1) * me.max_blocks]
                 .fill(0);
         }
@@ -871,6 +950,9 @@ impl Scheduler {
         mut scored: Vec<Option<Scored>>,
     ) -> Vec<Seq> {
         self.counters.steps += 1;
+        for &(si, len, snap) in &step.snaps {
+            self.add_entry(step.rows[si].0, len, snap);
+        }
         let mut done = Vec::new();
         for (si, &(ri, n)) in step.rows.iter().enumerate() {
             let o0 = step.outs_at[si];
@@ -976,35 +1058,11 @@ impl Scheduler {
     /// before the next step.
     fn keep_prefix(&mut self, ri: usize) {
         let len = self.running[ri].fed;
-        let Some(&h) = unit_hashes(&self.running[ri].req.prompt[..len]).last() else {
-            return;
-        };
-        if self.prefixes.entries.contains_key(&h) {
-            return;
+        let prefix = self.running[ri].req.prompt[..len].to_vec();
+        if let Some(snap) = self.reserve_snap(&prefix) {
+            self.pending_copies.push((self.running[ri].slot, snap));
+            self.add_entry(ri, len, snap);
         }
-        if self.prefixes.free_snaps.is_empty() && !self.evict_one() {
-            return;
-        }
-        let Some(snap) = self.prefixes.free_snaps.pop() else {
-            return;
-        };
-        let s = &self.running[ri];
-        let blocks = s.blocks[..len / BLOCK_SIZE].to_vec();
-        let tokens = s.req.prompt[..len].to_vec();
-        self.pending_copies.push((s.slot, snap));
-        for &b in &blocks {
-            self.block_refs[b as usize] += 1;
-        }
-        self.prefixes.clock += 1;
-        self.prefixes.entries.insert(
-            h,
-            Entry {
-                tokens,
-                blocks,
-                snap,
-                used: self.prefixes.clock,
-            },
-        );
     }
 
     /// Fails every request, as when the GPU stops working.
@@ -1084,19 +1142,24 @@ mod tests {
         };
         let (tx, _ra) = unbounded_channel();
         s.submit(Request::text(ask(1000), 1, Sampling::default(), tx));
-        // Chunks stop at 192 (the unit before the last message) and 256.
-        assert_eq!(step(&mut s, 7).0, 192);
-        assert_eq!(step(&mut s, 7).0, 64);
-        step(&mut s, 7);
+        // One step keeps the state at 192 (the unit before the last message)
+        // and 256 (the last whole unit).
+        let st = s.plan().expect("work");
+        assert_eq!(st.tokens, 301);
+        let at: Vec<usize> = st.snaps.iter().map(|x| x.1).collect();
+        assert_eq!(at, vec![192, 256]);
+        let mut m = vec![0; s.meta.words()];
+        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        assert_eq!(m[s.meta.snaps()], 192);
+        assert_eq!(m[s.meta.snaps() + 2], 256);
+        s.finish(st, &[7], None, Vec::new());
         let (tx, _rb) = unbounded_channel();
         s.submit(Request::text(ask(2000), 1, Sampling::default(), tx));
         let st = s.plan().expect("work");
         assert_eq!(s.counters.cached_tokens, 192, "the system prompt's units");
-        assert_eq!(
-            st.tokens,
-            301 - 192 - 45,
-            "then up to its own boundary at 256"
-        );
+        assert_eq!(st.tokens, 301 - 192, "the rest in one step");
+        let at: Vec<usize> = st.snaps.iter().map(|x| x.1).collect();
+        assert_eq!(at, vec![256], "keeping its own last unit");
     }
 
     #[test]
@@ -1112,14 +1175,14 @@ mod tests {
         let base: Vec<u32> = (1..=150).collect();
         let (tx, mut ra) = unbounded_channel();
         s.submit(Request::text(base.clone(), 2, Sampling::default(), tx));
-        // The prompt chunk stops at the 128-token boundary for the snapshot.
-        let (t, _, _) = step(&mut s, 7);
-        assert_eq!(t, 128);
+        // One step runs the whole prompt and keeps the state at the
+        // 128-token boundary in snapshot slot 5.
         let st = s.plan().expect("work");
-        assert_eq!(st.copies, vec![(0, 5)], "state kept after the boundary");
-        assert_eq!(st.tokens, 22);
+        assert_eq!(st.tokens, 150);
+        assert_eq!(st.snaps, vec![(0, 128, 5)]);
         let mut m = vec![0; s.meta.words()];
         s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        assert_eq!(&m[s.meta.snaps()..s.meta.snaps() + 4], &[128, 5, -1, -1]);
         s.finish(st, &[7], None, Vec::new());
         step(&mut s, 7);
         assert_eq!(tokens(&mut ra).0, vec![7, 7]);
@@ -1134,17 +1197,15 @@ mod tests {
         s.submit(Request::text(longer, 1, Sampling::default(), tx));
         let st = s.plan().expect("work");
         assert_eq!(st.copies, vec![(5, 0)]);
-        assert_eq!(st.tokens, 192 - 128, "stops at its own boundary, 192");
+        assert_eq!(st.tokens, 250 - 128, "the rest in one step");
+        assert_eq!(st.snaps, vec![(0, 192, 6)], "keeping its own boundary");
         assert_eq!(s.counters.cached_tokens, 128);
         let mut m = vec![0; s.meta.words()];
         s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
-        // Positions continue after the prefix, in the cache's blocks.
+        // Positions continue after the prefix, in the cache's blocks; the
+        // snapshot is 64 tokens into this row.
         assert_eq!(m[s.meta.pos()], 128);
-        s.finish(st, &[3], None, Vec::new());
-        let st = s.plan().expect("work");
-        assert_eq!(st.copies, vec![(0, 6)], "second entry");
-        let mut m = vec![0; s.meta.words()];
-        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        assert_eq!(m[s.meta.snaps()], 64);
         s.finish(st, &[3], None, Vec::new());
         assert_eq!(tokens(&mut rb).0, vec![3]);
         // Both entries hold blocks; the second shares the first's 8.

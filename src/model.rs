@@ -914,8 +914,13 @@ impl Meta {
     pub fn limits(&self) -> usize {
         self.pen_cu() + self.max_outs() + 1
     }
-    pub fn block_table(&self) -> usize {
+    /// Per sequence, up to two prefix-cache snapshots to write in the step:
+    /// (tokens into its row, state slot), -1 when unused.
+    pub fn snaps(&self) -> usize {
         self.limits() + self.max_seqs
+    }
+    pub fn block_table(&self) -> usize {
+        self.snaps() + 4 * self.max_seqs
     }
     pub fn words(&self) -> usize {
         self.block_table() + self.max_seqs * self.max_blocks
@@ -1199,6 +1204,8 @@ struct View {
     fresh: u64,
     outs: u64,
     block_table: u64,
+    /// Prefix-cache snapshots to write in the step (Meta::snaps), or 0.
+    snaps: u64,
 }
 
 impl View {
@@ -1215,6 +1222,7 @@ impl View {
             fresh: a.m(me.fresh()),
             outs: a.m(me.outs()),
             block_table: a.m(me.block_table()),
+            snaps: a.m(me.snaps()),
         }
     }
 }
@@ -1472,6 +1480,7 @@ impl Model {
             fresh: a.m(me.fresh()),
             outs: ma.neg.ptr,
             block_table: a.m(me.block_table()),
+            snaps: 0,
         };
         for d in 1..me.spec - 1 {
             gpu.launch(
@@ -1655,6 +1664,7 @@ impl Model {
                             I(cd as i32),
                             outs[0],
                             outs[1],
+                            P(v.snaps),
                         ],
                     )?;
                     let args = [
@@ -1717,6 +1727,7 @@ impl Model {
                                 &a.fp8_args(|f| &f.core, t),
                                 &outs,
                                 &scratch,
+                                &[P(v.snaps)],
                             ]
                             .concat(),
                         )?;
@@ -2046,6 +2057,7 @@ mod tests {
             m.min_ps(),
             m.pen_cu(),
             m.limits(),
+            m.snaps(),
             m.block_table(),
             m.words(),
         ];

@@ -208,14 +208,15 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
 // head's [k, v] state lives in registers: threads 2j and 2j+1 hold rows 0..63
 // and 64..127 of column j. Per token:
 //   S *= exp(g); delta = (v - k^T S) * beta; S += k delta^T; o = q^T S
-// then a gated RMSNorm of o with silu(z). The state is f32: [slot][Hv][128][128].
+// then a gated RMSNorm of o with silu(z). The state is [slot][Hv][128][128],
+// f32 or (state_bf16) bf16; the math is f32 either way.
 // conv rows: [q (Hk*128) | k (Hk*128) | v (Hv*128)]; proj rows after the
 // convolution inputs: [z (Hv*128) | b (Hv) | a (Hv)].
 #define GDN_HALF (GDN_DIM / 2)
 extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
     gdn_recurrent(const bf16* __restrict__ conv, const bf16* __restrict__ proj, int pstride, int C,
                   int Hk, int Hv, const float* __restrict__ neg_a, const float* __restrict__ dt_bias,
-                  const float* __restrict__ norm_w, float* __restrict__ state,
+                  const float* __restrict__ norm_w, void* __restrict__ state, int state_bf16,
                   const int* __restrict__ cu, const int* __restrict__ slots,
                   const int* __restrict__ fresh, bf16* __restrict__ out, float eps, int tiled,
                   uint8_t* fq, void* fs, int fmode, int frows) {
@@ -228,11 +229,16 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
     // Value head h reads key head h / (Hv / Hk) (grouped order), or h % Hk in
     // the tiled order GGUF files use.
     const int kh = tiled ? h % Hk : h / (Hv / Hk);
-    float* S = state + ((size_t)slots[s] * Hv + h) * GDN_DIM * GDN_DIM;
+    const size_t base = ((size_t)slots[s] * Hv + h) * GDN_DIM * GDN_DIM;
+    float* S = (float*)state + base;
+    bf16* Sb = (bf16*)state + base;
     float r[GDN_HALF];
     const bool is_fresh = fresh[s] != 0;
 #pragma unroll
-    for (int i = 0; i < GDN_HALF; i++) r[i] = is_fresh ? 0.f : S[(i0 + i) * GDN_DIM + j];
+    for (int i = 0; i < GDN_HALF; i++) {
+        const int at = (i0 + i) * GDN_DIM + j;
+        r[i] = is_fresh ? 0.f : state_bf16 ? b2f(Sb[at]) : S[at];
+    }
     // Prefill rounds the normalized q and k to bf16; single-token decode keeps f32.
     const bool round_qk = (t1 - t0) > 1 || is_fresh;
     const float na = neg_a[h], db = dt_bias[h], nw = norm_w[j];
@@ -301,7 +307,11 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
         }
     }
 #pragma unroll
-    for (int i = 0; i < GDN_HALF; i++) S[(i0 + i) * GDN_DIM + j] = r[i];
+    for (int i = 0; i < GDN_HALF; i++) {
+        const int at = (i0 + i) * GDN_DIM + j;
+        if (state_bf16) Sb[at] = f2b(r[i]);
+        else S[at] = r[i];
+    }
 }
 
 // One head's 256 values (v0 from thread i, v1 from i + 128) as E4M3 with a

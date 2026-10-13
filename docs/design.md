@@ -90,7 +90,27 @@ Copying through mapped pages took 8.8 s for the 9B model and 24.7 s for the 27B 
 
 ## Numerics
 
-Activations are bf16 with f32 accumulation, rounded where the bf16 reference rounds them. Recurrent states are f32. Logits are f32. Sampling runs on the GPU, so only one token id per sequence returns to the host each step.
+Activations are bf16 with f32 accumulation, rounded where the bf16 reference rounds them. Logits are f32. Sampling runs on the GPU, so only one token id per sequence returns to the host each step.
+
+The linear-attention state is stored in bf16 between steps; the recurrence loads it into f32 registers, does all of its math in f32 and rounds once when it stores. That halves the memory per request (25 MB on 9B instead of 49, 75 MB on 27B instead of 146), and the state is what limits how many requests run at once. `--state-f32` keeps it in f32. Rounding once per step costs nothing measurable against Transformers, even over 512 generated tokens, where every token rounds the state:
+
+| Check | f32 state | bf16 state |
+|---|---|---|
+| Qwen3.5-2B, 949 positions over generations of up to 512 tokens | 943 agree, median 0.0002 | 944, 0.0002 |
+| Qwen3.5-2B, 3,300-token prompts | 285 of 288, 0.0012 | 286, 0.0011 |
+| Qwen3.5-9B, 1,293 positions over generations of up to 512 tokens | 1,291, 0.0000 | 1,291, 0.0000 |
+| Qwen3.5-9B, 3,300-token prompts in 64-token chunks | 284 of 288, 0.0005 | 286, 0.0004 |
+| Fixtures, 0.8B / 2B / 4B / 9B | 214, 214, 209, 218 agree | 214, 215, 209, 219 |
+
+On the RTX 5090, twice the requests fit and throughput at high load rises (output tokens per second, median time to first token at 64 in flight):
+
+| Model | Requests that fit, f32 → bf16 | 64 in flight, f32 | 64 in flight, bf16 |
+|---|---|---|---|
+| Qwen3.5-9B, bf16 weights | 54 → 101 | 1,516, 0.31 s | 1,687, 0.14 s |
+| Qwen3.5-9B, `--fp8` | 119 → 231 | 2,508, 0.08 s | 2,675, 0.08 s |
+| Qwen3.8-27B, Q4_K_M | 17 → 33 | 231, 4.7 s | 308, 2.4 s |
+
+One request alone runs at the same speed either way.
 
 ## Accuracy
 
@@ -157,7 +177,7 @@ The model was Qwen3.5-2B. Both H100 runs used the same RunPod H100 SXM (driver 5
 
 ### Quantized weights, RTX 5090
 
-Qwen3.5-9B under the same load, output tokens per second and median time to first token at 64 in flight. With `--max-seqs` lowered to fit the recurrent state, 53 requests fit beside the bf16 weights, 119 beside FP8 and 187 beside Q4_K_M.
+Qwen3.5-9B under the same load, with the recurrent state in f32, output tokens per second and median time to first token at 64 in flight. With `--max-seqs` lowered to fit the recurrent state, 53 requests fit beside the bf16 weights, 119 beside FP8 and 187 beside Q4_K_M.
 
 | In flight | bf16 (safetensors) | `--fp8` (MXFP8) | Q4_K_M (GGUF) | Q8_0 (GGUF) |
 |---:|---|---|---|---|
@@ -180,4 +200,4 @@ Output tokens per second under the same load, and median time to first token. [R
 | 32 | 241, 1.6 s | 662, 0.10 s | 810, 0.10 s |
 | 64 | 231, 4.7 s | 898, 0.15 s | 1,107, 0.14 s |
 
-A request holds 146 MB of recurrent state (48 linear-attention layers × 48 heads × 128 × 128 × f32) plus 64 KB of KV cache per token (16 attention layers). On the 5090, the Q4_K_M weights (19 GB) leave room for 17 requests at once, so throughput levels off from 16 in flight and later requests wait. The H100 holds 63 beside the bf16 weights and 142 beside the FP8 ones (`Qwen3.8-27B-FP8`, about 30 GB).
+These runs kept the recurrent state in f32: 146 MB per request (48 linear-attention layers × 48 heads × 128 × 128), plus 64 KB of KV cache per token (16 attention layers). On the 5090, the Q4_K_M weights (19 GB) left room for 17 requests at once, so throughput levelled off from 16 in flight. With the state in bf16 (now the default) 33 fit, and 32 in flight reach 318 tok/s. The H100 holds 63 beside the bf16 weights and 142 beside the FP8 ones (`Qwen3.8-27B-FP8`, about 30 GB).

@@ -30,6 +30,7 @@ fn config(model: PathBuf) -> EngineConfig {
         max_image_pixels: 1 << 20,
         fp8: fp8(),
         kv_fp8: kv_fp8(),
+        state_bf16: !std::env::var("POCKET_ENGINE_STATE_F32").is_ok_and(|v| v == "1"),
         ..EngineConfig::new(model)
     }
 }

@@ -250,9 +250,11 @@ impl Config {
     pub fn kv_layers(&self) -> usize {
         self.attn_layers.iter().filter(|a| **a).count()
     }
-    /// Recurrent and convolution state bytes per sequence slot.
-    pub fn slot_bytes(&self) -> usize {
-        self.gdn_layers() * (self.lin_v_heads * GDN_DIM * GDN_DIM * 4 + 3 * self.conv_dim() * 2)
+    /// Recurrent and convolution state bytes per sequence slot, with the
+    /// recurrent state in f32 or bf16.
+    pub fn slot_bytes(&self, state_bf16: bool) -> usize {
+        let elem = if state_bf16 { 2 } else { 4 };
+        self.gdn_layers() * (self.lin_v_heads * GDN_DIM * GDN_DIM * elem + 3 * self.conv_dim() * 2)
     }
     /// KV cache bytes per block of BLOCK_SIZE tokens: bf16, or E4M3 with an
     /// f32 scale per token and head.
@@ -523,14 +525,24 @@ pub struct State {
     ks: Vec<Buf>,
     vs: Vec<Buf>,
     pub kv_fp8: bool,
+    /// Recurrent state stored as bf16 (math stays f32).
+    pub state_bf16: bool,
     pub slots: usize,
     pub blocks: usize,
 }
 
 impl State {
-    pub fn new(gpu: &Gpu, cfg: &Config, slots: usize, blocks: usize, kv_fp8: bool) -> Result<Self> {
+    pub fn new(
+        gpu: &Gpu,
+        cfg: &Config,
+        slots: usize,
+        blocks: usize,
+        kv_fp8: bool,
+        state_bf16: bool,
+    ) -> Result<Self> {
         let conv_bytes = slots * 3 * cfg.conv_dim() * 2;
-        let rec_bytes = slots * cfg.lin_v_heads * GDN_DIM * GDN_DIM * 4;
+        let rec_bytes =
+            slots * cfg.lin_v_heads * GDN_DIM * GDN_DIM * if state_bf16 { 2 } else { 4 };
         let heads = blocks * BLOCK_SIZE * cfg.hkv;
         let kv_bytes = heads * HEAD_DIM * if kv_fp8 { 1 } else { 2 };
         let mut s = Self {
@@ -541,6 +553,7 @@ impl State {
             ks: vec![],
             vs: vec![],
             kv_fp8,
+            state_bf16,
             slots,
             blocks,
         };
@@ -887,6 +900,7 @@ impl Model {
                             P(dt_bias.ptr),
                             P(norm_w.ptr),
                             P(st.rec[*state].ptr),
+                            I(st.state_bf16 as i32),
                             P(a.m(me.cu())),
                             P(a.m(me.slots())),
                             P(a.m(me.fresh())),
@@ -1076,7 +1090,11 @@ mod tests {
         assert_eq!(c.attn_proj(), 5120);
         assert_eq!(c.eos, vec![248044, 248046]);
         // 18 layers x (16 heads x 128 x 128 f32 + 3 x 6144 bf16).
-        assert_eq!(c.slot_bytes(), 18 * (16 * 128 * 128 * 4 + 3 * 6144 * 2));
+        assert_eq!(
+            c.slot_bytes(false),
+            18 * (16 * 128 * 128 * 4 + 3 * 6144 * 2)
+        );
+        assert_eq!(c.slot_bytes(true), 18 * (16 * 128 * 128 * 2 + 3 * 6144 * 2));
         let small = fixture("qwen3.5-0.8b");
         assert_eq!(small.hidden, 1024);
         // The 4B model has two value heads per key head.

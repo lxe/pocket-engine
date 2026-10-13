@@ -38,6 +38,8 @@ pub struct EngineConfig {
     pub fp8: bool,
     /// Store the KV cache as E4M3 with a scale per token and head.
     pub kv_fp8: bool,
+    /// Store the recurrent state as bf16 (math stays f32).
+    pub state_bf16: bool,
 }
 
 impl EngineConfig {
@@ -56,6 +58,7 @@ impl EngineConfig {
             image_pool: 16_384,
             fp8: false,
             kv_fp8: false,
+            state_bf16: true,
         }
     }
 }
@@ -157,12 +160,14 @@ impl Engine {
         {
             let (free, total) = gpu.mem_info()?;
             let usable = free.saturating_sub((total as f64 * (1.0 - cfg.memory_fraction)) as usize);
-            let fit = (usable / 2 / mc.slot_bytes()).saturating_sub(1).max(1);
+            let fit = (usable / 2 / mc.slot_bytes(cfg.state_bf16))
+                .saturating_sub(1)
+                .max(1);
             if fit < cfg.max_seqs {
                 eprintln!(
                     "{} sequences fit beside the KV cache ({} MB of state each); --max-seqs {} lowered",
                     fit,
-                    mc.slot_bytes() >> 20,
+                    mc.slot_bytes(cfg.state_bf16) >> 20,
                     cfg.max_seqs
                 );
                 cfg.max_seqs = fit;
@@ -182,14 +187,14 @@ impl Engine {
         let reserve = (total as f64 * (1.0 - cfg.memory_fraction)) as usize;
         let usable = free
             .saturating_sub(reserve)
-            .saturating_sub(slots * mc.slot_bytes());
+            .saturating_sub(slots * mc.slot_bytes(cfg.state_bf16));
         let blocks = (usable / mc.block_bytes(cfg.kv_fp8)).min(cfg.max_seqs * max_blocks);
         if blocks < max_blocks {
             return Err(Error::Config(format!(
                 "not enough memory for one full context: {blocks} KV blocks, {max_blocks} needed"
             )));
         }
-        let state = State::new(&gpu, &mc, slots, blocks, cfg.kv_fp8)?;
+        let state = State::new(&gpu, &mc, slots, blocks, cfg.kv_fp8, cfg.state_bf16)?;
         gpu.sync()?;
         let sched = Scheduler::with_images(
             meta,

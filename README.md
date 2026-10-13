@@ -10,7 +10,7 @@ An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. I
 | Not supported | Mixture-of-experts models (Qwen3.5-35B-A3B and larger), video, GPTQ and AWQ checkpoints |
 | Weights | Hugging Face safetensors checkpoints in bf16 (f32 tensors are converted) or Qwen's FP8 (`Qwen3.8-27B-FP8`, `Qwen3.5-27B-FP8`), or a GGUF file (text only; projector files are not read yet). GGUF files with a multi-token-prediction layer load; the layer is skipped |
 | Images | JPEG, PNG, WebP, GIF or BMP, as `data:` or `http(s)` URLs. Images are resized so each side is a multiple of 32 pixels, and every 32×32 block becomes one prompt token. The area is held between 65,536 and `--max-image-pixels` (default 4,194,304). |
-| Quantization | GGUF weights stay quantized on the GPU: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely within a file. Their activations run in bf16 with f32 accumulation; recurrent state is f32 |
+| Quantization | GGUF weights stay quantized on the GPU: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely within a file. Their activations run in bf16 with f32 accumulation |
 | FP8 | E4M3 weights and activations on H100, H200 and RTX 50-series: Qwen's FP8 checkpoints, or any bf16 checkpoint with `--fp8`. Block scales of 128×128 per weight tile and 128 per activation row on Hopper; MXFP8 (a scale per 32 values) on Blackwell. Images, samplers and CUDA graphs work with it. The KV cache can be FP8 too (`--kv-fp8`) |
 | Context | Up to `--max-context` tokens per request (default 4,096) |
 | Sampling | Greedy, or temperature with `top_k`, `top_p`, `min_p` and `seed`; `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`; `stop` strings |
@@ -87,12 +87,13 @@ Filters apply in order: min_p, then top_k, then top_p. Each one judges the token
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--max-seqs` | 256 | Most requests decoding at once; lowered at startup so their recurrent state fits in half of the free memory (49 MB per request on 9B, 146 MB on 27B) |
+| `--max-seqs` | 256 | Most requests decoding at once; lowered at startup so their recurrent state fits in half of the free memory (25 MB per request on 9B, 75 MB on 27B) |
 | `--max-batch-tokens` | 4096 | Most tokens in one step, decode rows plus prompt chunks |
 | `--max-context` | 4096 | Longest prompt plus output, in tokens |
 | `--memory-fraction` | 0.9 | Share of GPU memory to use; the KV cache gets what is left after the weights |
 | `--fp8` | off | Quantize a bf16 checkpoint's projections to FP8 at load (Hopper or Blackwell). FP8 checkpoints need no flag |
 | `--kv-fp8` | off | Store the KV cache as FP8 (E4M3 with a scale per token and head): about twice the tokens in the same memory |
+| `--state-f32` | off | Store the linear-attention state as f32 instead of bf16, at twice the memory per request. The math is f32 either way |
 | `--wait-for PATH` | none | Initialize the GPU, then wait for `PATH` to exist before reading the model. A downloader can create the file when it finishes, so device setup overlaps the download |
 | `--no-graphs` | off | Run every step without CUDA graphs |
 | `--no-vision` | off | Serve text only; the vision encoder is not loaded |
@@ -107,7 +108,7 @@ POCKET_ENGINE_MODEL=models/qwen3.5-2b \
   CUDA_COMPUTE_CAP=120a cargo test --release --features cuda
 ```
 
-With a model set, `tests/gpu.rs` runs six checks against it. The model can be Qwen3.5 0.8B, 2B, 4B or 9B or Qwen3.8-27B, as a directory or a GGUF file. `POCKET_ENGINE_FP8=1` runs the suite with `--fp8`, and `POCKET_ENGINE_KV_FP8=1` with `--kv-fp8`:
+With a model set, `tests/gpu.rs` runs six checks against it. The model can be Qwen3.5 0.8B, 2B, 4B or 9B or Qwen3.8-27B, as a directory or a GGUF file. `POCKET_ENGINE_FP8=1` runs the suite with `--fp8`, `POCKET_ENGINE_KV_FP8=1` with `--kv-fp8` and `POCKET_ENGINE_STATE_F32=1` with `--state-f32`:
 
 - its predictions match stored Transformers reference outputs;
 - image prompts tokenize exactly as Transformers' processor does, and their predictions match too;

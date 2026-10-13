@@ -52,6 +52,10 @@ struct EngineArgs {
     /// twice the tokens in the same memory.
     #[arg(long)]
     kv_fp8: bool,
+    /// Store the linear-attention state as f32 instead of bf16 (the math is
+    /// f32 either way): twice the memory per request.
+    #[arg(long)]
+    state_f32: bool,
 }
 
 impl EngineArgs {
@@ -69,6 +73,7 @@ impl EngineArgs {
             image_pool: self.image_pool,
             fp8: self.fp8,
             kv_fp8: self.kv_fp8,
+            state_bf16: !self.state_f32,
             ..EngineConfig::new(self.model.clone())
         }
     }

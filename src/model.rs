@@ -16,12 +16,17 @@ pub const BLOCK_SIZE: usize = 16;
 /// Tokens drafts pick from (see Mtp::head): on Qwen3.5-9B, 65,536 keep
 /// almost every accepted draft of the full 248,320 at a quarter of the cost.
 const DRAFT_VOCAB: usize = 65_536;
-/// Keys per range of split decode attention.
-const ATTN_RANGE: usize = 2048;
+/// Fewest keys per range of split decode attention.
+const SPLIT_MIN_KEYS: usize = 256;
+/// Most ranges one sequence's keys split into.
+const SPLIT_MAX: usize = 64;
 
-/// Key ranges decode attention splits a context of `n` tokens into.
-fn attn_ranges(n: usize) -> usize {
-    n.div_ceil(ATTN_RANGE)
+/// Key ranges per decode token for a step of `t` tokens: enough blocks to
+/// give every SM about four, so one long sequence uses the whole GPU (1:
+/// no split). Each sequence uses as many as its length fills with ranges of
+/// at least SPLIT_MIN_KEYS (split_parts in qwen35.cu).
+fn split_ranges(t: usize, hkv: usize, sms: usize) -> usize {
+    (4 * sms).div_ceil(t * hkv).clamp(1, SPLIT_MAX)
 }
 
 /// Dynamic shared memory of attn_group_g<G> (fg_smem in qwen35.cu): 16
@@ -969,9 +974,16 @@ impl Act {
         let b = |n: usize| gpu.alloc_zeroed(n * 2);
         // Every token a sequence can hold, plus a logit_bias of up to 1,024.
         let pen_capacity = s * (meta.max_blocks * BLOCK_SIZE + 1024);
-        let ranges = attn_ranges(meta.max_blocks * BLOCK_SIZE);
-        let attn_part = if ranges > 1 {
-            Some(gpu.alloc(outs * cfg.hq * ranges * (HEAD_DIM + 2) * 4)?)
+        // Partials are per decode token (up to `spec` per sequence) and range.
+        let part_rows = (1..=t)
+            .map(|n| match split_ranges(n, cfg.hkv, gpu.sms) {
+                1 => 0,
+                z => n.min(s) * meta.spec * z,
+            })
+            .max()
+            .unwrap_or(0);
+        let attn_part = if part_rows > 0 {
+            Some(gpu.alloc(part_rows * cfg.hq * (HEAD_DIM + 2) * 4)?)
         } else {
             None
         };
@@ -1670,8 +1682,11 @@ impl Model {
                             F(eps),
                         ],
                     )?;
-                    let ranges = attn_ranges(me.max_blocks * BLOCK_SIZE);
-                    let part = a.attn_part.as_ref().map_or(0, |b| b.ptr);
+                    let ranges = split_ranges(t, c.hkv, gpu.sms);
+                    let part = match ranges {
+                        1 => 0,
+                        _ => a.attn_part.as_ref().map_or(0, |b| b.ptr),
+                    };
                     gpu.launch(
                         if st.kv_fp8 { k.attn8 } else { k.attn },
                         (ti, c.hkv as u32, ranges as u32),
@@ -1704,7 +1719,7 @@ impl Model {
                         .chain([
                             P(v.cu),
                             I((t > s) as i32),
-                            I(ATTN_RANGE as i32),
+                            I(SPLIT_MIN_KEYS as i32),
                             P(part),
                             outs[0],
                             outs[1],
@@ -1722,7 +1737,7 @@ impl Model {
                                 [
                                     P(part),
                                     I(ranges as i32),
-                                    I(ATTN_RANGE as i32),
+                                    I(SPLIT_MIN_KEYS as i32),
                                     P(a.proj.ptr),
                                     I(qs as i32),
                                     I(c.hq as i32),

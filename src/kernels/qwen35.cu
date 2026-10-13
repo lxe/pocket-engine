@@ -818,6 +818,12 @@ extern "C" __global__ void __launch_bounds__(128)
 // Cache layout: [block * block_size + offset][Hkv][256], bf16, or E4M3 (F8)
 // with an f32 scale per [slot][Hkv] that folds into the dot product and the
 // weighted sum of values.
+// Key ranges split decode attention divides a context of L keys into: up to
+// Z, each at least min_chunk long.
+__device__ __forceinline__ int split_parts(int L, int Z, int min_chunk) {
+    return max(1, min(Z, (L + min_chunk - 1) / min_chunk));
+}
+
 template <int G, int WARPS, bool F8>
 __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void* __restrict__ kcache,
                                           const void* __restrict__ vcache,
@@ -828,7 +834,7 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
                                           const int* __restrict__ block_table, int max_blocks,
                                           int block_size, bf16* __restrict__ out, float scale,
                                           uint8_t* fq, void* fs, int fmode, int frows,
-                                          const int* __restrict__ cu, int skip_prompts, int zchunk,
+                                          const int* __restrict__ cu, int skip_prompts, int min_chunk,
                                           float* __restrict__ part, const int* __restrict__ outs, int spec) {
     __shared__ float sm_m[WARPS][G], sm_s[WARPS][G];
     __shared__ float sm_acc[WARPS][G][HEAD_DIM];
@@ -839,10 +845,12 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
     if (skip_prompts && cu[sq + 1] - cu[sq] > 1 && !is_spec(outs, spec, sq)) return;
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
     const int L = pos[t] + 1;
-    // With `part`, keys split into ranges of zchunk across blockIdx.z
-    // (flash decoding); the ranges' partial results go to `part` for
-    // attn_merge.
-    const int j0 = part ? blockIdx.z * zchunk : 0, j1 = part ? min(L, j0 + zchunk) : L;
+    // With `part`, keys split into up to gridDim.z equal ranges of at least
+    // min_chunk across blockIdx.z (flash decoding); the ranges' partial
+    // results go to `part` for attn_merge.
+    const int parts = part ? split_parts(L, gridDim.z, min_chunk) : 1;
+    const int chunk = (L + parts - 1) / parts;
+    const int j0 = part ? blockIdx.z * chunk : 0, j1 = part ? min(L, j0 + chunk) : L;
     if (j0 >= j1) return;
     const int* bt = block_table + (size_t)tok_seq[t] * max_blocks;
     float qr[G][8], acc[G][8], m[G], ssum[G];
@@ -858,33 +866,62 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
         m[g] = -INFINITY;
         ssum[g] = 0.f;
     }
-    for (int j = j0 + w; j < j1; j += WARPS) {
-        const size_t slot = (size_t)bt[j / block_size] * block_size + (j % block_size);
-        const size_t at = slot * Hkv + kvh;
-        const size_t off = at * HEAD_DIM + l * 8;
-        float kf[8], vf[8], ks = 1.f, vs = 1.f;
-        if constexpr (F8) {
-            unpack8_e4m3(*reinterpret_cast<const uint2*>((const uint8_t*)kcache + off), kf);
-            unpack8_e4m3(*reinterpret_cast<const uint2*>((const uint8_t*)vcache + off), vf);
-            ks = kscale[at];
-            vs = vscale[at];
-        } else {
-            unpack8(*reinterpret_cast<const uint4*>((const bf16*)kcache + off), kf);
-            unpack8(*reinterpret_cast<const uint4*>((const bf16*)vcache + off), vf);
+    // Four keys per warp at a time, so their loads overlap.
+    constexpr int U = 4;
+    for (int j = j0 + w * U; j < j1; j += WARPS * U) {
+        float kf[U][8], vf[U][8], ks[U], vs[U];
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            ks[u] = vs[u] = 1.f;
+            const int jj = min(j + u, j1 - 1);
+            const size_t slot = (size_t)bt[jj / block_size] * block_size + (jj % block_size);
+            const size_t at = slot * Hkv + kvh;
+            const size_t off = at * HEAD_DIM + l * 8;
+            if constexpr (F8) {
+                unpack8_e4m3(*reinterpret_cast<const uint2*>((const uint8_t*)kcache + off), kf[u]);
+                unpack8_e4m3(*reinterpret_cast<const uint2*>((const uint8_t*)vcache + off), vf[u]);
+                ks[u] = kscale[at];
+                vs[u] = vscale[at];
+            } else {
+                unpack8(*reinterpret_cast<const uint4*>((const bf16*)kcache + off), kf[u]);
+                unpack8(*reinterpret_cast<const uint4*>((const bf16*)vcache + off), vf[u]);
+            }
         }
 #pragma unroll
         for (int g = 0; g < G; g++) {
-            float d = 0.f;
+            float d[U];
 #pragma unroll
-            for (int e = 0; e < 8; e++) d += qr[g][e] * kf[e];
-            d = warp_sum(d) * ks;
-            const float mn = fmaxf(m[g], d);
+            for (int u = 0; u < U; u++) {
+                d[u] = 0.f;
+#pragma unroll
+                for (int e = 0; e < 8; e++) d[u] += qr[g][e] * kf[u][e];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int u = 0; u < U; u++) d[u] += __shfl_xor_sync(0xffffffffu, d[u], o);
+            float mn = m[g];
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                d[u] = j + u < j1 ? d[u] * ks[u] : -INFINITY;
+                mn = fmaxf(mn, d[u]);
+            }
             const float corr = expf(m[g] - mn);
-            const float p = expf(d - mn);
-            const float pv = p * vs;
-            ssum[g] = ssum[g] * corr + p;
+            float p[U], psum = 0.f;
 #pragma unroll
-            for (int e = 0; e < 8; e++) acc[g][e] = acc[g][e] * corr + pv * vf[e];
+            for (int u = 0; u < U; u++) {
+                p[u] = expf(d[u] - mn);
+                psum += p[u];
+                p[u] *= vs[u];
+            }
+            ssum[g] = ssum[g] * corr + psum;
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                float a = acc[g][e] * corr;
+#pragma unroll
+                for (int u = 0; u < U; u++) a += p[u] * vf[u][e];
+                acc[g][e] = a;
+            }
             m[g] = mn;
         }
     }
@@ -953,11 +990,11 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
         const bf16* __restrict__ qkv, int qstride, int Hq, int Hkv, const int* __restrict__ pos,      \
         const int* __restrict__ tok_seq, const int* __restrict__ block_table, int max_blocks,         \
         int block_size, bf16* __restrict__ out, float scale, uint8_t* fq, void* fs, int fmode,         \
-        int frows, const int* __restrict__ cu, int skip_prompts, int zchunk, float* part,              \
+        int frows, const int* __restrict__ cu, int skip_prompts, int min_chunk, float* part,           \
         const int* __restrict__ outs, int spec) {                                                      \
         attn_body<G, WARPS, F8>(q, kcache, vcache, kscale, vscale, qkv, qstride, Hq, Hkv, pos,         \
                                 tok_seq, block_table, max_blocks, block_size, out, scale, fq, fs,      \
-                                fmode, frows, cu, skip_prompts, zchunk, part, outs, spec);             \
+                                fmode, frows, cu, skip_prompts, min_chunk, part, outs, spec);          \
     }
 // attn_paged_g<G> reads a bf16 cache, attn_paged8_g<G> an E4M3 one.
 #define ATTN_KERNEL(G, WARPS)                                                                          \
@@ -1191,7 +1228,7 @@ ATTN_GROUP(8)
 // in range order, then gates as attn_body does: a block of 256 threads per
 // (token, query head), one per dimension, then one warp for the FP8 copy.
 extern "C" __global__ void __launch_bounds__(HEAD_DIM)
-    attn_merge(const float* __restrict__ part, int Z, int zchunk, const bf16* __restrict__ qkv, int qstride,
+    attn_merge(const float* __restrict__ part, int Z, int min_chunk, const bf16* __restrict__ qkv, int qstride,
                int Hq, const int* __restrict__ pos, const int* __restrict__ tok_seq,
                const int* __restrict__ cu, int skip_prompts, bf16* __restrict__ out, uint8_t* fq, void* fs,
                int fmode, int frows, const int* __restrict__ outs, int spec) {
@@ -1199,7 +1236,7 @@ extern "C" __global__ void __launch_bounds__(HEAD_DIM)
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const int sq = tok_seq[t];
     if (skip_prompts && cu[sq + 1] - cu[sq] > 1 && !is_spec(outs, spec, sq)) return;
-    const int nz = (pos[t] + zchunk) / zchunk;  // ranges holding keys 0 .. pos[t]
+    const int nz = split_parts(pos[t] + 1, Z, min_chunk);
     const float* pp = part + (((size_t)sq * spec + (t - cu[sq])) * Hq + h) * Z * (HEAD_DIM + 2);
     float M = -INFINITY;
     for (int z = 0; z < nz; z++) M = fmaxf(M, pp[z * (HEAD_DIM + 2)]);

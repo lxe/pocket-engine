@@ -87,3 +87,60 @@ All runs used one RunPod H100 80GB SXM (driver 580.126.09), one after another, o
 - **Time to first token.** pocket-engine's median at 64 in flight is 0.06 to 0.07 s up to 9B, against vLLM's 0.12 to 0.17 s.
 - **llama.cpp** barely gains from concurrency on these hybrid models. Its best is 752 tok/s, on 0.8B at 64 in flight, where pocket-engine serves 7,439 from Q4_K_M. Its default cache roughly halves even that.
 - **Tiled Q4 weights** raised pocket-engine's Q4_K_M throughput 10 to 29% from 8 in flight. A single request on 0.8B got slower (459 against 539 tok/s), because its matrices are too small for the tiled kernel to hide latency. On the H100 the tiled kernel also falls behind bf16 cuBLAS above 8 rows (57 against 39 µs at 64 rows on 9B `ffn_up`), because it reaches only about 1 TB/s of the H100's 3.35.
+
+## Retest, 2026-10-13: 27B, prefix cache, long contexts, multi-token prediction
+
+A second RunPod H100 80GB SXM (driver 580.126.09) and the same vLLM 0.31.0 image, one engine after the other. pocket-engine was at 42b6977: chunked tensor-core linear attention for prompts, flash attention sharing key and value tiles across each query group, and the prefix cache. The multi-token-prediction rows ran 7da5da0. vLLM ran with `--max-num-seqs 256` (128 for the 70,000-token runs) and, for FP8, `VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0`. [Receipt](receipts/h100-retest.json).
+
+### Under `scripts/load.py`
+
+Output tokens per second, and the median time to first token at 64 in flight. vLLM's prefix cache is off, as in the main rows above.
+
+| Model | Engine | 1 | 8 | 16 | 32 | 64 | burst 64 | TTFT p50 at 64 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 9b bf16 | pocket-engine | 146 | 938 | 1,672 | 2,469 | 3,408 | 2,346 | 0.065 s |
+| 9b bf16 | vLLM | 136 | 681 | 1,171 | 1,974 | 2,938 | 2,323 | 0.159 s |
+| 27b bf16 | pocket-engine | 47 | 272 | 479 | 759 | 978 | 742 | 0.191 s |
+| 27b bf16 | vLLM | 45 | 263 | 493 | 710 | 1,088 | 777 | 0.219 s |
+| 27b FP8 | pocket-engine | 67 | 404 | 741 | 1,022 | 1,314 | 889 | 0.141 s |
+| 27b FP8 | vLLM | 66 | 360 | 606 | 976 | 1,302 | 1,075 | 0.175 s |
+
+### With multi-token prediction
+
+Both engines draft two tokens a step with the checkpoint's MTP layer: pocket-engine with `--mtp 2`, vLLM with `--speculative-config '{"method":"mtp","num_speculative_tokens":2}'`.
+
+| Model | Engine | 1 | 8 | 16 | 32 | 64 | burst 64 | TTFT p50 at 64 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 9b bf16 | pocket-engine | 252 | 1,376 | 2,475 | 3,344 | 3,458 | 2,609 | 0.069 s |
+| 9b bf16 | vLLM | 200 | 998 | 1,575 | 2,284 | 3,180 | 2,797 | 0.184 s |
+| 27b bf16 | pocket-engine | 85 | 471 | 816 | 1,096 | 1,092 | 892 | 0.177 s |
+| 27b bf16 | vLLM | 78 | 409 | 702 | 1,000 | 989 | 890 | 1.03 s |
+
+### Shared prefixes
+
+`scripts/workloads.py` against both engines with their prefix caches on (vLLM's default for these models, in its `align` mode for the recurrent state). Output tokens per second and median time to first token.
+
+| Workload | Model | pocket-engine | vLLM |
+|---|---|---|---|
+| 2,000-token system prompt, 128 short questions, 16 at a time | 9b | 1,338 tok/s, 0.059 s | 1,040 tok/s, 0.206 s |
+| | 27b | 448 tok/s, 0.079 s | 359 tok/s, 0.240 s |
+| 16 conversations of 8 turns, each resending its history | 9b | 1,613 tok/s, 0.118 s | 1,419 tok/s, 0.220 s |
+| | 27b | 420 tok/s, 0.202 s | 423 tok/s, 0.451 s |
+
+### Long prompts
+
+One request at a time, bf16, servers started with a 70,000-token context; time to first token.
+
+| Prompt | 9b pocket-engine | 9b vLLM | 27b pocket-engine | 27b vLLM |
+|---:|---:|---:|---:|---:|
+| 8k | 0.37 s | 0.27 s | 0.98 s | 0.70 s |
+| 32k | 1.86 s | 1.05 s | 4.96 s | 3.17 s |
+| 64k | 4.88 s | 2.25 s | 12.7 s | 6.86 s |
+| 4 × 32k at once (median) | 3.82 s | 1.48 s | 9.80 s | 4.71 s |
+
+### What the retest shows
+
+- **27B.** In FP8, pocket-engine now matches vLLM at 64 in flight (1,314 against 1,302) and leads from 8 to 32; vLLM keeps the burst (1,075 against 889). In bf16 the two are within 7% up to 32 in flight, and vLLM leads at 64 (1,088 against 978).
+- **Multi-token prediction.** pocket-engine leads at every steady load on both models: a single 9B request decodes at 252 tok/s against vLLM's 200, and 27B reaches 1,092 at 64 in flight against vLLM's 989. The 9B burst goes to vLLM (2,797 against 2,609). With drafting, 27B in bf16 matches vLLM's best without it.
+- **Shared prefixes.** First tokens come 1.9 to 3.5 times sooner. Throughput leads on a shared system prompt and is level on multi-turn 27B.
+- **Long prompts are vLLM's.** Its prefill is about twice as fast from 32k: FlashAttention 3 on Hopper's wgmma against pocket-engine's mma.sync flash kernel, whose share of prefill grows with the context. Decoding speeds in these runs came from about 25 tokens each, too few to compare; they predate 0a9a982, which splits decode attention by the GPU's size.

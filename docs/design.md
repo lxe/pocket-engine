@@ -18,7 +18,7 @@ Each layer runs three or four cuBLAS GEMMs over all of the step's tokens, plus a
   - The recurrence. A decode token updates each head's 128×128 state in registers. A prompt runs in chunks of 32 tokens on tensor cores, in the chunked form FlashInfer and FLA use: with G the cumulative log decay, the chunk solves (I + A)D = β(V − e^G K S₀), outputs e^G Q S₀ + tril(QKᵀ ⊙ Γ) D and carries e^{G_last} S₀ + (K ⊙ e^{G_last − G})ᵀ D to the next chunk. Operands are bf16 and every product accumulates in f32.
   - The gated RMSNorm, in place on the recurrence's output.
   - Each sequence's states live in a slot: about 18.6 MB for the 2B model.
-- **Full attention, two or three kernels.** One applies the q/k norms and rotary embedding and writes keys and values into a paged cache of 16-token blocks. Decode tokens then run paged attention with the output gate fused in; past 2,048 keys the keys split into ranges of 2,048 that run in parallel, and a merge kernel combines them. Prompt tokens run flash attention: a block takes 16 query tokens of one key/value head with one warp per query head of the group, so each key tile is read once for the whole group, double-buffered with `cp.async`, and the probabilities feed the second product straight from the accumulators.
+- **Full attention, two or three kernels.** One applies the q/k norms and rotary embedding and writes keys and values into a paged cache of 16-token blocks. Decode tokens then run paged attention with the output gate fused in, a warp loading four keys at a time. When a step has few tokens, each sequence's keys split into ranges that run in parallel (as many as give every SM about four blocks, each at least 256 keys), and a merge kernel combines them. Prompt tokens run flash attention: a block takes 16 query tokens of one key/value head with one warp per query head of the group, so each key tile is read once for the whole group, double-buffered with `cp.async`, and the probabilities feed the second product straight from the accumulators.
 - **Norms and activation.** The residual add is folded into the next RMSNorm, and SiLU-and-multiply is one kernel.
 
 ## Prefix cache
@@ -40,17 +40,40 @@ Without the cache, time to first token in the conversations grows from 0.34 s to
 
 ## Long contexts
 
-Three changes made long prompts and long-context decoding fast: the chunked recurrence above (the per-token recurrence ran a 64k prompt's linear attention one token at a time), flash attention for prompt tokens, and split-key decode attention, which spreads one long sequence's keys over the whole GPU instead of one block per head. The split runs inside CUDA graphs: the grid is sized for `--max-context` and ranges past a sequence's length exit at once.
+Three changes made long prompts and long-context decoding fast: the chunked recurrence above (the per-token recurrence ran a 64k prompt's linear attention one token at a time), flash attention for prompt tokens, and split-key decode attention, which spreads one long sequence's keys over the whole GPU instead of one block per head. The split runs inside CUDA graphs: each graph has a fixed token count, which fixes the number of ranges, and each sequence divides its keys among as many of them as its length fills.
 
 Qwen3.5-9B, bf16, one request at a time on an RTX 5090, 128 output tokens (`scripts/workloads.py long`):
 
 | Prompt | First token, before | First token, now | Prefill | Decode, before | Decode, now |
 |---:|---:|---:|---:|---:|---:|
-| 8k | 0.95 s | 0.73 s | 11,200 tok/s | 57 tok/s | 78 tok/s |
-| 32k | 7.2 s | 3.5 s | 9,500 tok/s | 28 tok/s | 76 tok/s |
-| 64k | 24.1 s | 8.6 s | 7,700 tok/s | 17 tok/s | 76 tok/s |
+| 8k | 0.95 s | 0.75 s | 11,000 tok/s | 57 tok/s | 85 tok/s |
+| 32k | 7.2 s | 3.5 s | 9,400 tok/s | 28 tok/s | 82 tok/s |
+| 64k | 24.1 s | 8.6 s | 7,600 tok/s | 17 tok/s | 78 tok/s |
 
-At 8k, prefill is close to what the GEMMs alone allow. Four 32k prompts at once share the GPU at 9,400 prompt tokens per second.
+Decoding with a short context runs at 89 tok/s; at 64k, reading the 2 GB of cached keys and values each step accounts for the rest. Four 32k prompts at once share the GPU at 9,400 prompt tokens per second.
+
+At 32k, prefill spends 58% of its GPU time in cuBLAS matmuls, 22% in flash attention (about 82 TFLOPS, 40% of the 5090's dense bf16 rate), 7% in the chunked recurrence and 4% in the convolution. On an H100, where cuBLAS runs the matmuls on wgmma, the mma.sync flash kernel is the larger share, and vLLM's FlashAttention 3 prefills 32k and 64k prompts about twice as fast ([retest](h100-comparison.md#long-prompts)).
+
+## Multi-token prediction
+
+Qwen3.5 checkpoints carry one extra layer (`mtp.*`) trained to predict the token after next. `--mtp N` uses it to draft N tokens a step and verifies them in the next one. Output is the model's own: with greedy decoding a sequence keeps drafts up to the first one the model would not have picked, and with sampling it keeps them while the sample at each position equals the draft, which leaves each token distributed exactly as sequential sampling would.
+
+- **The draft layer.** It embeds a token, normalizes the embedding and the model's final hidden state before that token, joins them through a projection (`fc`) and runs one full-attention layer with its own KV cache. Its output layer is the model's, cut to the first 65,536 tokens (BPE ids are ordered roughly by frequency): drafts stay greedy, and the cut layer costs a quarter of the full one. On Qwen3.5-9B it keeps 74% of drafts accepted against 76% with the whole vocabulary.
+- **Every step.** After the model picks its tokens, the draft layer runs over every token row of the step, so its KV cache follows the model's through prompts and decoding. Each sequence drafts from its last accepted row; further drafts run one row per sequence from the draft layer's own output, with positions and KV slots the GPU computes, so the whole step stays inside one CUDA graph.
+- **Verification.** A decoding sequence feeds its last token and its drafts, and gets a pick for each. The linear-attention recurrence keeps the state after every fed token (and the convolution its window), each in a state slot lent from the free ones for the step: after acceptance the sequence keeps the slot holding the state after its last accepted token and returns the rest. A rejected draft costs no recomputation, and drafting reserves no memory per sequence.
+- **When.** Sequences verify drafts when the free slots suffice and the step stays within 96 rows; otherwise the step decodes plainly. Past that, verification turns the step's matmuls compute-bound and costs more than it saves. Penalized requests and teacher-forced scoring never draft.
+
+Qwen3.5-9B, bf16, RTX 5090, `scripts/load.py`, output tokens per second:
+
+| In flight | 1 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|
+| Without drafting | 85 | 566 | 917 | 1,351 | 1,811 |
+| `--mtp 2` | 152 | 824 | 1,274 | 1,497 | 1,797 |
+| `--mtp 3` | 151 | 820 | 1,286 | 1,264 | 1,743 |
+
+(The `--mtp 3` row predates the 96-row limit, which now stops drafting at 32 in flight.) Over longer answers, one request runs at 89 tok/s plainly, 144 with one draft (74% accepted), 170 with two (62%), 181 with three (52%) and 182 with four (44%).
+
+Greedy output with drafting matches teacher-forced picks except at near ties: on Qwen3.5-9B, 1 of 320 positions departs, by 0.012 in log-probability. With FP8 activations, verification's matmuls run with four times the rows and take other cuBLAS kernels, and E4M3 rounding magnifies their last-bit differences: 10 of 320 positions depart, against 4 for the same comparison without drafting.
 
 ## Images
 

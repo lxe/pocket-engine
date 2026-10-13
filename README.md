@@ -1,6 +1,6 @@
 # pocket-engine
 
-An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine. It is ready 5 seconds after launch, and a 27B model reaches serving in about 2 seconds from the page cache ([design and measurements](docs/design.md); [against vLLM and llama.cpp on an H100](docs/h100-comparison.md)).
+An inference server for Qwen3.5 models, written from scratch in Rust and CUDA. It batches requests continuously, captures decode steps in CUDA graphs and serves an OpenAI-compatible chat API. On one H100 it serves Qwen3.5-2B at 7,500 output tokens per second with 64 requests in flight, against vLLM's 5,500 on the same machine. With the checkpoint's multi-token-prediction layer drafting tokens (`--mtp`), one Qwen3.5-9B request decodes at 252 tokens per second, against vLLM's 200 with the same drafting. It is ready 5 seconds after launch, and a 27B model reaches serving in about 2 seconds from the page cache ([design and measurements](docs/design.md); [against vLLM and llama.cpp on an H100](docs/h100-comparison.md)).
 
 ## Performance
 
@@ -11,14 +11,18 @@ Output tokens per second with 64 requests in flight on one H100, from `scripts/l
 | Qwen3.5-0.8B | bf16 | **9,114** | 6,057 | 752 |
 | Qwen3.5-2B | bf16 | **7,530** | 5,172 | 656 |
 | Qwen3.5-4B | bf16 | **3,736** | 3,291 | 471 |
-| Qwen3.5-9B | bf16 | **3,133** | 2,921 | 390 |
-| Qwen3.8-27B | bf16 | 924 | **1,092** | 158 |
+| Qwen3.5-9B | bf16 | **3,408**¹ | 2,938¹ | 390 |
+| Qwen3.8-27B | bf16 | 978¹ | **1,088**¹ | 158 |
 | Qwen3.5-9B | FP8 | **3,523** | 3,460 | — |
-| Qwen3.8-27B | FP8 | 1,150 | **1,299** | — |
+| Qwen3.8-27B | FP8 | **1,314**¹ | 1,302¹ | — |
+| Qwen3.5-9B | bf16, 2 drafts a step | **3,458**¹ | 3,180¹ | — |
+| Qwen3.8-27B | bf16, 2 drafts a step | **1,092**¹ | 989¹ | — |
 | Qwen3.5-9B | Q4_K_M | **2,315** | does not load | 395 |
 | Qwen3.8-27B | Q4_K_M | **675** | does not load | 156 |
 
-pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170.
+¹ Retested on 2026-10-13 after the chunked linear attention, grouped flash attention and multi-token prediction; the other rows are from 2026-10-12. Drafting rows use each engine's multi-token prediction (pocket-engine `--mtp 2`, vLLM's `mtp` method with 2 speculative tokens).
+
+pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170. vLLM's prefill is about twice as fast on prompts of 32k tokens and more; [the retest](docs/h100-comparison.md#retest-2026-10-13-27b-prefix-cache-long-contexts-multi-token-prediction) has long prompts and shared prefixes.
 
 ## Supported
 
@@ -26,13 +30,14 @@ pocket-engine is ready to serve in 2 to 5 seconds, vLLM in 61 to 170.
 |---|---|
 | Models | Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B (Qwen3.5- and 3.6-27B share its architecture), with images. All dense |
 | Not supported | Mixture-of-experts models (Qwen3.5-35B-A3B and larger), video, GPTQ and AWQ checkpoints |
-| Weights | Hugging Face safetensors checkpoints in bf16 (f32 tensors are converted), Qwen's FP8 (`Qwen3.8-27B-FP8`, `Qwen3.5-27B-FP8`) or NVIDIA ModelOpt's NVFP4 and per-tensor FP8, or a GGUF file (text only; projector files are not read yet). GGUF files with a multi-token-prediction layer load; the layer is skipped |
+| Weights | Hugging Face safetensors checkpoints in bf16 (f32 tensors are converted), Qwen's FP8 (`Qwen3.8-27B-FP8`, `Qwen3.5-27B-FP8`) or NVIDIA ModelOpt's NVFP4 and per-tensor FP8, or a GGUF file (text only; projector files are not read yet). GGUF files with a multi-token-prediction layer load; the layer is skipped (`--mtp` needs a safetensors checkpoint) |
 | Images | JPEG, PNG, WebP, GIF or BMP, as `data:` or `http(s)` URLs. Images are resized so each side is a multiple of 32 pixels, and every 32×32 block becomes one prompt token. The area is held between 65,536 and `--max-image-pixels` (default 4,194,304). |
 | Quantization | GGUF weights stay quantized on the GPU: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, mixed freely within a file. Their activations run in bf16 with f32 accumulation |
 | FP8 | E4M3 weights and activations on H100, H200 and RTX 50-series: Qwen's FP8 checkpoints, or any bf16 checkpoint with `--fp8`. Block scales of 128×128 per weight tile and 128 per activation row on Hopper; MXFP8 (a scale per 32 values) on Blackwell. Images, samplers and CUDA graphs work with it. The KV cache can be FP8 too (`--kv-fp8`) |
 | FP4 | RTX 50-series only: MXFP4 weights (E2M1, a power-of-two scale per 32) times MXFP8 activations on block-scaled tensor cores. NVIDIA's NVFP4 checkpoints (`nvidia/Qwen3.8-27B-NVFP4`) are re-quantized to MXFP4 at load; `--fp4` quantizes a bf16 checkpoint's MLP to FP4 and the rest to FP8 |
-| Context | Up to `--max-context` tokens per request (default 4,096). On an RTX 5090, Qwen3.5-9B takes 0.73 s to a first token at 8k, 3.5 s at 32k and 8.6 s at 64k, and decodes at 76 tok/s at every length |
+| Context | Up to `--max-context` tokens per request (default 4,096). On an RTX 5090, Qwen3.5-9B takes 0.73 s to a first token at 8k, 3.5 s at 32k and 8.6 s at 64k, and decodes at 78 to 85 tok/s at every length |
 | Prefix cache | Prompts that share a beginning (a system prompt, or a conversation's earlier turns) reuse its KV cache and recurrent state. On by default |
+| Speculative decoding | `--mtp` drafts tokens with the checkpoint's multi-token-prediction layer and verifies them in the next step, for greedy and sampled requests alike (not with penalties or `logit_bias`). Qwen3.5-9B on an RTX 5090: 152 tok/s for one request instead of 85 |
 | Sampling | Greedy, or temperature with `top_k`, `top_p`, `min_p` and `seed`; `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `logit_bias`; `stop` strings |
 | GPUs | NVIDIA, built per architecture: `90a` (H100), `120a` (RTX 50-series); others via `CUDA_COMPUTE_CAP` |
 | Driver | CUDA 13 (driver 580 or newer); cuBLAS 13 at run time |
@@ -111,6 +116,7 @@ Filters apply in order: min_p, then top_k, then top_p. Each one judges the token
 | `--max-batch-tokens` | 4096 | Most tokens in one step, decode rows plus prompt chunks |
 | `--max-context` | 4096 | Longest prompt plus output, in tokens |
 | `--prefix-cache` | a quarter of `--max-seqs`, 2 to 64 | Prompt prefixes to keep for reuse, each holding its KV blocks and a snapshot of the recurrent state; 0 turns the cache off |
+| `--mtp [N]` | off (2 when given without N) | Draft N tokens a step with the multi-token-prediction layer. Sequences verify drafts while the step stays within 96 rows and free state slots can hold the states after each draft, so drafting needs no memory of its own and stops under heavy load |
 | `--memory-fraction` | 0.9 | Share of GPU memory to use; the KV cache gets what is left after the weights |
 | `--fp8` | off | Quantize a bf16 checkpoint's projections to FP8 at load (Hopper or Blackwell). FP8 checkpoints need no flag |
 | `--fp4` | off | Quantize a bf16 checkpoint's MLP to FP4 and its other projections to FP8 at load (RTX 50-series) |
@@ -130,17 +136,18 @@ POCKET_ENGINE_MODEL=models/qwen3.5-2b \
   CUDA_COMPUTE_CAP=120a cargo test --release --features cuda
 ```
 
-With a model set, `tests/gpu.rs` runs seven checks against it. The model can be Qwen3.5 0.8B, 2B, 4B or 9B or Qwen3.8-27B, as a directory or a GGUF file. `POCKET_ENGINE_FP8=1` runs the suite with `--fp8`, `POCKET_ENGINE_FP4=1` with `--fp4`, `POCKET_ENGINE_KV_FP8=1` with `--kv-fp8` and `POCKET_ENGINE_STATE_F32=1` with `--state-f32`:
+With a model set, `tests/gpu.rs` runs eight checks against it. The model can be Qwen3.5 0.8B, 2B, 4B or 9B or Qwen3.8-27B, as a directory or a GGUF file. `POCKET_ENGINE_FP8=1` runs the suite with `--fp8`, `POCKET_ENGINE_FP4=1` with `--fp4`, `POCKET_ENGINE_KV_FP8=1` with `--kv-fp8`, `POCKET_ENGINE_STATE_F32=1` with `--state-f32` and `POCKET_ENGINE_MTP=N` with `--mtp N`:
 
 - its predictions match stored Transformers reference outputs;
 - image prompts tokenize exactly as Transformers' processor does, and their predictions match too;
 - batching does not change predictions beyond rounding: the same tokens scored alone and among other requests agree except at near ties;
 - a prompt extending a cached one gives exactly the output it gives without the prefix cache;
+- with three drafts a step, greedy output departs from the model's own picks (that output scored teacher-forced) only at near ties, and more than a third of drafts are accepted;
 - the samplers keep exactly the right tokens and draw them in proportion to the model's probabilities;
 - penalties cut repetition;
 - the HTTP API streams and reports usage correctly.
 
-Quantized weights are held to looser bars on the accuracy checks. For GGUF, 85% of picks agree with bf16 Transformers and the median log-probability difference stays under 0.1; the image check is skipped. For FP8, 93% agree with a median under 0.03, and 95% with a median under 0.01 on images; FP4 takes the GGUF bar, and 90% with a median under 0.05 on images. An FP8 KV cache takes the FP8 bar too. The batching check allows rounding because GEMM kernels differ by batch size in the last bit; with FP8 or FP4 activations or an FP8 KV cache, which magnify that about as much as their own error, it takes 90% with a median under 0.03.
+Quantized weights are held to looser bars on the accuracy checks. For GGUF, 85% of picks agree with bf16 Transformers and the median log-probability difference stays under 0.1; the image check is skipped. For FP8, 93% agree with a median under 0.03, and 95% with a median under 0.01 on images; FP4 takes the GGUF bar, and 90% with a median under 0.05 on images. An FP8 KV cache takes the FP8 bar too. The batching check allows rounding because GEMM kernels differ by batch size in the last bit; with FP8 or FP4 activations or an FP8 KV cache, which magnify that about as much as their own error, it takes 90% with a median under 0.03. For the same reason the drafting check lets quantized runs depart at up to 5% of positions.
 
 To check a model or prompt that isn't in the fixtures, `scripts/accuracy.py` makes new reference data with Transformers:
 

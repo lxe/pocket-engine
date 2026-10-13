@@ -281,8 +281,8 @@ fn batching_does_not_change_greedy_output() {
         ..config(dir)
     })
     .unwrap();
-    if fp8() || fp4() {
-        // FP8 rounding of activations magnifies the last-bit differences
+    if fp8() || fp4() || kv_fp8() {
+        // FP8 rounding of activations (or of cached keys and values) magnifies the last-bit differences
         // that come from GEMM kernels chosen by batch size, about as much as
         // FP8's own error against bf16, so greedy output may part. Hold the
         // scores to the FP8 bar instead: the same tokens scored alone and

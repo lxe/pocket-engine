@@ -805,12 +805,22 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
                                           const int* __restrict__ tok_seq,
                                           const int* __restrict__ block_table, int max_blocks,
                                           int block_size, bf16* __restrict__ out, float scale,
-                                          uint8_t* fq, void* fs, int fmode, int frows) {
+                                          uint8_t* fq, void* fs, int fmode, int frows,
+                                          const int* __restrict__ cu, int skip_prompts, int zchunk,
+                                          float* __restrict__ part) {
     __shared__ float sm_m[WARPS][G], sm_s[WARPS][G];
     __shared__ float sm_acc[WARPS][G][HEAD_DIM];
     const int t = blockIdx.x, kvh = blockIdx.y;
+    // With skip_prompts, tokens of sequences with more than one (prompts)
+    // are left to attn_flash.
+    if (skip_prompts && cu[tok_seq[t] + 1] - cu[tok_seq[t]] > 1) return;
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
     const int L = pos[t] + 1;
+    // With `part`, keys split into ranges of zchunk across blockIdx.z
+    // (flash decoding); the ranges' partial results go to `part` for
+    // attn_merge.
+    const int j0 = part ? blockIdx.z * zchunk : 0, j1 = part ? min(L, j0 + zchunk) : L;
+    if (j0 >= j1) return;
     const int* bt = block_table + (size_t)tok_seq[t] * max_blocks;
     float qr[G][8], acc[G][8], m[G], ssum[G];
 #pragma unroll
@@ -825,7 +835,7 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
         m[g] = -INFINITY;
         ssum[g] = 0.f;
     }
-    for (int j = w; j < L; j += WARPS) {
+    for (int j = j0 + w; j < j1; j += WARPS) {
         const size_t slot = (size_t)bt[j / block_size] * block_size + (j % block_size);
         const size_t at = slot * Hkv + kvh;
         const size_t off = at * HEAD_DIM + l * 8;
@@ -879,6 +889,15 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
                 A += sm_acc[k][g][d] * f;
             }
             const int h = kvh * G + g;
+            if (part) {
+                float* pp = part + (((size_t)tok_seq[t] * Hq + h) * gridDim.z + blockIdx.z) * (HEAD_DIM + 2);
+                if (d == 0) {
+                    pp[0] = M;
+                    pp[1] = S;
+                }
+                pp[2 + d] = A;
+                continue;
+            }
             const float o = rbf(A / S);
             const float gate = b2f(qkv[(size_t)t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d]);
             const float y = o / (1.f + expf(-gate));
@@ -886,7 +905,7 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
             if (fmode) sm_acc[0][g][d] = y;  // reused: the merge above has read it
         }
     }
-    if (fmode) {
+    if (fmode && !part) {
         // Each head's 256 gated outputs as FP8, one warp per head.
         __syncthreads();
         const Fp8Out fo{fq, fs, fmode, frows};
@@ -909,10 +928,10 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
         const bf16* __restrict__ qkv, int qstride, int Hq, int Hkv, const int* __restrict__ pos,      \
         const int* __restrict__ tok_seq, const int* __restrict__ block_table, int max_blocks,         \
         int block_size, bf16* __restrict__ out, float scale, uint8_t* fq, void* fs, int fmode,         \
-        int frows) {                                                                                   \
+        int frows, const int* __restrict__ cu, int skip_prompts, int zchunk, float* part) {            \
         attn_body<G, WARPS, F8>(q, kcache, vcache, kscale, vscale, qkv, qstride, Hq, Hkv, pos,         \
                                 tok_seq, block_table, max_blocks, block_size, out, scale, fq, fs,      \
-                                fmode, frows);                                                         \
+                                fmode, frows, cu, skip_prompts, zchunk, part);                         \
     }
 // attn_paged_g<G> reads a bf16 cache, attn_paged8_g<G> an E4M3 one.
 #define ATTN_KERNEL(G, WARPS)                                                                          \
@@ -923,6 +942,246 @@ ATTN_KERNEL(2, 8)
 ATTN_KERNEL(4, 8)
 ATTN_KERNEL(6, 4)
 ATTN_KERNEL(8, 4)
+
+// Attention for prompt tokens, on tensor cores (flash attention over the
+// paged cache). A block of 4 warps takes 64 query tokens of one sequence and
+// one query head; each warp owns 16 of them. Keys and values stream through
+// shared memory 32 at a time (gathered by the block table, and converted from
+// E4M3 with F8); S = Q K^T runs on mma.sync, the softmax is online, and the
+// probabilities go straight from S's accumulators into P V as A fragments.
+// The output is gated as attn_body gates it. Blocks walk the step's prompt
+// sequences (those with more than one token) in tiles of 64; others exit.
+#define FA_BM 64
+#define FA_BN 32
+#define FA_STR (HEAD_DIM + 8)
+#define FA_SMEM ((FA_BM + 2 * FA_BN) * FA_STR * 2)
+__device__ __forceinline__ uint32_t fa_bf2(float lo, float hi) {
+    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+template <bool F8>
+__device__ __forceinline__ void attn_flash_body(
+    const bf16* __restrict__ q, const void* __restrict__ kcache, const void* __restrict__ vcache,
+    const float* __restrict__ kscale, const float* __restrict__ vscale, const bf16* __restrict__ qkv, int qstride,
+    int Hq, int Hkv, const int* __restrict__ pos, const int* __restrict__ cu, int seqs,
+    const int* __restrict__ block_table, int max_blocks, int block_size, bf16* __restrict__ out, float scale) {
+    extern __shared__ __align__(16) unsigned char fsm[];
+    bf16* sQ = (bf16*)fsm;
+    bf16* sK = sQ + FA_BM * FA_STR;
+    bf16* sV = sK + FA_BN * FA_STR;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
+    const int h = blockIdx.y, kvh = h / (Hq / Hkv);
+    // Which (sequence, tile) this block takes.
+    int s = -1, tile = blockIdx.x;
+    for (int i = 0; i < seqs; i++) {
+        const int n = cu[i + 1] - cu[i];
+        if (n <= 1) continue;
+        const int tiles = (n + FA_BM - 1) / FA_BM;
+        if (tile < tiles) {
+            s = i;
+            break;
+        }
+        tile -= tiles;
+    }
+    if (s < 0) return;
+    const int t0 = cu[s] + tile * FA_BM, n = min(FA_BM, cu[s + 1] - t0);
+    const int p0 = pos[t0];  // positions are consecutive within a chunk
+    const int L = p0 + n;    // keys 0 .. L - 1
+    const int* bt = block_table + (size_t)s * max_blocks;
+    // Queries, pre-scaled (by a power of two: exact).
+    for (int e = tid; e < FA_BM * (HEAD_DIM / 8); e += 128) {
+        const int r = e / (HEAD_DIM / 8), c = (e % (HEAD_DIM / 8)) * 8;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (r < n) {
+            float f[8];
+            unpack8(*reinterpret_cast<const uint4*>(q + ((size_t)(t0 + r) * Hq + h) * HEAD_DIM + c), f);
+#pragma unroll
+            for (int i = 0; i < 8; i++) f[i] *= scale;
+            v = pack8(f);
+        }
+        *reinterpret_cast<uint4*>(sQ + r * FA_STR + c) = v;
+    }
+    float o[HEAD_DIM / 8][4];
+#pragma unroll
+    for (int nt = 0; nt < HEAD_DIM / 8; nt++) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
+    const int r0 = warp * 16 + g, r1 = r0 + 8;  // this lane's rows
+    const int last_key = min(L, p0 + warp * 16 + 16);  // past this warp's last row's keys
+    for (int k0 = 0; k0 < L; k0 += FA_BN) {
+        __syncthreads();
+        // Keys and values for positions k0 .. k0 + 31.
+        for (int e = tid; e < FA_BN * (HEAD_DIM / 8); e += 128) {
+            const int j = e / (HEAD_DIM / 8), c = (e % (HEAD_DIM / 8)) * 8, kp = k0 + j;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+            if (kp < L) {
+                const size_t slot = (size_t)bt[kp / block_size] * block_size + kp % block_size;
+                const size_t at = (slot * Hkv + kvh) * HEAD_DIM + c;
+                if constexpr (F8) {
+                    float kf[8], vf[8];
+                    unpack8_e4m3(*reinterpret_cast<const uint2*>((const uint8_t*)kcache + at), kf);
+                    unpack8_e4m3(*reinterpret_cast<const uint2*>((const uint8_t*)vcache + at), vf);
+                    const float ks = kscale[slot * Hkv + kvh], vs = vscale[slot * Hkv + kvh];
+#pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        kf[i] *= ks;
+                        vf[i] *= vs;
+                    }
+                    kv = pack8(kf);
+                    vv = pack8(vf);
+                } else {
+                    kv = *reinterpret_cast<const uint4*>((const bf16*)kcache + at);
+                    vv = *reinterpret_cast<const uint4*>((const bf16*)vcache + at);
+                }
+            }
+            *reinterpret_cast<uint4*>(sK + j * FA_STR + c) = kv;
+            *reinterpret_cast<uint4*>(sV + j * FA_STR + c) = vv;
+        }
+        __syncthreads();
+        if (k0 >= last_key) continue;  // every key here is past this warp's rows
+        // S = Q K^T for this warp's 16 rows and 32 keys.
+        float sc[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++) sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.f;
+#pragma unroll
+        for (int kd = 0; kd < HEAD_DIM; kd += 16) {
+            uint32_t a[4], b0[4], b1[4];
+            frag_a(a, sQ, FA_STR, warp * 16, kd);
+            frag_b(b0, sK, FA_STR, kd, 0);
+            frag_b(b1, sK, FA_STR, kd, 16);
+            gmma(sc[0], a, b0[0], b0[1]);
+            gmma(sc[1], a, b0[2], b0[3]);
+            gmma(sc[2], a, b1[0], b1[1]);
+            gmma(sc[3], a, b1[2], b1[3]);
+        }
+        // Causal mask and online softmax; rows r0 (sc[.][0..1]) and r1 ([2..3]).
+        float mx0 = m0, mx1 = m1;
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int kp = k0 + nt * 8 + 2 * t4 + (e & 1);
+                const int qp = p0 + (e < 2 ? r0 : r1);
+                if (kp > qp || kp >= L) sc[nt][e] = -INFINITY;
+                if (e < 2) mx0 = fmaxf(mx0, sc[nt][e]);
+                else mx1 = fmaxf(mx1, sc[nt][e]);
+            }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float c0 = mx0 == -INFINITY ? 1.f : expf(m0 - mx0), c1 = mx1 == -INFINITY ? 1.f : expf(m1 - mx1);
+        float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const float mm = e < 2 ? mx0 : mx1;
+                const float p = sc[nt][e] == -INFINITY ? 0.f : expf(sc[nt][e] - mm);
+                sc[nt][e] = p;
+                if (e < 2) s0 += p;
+                else s1 += p;
+            }
+        s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
+        s0 += __shfl_xor_sync(0xffffffffu, s0, 2);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, 1);
+        s1 += __shfl_xor_sync(0xffffffffu, s1, 2);
+        l0 = l0 * c0 + s0;
+        l1 = l1 * c1 + s1;
+        m0 = mx0;
+        m1 = mx1;
+#pragma unroll
+        for (int nt = 0; nt < HEAD_DIM / 8; nt++) {
+            o[nt][0] *= c0;
+            o[nt][1] *= c0;
+            o[nt][2] *= c1;
+            o[nt][3] *= c1;
+        }
+        // O += P V: P's A fragments come from S's accumulators.
+#pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            const uint32_t a[4] = {fa_bf2(sc[2 * ks][0], sc[2 * ks][1]), fa_bf2(sc[2 * ks][2], sc[2 * ks][3]),
+                                   fa_bf2(sc[2 * ks + 1][0], sc[2 * ks + 1][1]),
+                                   fa_bf2(sc[2 * ks + 1][2], sc[2 * ks + 1][3])};
+#pragma unroll
+            for (int np = 0; np < HEAD_DIM / 16; np++) {
+                uint32_t b[4];
+                frag_b_t(b, sV, FA_STR, ks * 16, np * 16);
+                gmma(o[2 * np], a, b[0], b[1]);
+                gmma(o[2 * np + 1], a, b[2], b[3]);
+            }
+        }
+    }
+    // out = bf16(bf16(O / l) * sigmoid(gate)), as attn_body writes it.
+    const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
+#pragma unroll
+    for (int hf = 0; hf < 2; hf++) {
+        const int r = hf ? r1 : r0;
+        if (r >= n) continue;
+        const size_t t = (size_t)t0 + r;
+        const float inv = hf ? i1 : i0;
+#pragma unroll
+        for (int nt = 0; nt < HEAD_DIM / 8; nt++) {
+            const int d = nt * 8 + 2 * t4;
+            float y[2];
+#pragma unroll
+            for (int e = 0; e < 2; e++) {
+                const float ov = rbf(o[nt][2 * hf + e] * inv);
+                const float gate = b2f(qkv[t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d + e]);
+                y[e] = ov / (1.f + expf(-gate));
+            }
+            *reinterpret_cast<__nv_bfloat162*>(out + (t * Hq + h) * HEAD_DIM + d) = __floats2bfloat162_rn(y[0], y[1]);
+        }
+    }
+}
+
+#define ATTN_FLASH_ARGS                                                                                \
+    const bf16 *__restrict__ q, const void *__restrict__ kcache, const void *__restrict__ vcache,       \
+        const float *__restrict__ kscale, const float *__restrict__ vscale, const bf16 *__restrict__ qkv, \
+        int qstride, int Hq, int Hkv, const int *__restrict__ pos, const int *__restrict__ cu, int seqs,  \
+        const int *__restrict__ block_table, int max_blocks, int block_size, bf16 *__restrict__ out,      \
+        float scale
+#define ATTN_FLASH_PASS q, kcache, vcache, kscale, vscale, qkv, qstride, Hq, Hkv, pos, cu, seqs, block_table, max_blocks, block_size, out, scale
+extern "C" __global__ void __launch_bounds__(128) attn_flash(ATTN_FLASH_ARGS) { attn_flash_body<false>(ATTN_FLASH_PASS); }
+extern "C" __global__ void __launch_bounds__(128) attn_flash8(ATTN_FLASH_ARGS) { attn_flash_body<true>(ATTN_FLASH_PASS); }
+
+// Combines the key ranges of split decode attention (attn_body with `part`)
+// in range order, then gates as attn_body does: a block of 256 threads per
+// (token, query head), one per dimension, then one warp for the FP8 copy.
+extern "C" __global__ void __launch_bounds__(HEAD_DIM)
+    attn_merge(const float* __restrict__ part, int Z, int zchunk, const bf16* __restrict__ qkv, int qstride,
+               int Hq, const int* __restrict__ pos, const int* __restrict__ tok_seq,
+               const int* __restrict__ cu, int skip_prompts, bf16* __restrict__ out, uint8_t* fq, void* fs,
+               int fmode, int frows) {
+    __shared__ float ys[HEAD_DIM];
+    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const int sq = tok_seq[t];
+    if (skip_prompts && cu[sq + 1] - cu[sq] > 1) return;
+    const int nz = (pos[t] + zchunk) / zchunk;  // ranges holding keys 0 .. pos[t]
+    const float* pp = part + ((size_t)sq * Hq + h) * Z * (HEAD_DIM + 2);
+    float M = -INFINITY;
+    for (int z = 0; z < nz; z++) M = fmaxf(M, pp[z * (HEAD_DIM + 2)]);
+    float S = 0.f, A = 0.f;
+    for (int z = 0; z < nz; z++) {
+        const float* q = pp + z * (HEAD_DIM + 2);
+        const float f = q[0] == -INFINITY ? 0.f : expf(q[0] - M);
+        S += q[1] * f;
+        A += q[2 + d] * f;
+    }
+    const float o = rbf(A / S);
+    const float gate = b2f(qkv[(size_t)t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d]);
+    const float y = o / (1.f + expf(-gate));
+    out[((size_t)t * Hq + h) * HEAD_DIM + d] = f2b(y);
+    if (fmode) {
+        ys[d] = y;
+        __syncthreads();
+        if (d < 32) {
+            float v[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++) v[i] = ys[8 * d + i];
+            quant8(v, t, h * HEAD_DIM + 8 * d, Hq * HEAD_DIM, Fp8Out{fq, fs, fmode, frows}, true);
+        }
+    }
+}
 
 __device__ __forceinline__ uint32_t mix32(uint32_t x) {
     x ^= x >> 16;

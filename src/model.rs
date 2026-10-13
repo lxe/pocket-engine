@@ -13,6 +13,16 @@ pub const GDN_DIM: usize = 128;
 pub const HEAD_DIM: usize = 256;
 pub const ROPE_DIM: usize = 64;
 pub const BLOCK_SIZE: usize = 16;
+/// Keys per range of split decode attention.
+const ATTN_RANGE: usize = 2048;
+
+/// Key ranges decode attention splits a context of `n` tokens into.
+fn attn_ranges(n: usize) -> usize {
+    n.div_ceil(ATTN_RANGE)
+}
+
+/// Dynamic shared memory of attn_flash (FA_SMEM in qwen35.cu).
+const FA_SMEM: usize = (64 + 2 * 32) * (HEAD_DIM + 8) * 2;
 /// Dynamic shared memory of the chunked gated delta rule (GDN_CHUNK_SMEM in
 /// qwen35.cu).
 const GDN_CHUNK_SMEM: usize =
@@ -312,6 +322,13 @@ struct Kernels {
     attn: Kernel,
     /// Paged attention over an E4M3 cache.
     attn8: Kernel,
+    /// Attention for prompt tokens on tensor cores, over a bf16 or E4M3 cache.
+    attn_flash: Kernel,
+    attn_flash8: Kernel,
+    /// FP8 copies of bf16 rows (the flash kernel's output, for FP8 layers).
+    fp8_rows: Kernel,
+    /// Combines split decode attention's key ranges.
+    attn_merge: Kernel,
     penalize: Kernel,
     sample: Kernel,
 }
@@ -487,6 +504,18 @@ impl Model {
             attn_prep: gpu.kernel("attn_prep")?,
             attn: gpu.kernel(&format!("attn_paged_g{}", cfg.hq / cfg.hkv))?,
             attn8: gpu.kernel(&format!("attn_paged8_g{}", cfg.hq / cfg.hkv))?,
+            attn_flash: {
+                let k = gpu.kernel("attn_flash")?;
+                gpu.set_smem(k, FA_SMEM)?;
+                k
+            },
+            attn_flash8: {
+                let k = gpu.kernel("attn_flash8")?;
+                gpu.set_smem(k, FA_SMEM)?;
+                k
+            },
+            fp8_rows: gpu.kernel("fp8_activations")?,
+            attn_merge: gpu.kernel("attn_merge")?,
             penalize: gpu.kernel("penalize")?,
             sample: gpu.kernel("sample")?,
         };
@@ -692,6 +721,10 @@ impl Meta {
 pub struct Act {
     pub meta: Meta,
     meta_dev: Buf,
+    /// Partial results of split decode attention: per sequence, query head
+    /// and key range, the max, the sum and 256 accumulators. None when one
+    /// range covers the context.
+    attn_part: Option<Buf>,
     pub staging: Pinned,
     res: Buf,
     xn: Buf,
@@ -770,7 +803,14 @@ impl Act {
         let b = |n: usize| gpu.alloc_zeroed(n * 2);
         // Every token a sequence can hold, plus a logit_bias of up to 1,024.
         let pen_capacity = s * (meta.max_blocks * BLOCK_SIZE + 1024);
+        let ranges = attn_ranges(meta.max_blocks * BLOCK_SIZE);
+        let attn_part = if ranges > 1 {
+            Some(gpu.alloc(s * cfg.hq * ranges * (HEAD_DIM + 2) * 4)?)
+        } else {
+            None
+        };
         Ok(Self {
+            attn_part,
             meta_dev: gpu.alloc_zeroed(meta.words() * 4)?,
             staging: gpu.pinned(meta.words() * 4)?,
             res: b(t * cfg.hidden)?,
@@ -1028,9 +1068,11 @@ impl Model {
                             F(eps),
                         ],
                     )?;
+                    let ranges = attn_ranges(me.max_blocks * BLOCK_SIZE);
+                    let part = a.attn_part.as_ref().map_or(0, |b| b.ptr);
                     gpu.launch(
                         if st.kv_fp8 { k.attn8 } else { k.attn },
-                        (ti, c.hkv as u32, 1),
+                        (ti, c.hkv as u32, ranges as u32),
                         if c.hq / c.hkv >= 6 { 128 } else { 256 },
                         0,
                         &[
@@ -1052,9 +1094,98 @@ impl Model {
                             F(1.0 / (HEAD_DIM as f32).sqrt()),
                         ]
                         .into_iter()
-                        .chain(a.fp8_args(|f| &f.ao, t))
+                        .chain(if part == 0 {
+                            a.fp8_args(|f| &f.ao, t)
+                        } else {
+                            [P(0), P(0), I(0), I(0)]
+                        })
+                        .chain([
+                            P(a.m(me.cu())),
+                            I((t > s) as i32),
+                            I(ATTN_RANGE as i32),
+                            P(part),
+                        ])
                         .collect::<Vec<_>>(),
                     )?;
+                    if part != 0 {
+                        // Long contexts: combine the key ranges.
+                        gpu.launch(
+                            k.attn_merge,
+                            (ti, c.hq as u32, 1),
+                            HEAD_DIM as u32,
+                            0,
+                            &[
+                                [
+                                    P(part),
+                                    I(ranges as i32),
+                                    I(ATTN_RANGE as i32),
+                                    P(a.proj.ptr),
+                                    I(qs as i32),
+                                    I(c.hq as i32),
+                                    P(a.m(me.pos())),
+                                    P(a.m(me.tok_seq())),
+                                    P(a.m(me.cu())),
+                                    I((t > s) as i32),
+                                    P(a.ao.ptr),
+                                ]
+                                .as_slice(),
+                                &a.fp8_args(|f| &f.ao, t),
+                            ]
+                            .concat(),
+                        )?;
+                    }
+                    if t > s {
+                        // Prompt sequences: flash attention, 64 queries a block.
+                        gpu.launch(
+                            if st.kv_fp8 {
+                                k.attn_flash8
+                            } else {
+                                k.attn_flash
+                            },
+                            ((t.div_ceil(64) + s) as u32, c.hq as u32, 1),
+                            128,
+                            FA_SMEM as u32,
+                            &[
+                                P(a.q.ptr),
+                                P(st.kc[*cache].ptr),
+                                P(st.vc[*cache].ptr),
+                                P(kscale),
+                                P(vscale),
+                                P(a.proj.ptr),
+                                I(qs as i32),
+                                I(c.hq as i32),
+                                I(c.hkv as i32),
+                                P(a.m(me.pos())),
+                                P(a.m(me.cu())),
+                                I(s as i32),
+                                P(a.m(me.block_table())),
+                                I(me.max_blocks as i32),
+                                I(BLOCK_SIZE as i32),
+                                P(a.ao.ptr),
+                                F(1.0 / (HEAD_DIM as f32).sqrt()),
+                            ],
+                        )?;
+                        if a.fp8.is_some() {
+                            // FP8 copies for the output projection.
+                            let [fq, fs, fmode, frows] = a.fp8_args(|f| &f.ao, t);
+                            let width = c.hq * HEAD_DIM;
+                            gpu.launch(
+                                k.fp8_rows,
+                                ((t * width / 8).div_ceil(256).min(65_535) as u32, 1, 1),
+                                256,
+                                0,
+                                &[
+                                    P(a.ao.ptr),
+                                    I(t as i32),
+                                    I(width as i32),
+                                    fq,
+                                    fs,
+                                    fmode,
+                                    frows,
+                                ],
+                            )?;
+                        }
+                    }
                     w_o.forward(gpu, q, a.input(&a.ao, |f| &f.ao), t, a.h.ptr, h, false)?;
                 }
             }

@@ -5,8 +5,9 @@
 //! stored as -exp(A_log)) are undone in one place.
 
 use crate::gguf::{GgmlType, Gguf};
-use crate::gpu::{Arg, Buf, Gpu, Piece};
+use crate::gpu::{Arg, Buf, Fp8Mode, Gpu, Piece};
 use crate::linear::{Kind, Linear, Part, Quants};
+use crate::model::f32_bytes;
 use crate::{Error, Result};
 use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
@@ -175,11 +176,13 @@ pub enum Source {
     Gguf(Gguf),
 }
 
-/// A matrix: bf16 bytes, or a quantized format's blocks.
+/// A matrix in device-ready form: bf16 bytes, a quantized format's raw blocks,
+/// or E4M3 bytes with f32 scales per 128 x 128 tile (Qwen's FP8 checkpoints).
 pub struct Mat<'a> {
     pub kind: Kind,
     /// As stored: quantized formats are repacked for the device on upload.
     pub bytes: Bytes<'a>,
+    pub scales: Vec<u8>,
 }
 
 /// Tensor bytes: a range of a model file, read straight into pinned staging
@@ -291,6 +294,33 @@ impl Mat<'_> {
     }
 }
 
+/// How a layer's matrices are loaded.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Load {
+    /// The FP8 layout of this device, for FP8 checkpoints and `quantize`.
+    pub fp8: Option<Fp8Mode>,
+    /// Quantize bf16 matrices to FP8 at load.
+    pub quantize: bool,
+}
+
+/// What a part of a layer becomes on the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Bf16,
+    Quant(crate::gguf::GgmlType),
+    /// E4M3 from the checkpoint, with block scales.
+    Fp8Checkpoint,
+    /// bf16 from the checkpoint, quantized to FP8 on the GPU.
+    Fp8Quantized,
+}
+
+/// Matrices Qwen's FP8 checkpoints keep in bf16, kept so when quantizing.
+fn keeps_bf16(name: &str) -> bool {
+    name.ends_with("in_proj_a.weight")
+        || name.ends_with("in_proj_b.weight")
+        || name == "/lm_head.weight"
+}
+
 /// The GGUF file a model path names: the path itself, or the single .gguf
 /// (other than projector files) in a directory without safetensors.
 pub fn gguf_path(path: &Path) -> Option<PathBuf> {
@@ -393,6 +423,20 @@ impl Source {
         }
     }
 
+    /// A tensor's shape, outermost first (safetensors order).
+    pub fn dims(&self, name: &str) -> Option<Vec<usize>> {
+        match self {
+            Source::Safetensors(ck) => {
+                let full = format!("{}{name}", ck.prefix);
+                Some(ck.index.get(&full)?.shape.clone())
+            }
+            Source::Gguf(g) => g
+                .tensors
+                .get(&gguf_name(name))
+                .map(|t| t.dims.iter().rev().copied().collect()),
+        }
+    }
+
     pub fn has(&self, name: &str) -> bool {
         match self {
             Source::Safetensors(ck) => match name.strip_prefix('/') {
@@ -466,10 +510,34 @@ impl Source {
     /// A `rows x cols` matrix (output features x input features).
     pub fn matrix(&self, name: &str, rows: usize, cols: usize) -> Result<Mat<'_>> {
         match self {
-            Source::Safetensors(ck) => Ok(Mat {
-                kind: Kind::Bf16,
-                bytes: ck.bf16_bytes(name, rows * cols)?,
-            }),
+            Source::Safetensors(ck) => {
+                let (dtype, shape, _) = ck.view(name)?;
+                if dtype == Dtype::F8_E4M3 {
+                    if shape.iter().product::<usize>() != rows * cols {
+                        return Err(Error::Config(format!(
+                            "{name}: shape {shape:?}, expected {rows} x {cols}"
+                        )));
+                    }
+                    let e = ck.entry(name)?;
+                    let scale_name = format!("{name}_scale_inv");
+                    let n = rows.div_ceil(128) * cols.div_ceil(128);
+                    let scales = ck.f32(&scale_name, n)?;
+                    return Ok(Mat {
+                        kind: Kind::Fp8(Fp8Mode::Block128),
+                        bytes: Bytes::File {
+                            file: &ck.files[e.file],
+                            offset: e.start as u64,
+                            len: e.end - e.start,
+                        },
+                        scales: f32_bytes(&scales),
+                    });
+                }
+                Ok(Mat {
+                    kind: Kind::Bf16,
+                    bytes: ck.bf16_bytes(name, rows * cols)?,
+                    scales: Vec::new(),
+                })
+            }
             Source::Gguf(g) => {
                 let (ty, dims, data) = self.gguf_tensor(g, name, rows * cols)?;
                 if dims.first() != Some(&cols) {
@@ -491,6 +559,7 @@ impl Source {
                             offset,
                             len,
                         },
+                        scales: Vec::new(),
                     })
                 } else {
                     let v = to_f32(ty, data).expect("float type");
@@ -501,6 +570,7 @@ impl Source {
                                 .flat_map(|x| bf16::from_f32(*x).to_le_bytes())
                                 .collect(),
                         ),
+                        scales: Vec::new(),
                     })
                 }
             }
@@ -508,49 +578,181 @@ impl Source {
     }
 
     /// A linear layer from matrices stacked by output feature, all with
-    /// `cols` inputs. Neighbours of one format share a buffer.
+    /// `cols` inputs. Neighbours that become the same format share a buffer.
     pub fn linear(
         &self,
         gpu: &Gpu,
         quants: &mut Quants,
         parts: &[(&str, usize)],
         cols: usize,
+        load: Load,
     ) -> Result<Linear> {
+        struct Pending<'a> {
+            target: Target,
+            kind: Kind,
+            bytes: Vec<Bytes<'a>>,
+            scales: Vec<u8>,
+            rows: usize,
+            off: usize,
+        }
         let mut out: Vec<Part> = Vec::new();
-        let mut pending: Option<(Kind, Vec<Bytes>, usize, usize)> = None; // kind, bytes, rows, off
+        let mut pending: Option<Pending> = None;
         let mut off = 0;
-        let flush =
-            |p: Option<(Kind, Vec<Bytes>, usize, usize)>, out: &mut Vec<Part>| -> Result<()> {
-                if let Some((kind, bytes, rows, off)) = p {
-                    let pieces: Vec<Piece> = bytes.iter().map(Bytes::piece).collect();
-                    out.push(Part {
-                        buf: Rc::new(upload_kind(gpu, kind, &pieces)?),
-                        kind,
+        for &(name, rows) in parts {
+            let m = self.matrix(name, rows, cols)?;
+            let target = match m.kind {
+                Kind::Quant(ty) => {
+                    quants.get(gpu, ty)?;
+                    Target::Quant(ty)
+                }
+                Kind::Fp8(_) => Target::Fp8Checkpoint,
+                Kind::Bf16
+                    if load.quantize
+                        && load.fp8.is_some()
+                        && !keeps_bf16(name)
+                        && cols.is_multiple_of(128) =>
+                {
+                    Target::Fp8Quantized
+                }
+                Kind::Bf16 => Target::Bf16,
+            };
+            // Block scales stack only in whole 128-row tiles.
+            let stacks = target != Target::Fp8Checkpoint
+                || pending.as_ref().is_some_and(|p| p.rows.is_multiple_of(128));
+            match &mut pending {
+                Some(p) if p.target == target && stacks => {
+                    p.bytes.push(m.bytes);
+                    p.scales.extend(m.scales);
+                    p.rows += rows;
+                }
+                _ => {
+                    if let Some(p) = pending.take() {
+                        out.push(self.place(
+                            gpu, p.target, p.kind, &p.bytes, p.scales, p.rows, p.off, cols, load,
+                        )?);
+                    }
+                    pending = Some(Pending {
+                        target,
+                        kind: m.kind,
+                        bytes: vec![m.bytes],
+                        scales: m.scales,
                         rows,
                         off,
                     });
                 }
-                Ok(())
-            };
-        for &(name, rows) in parts {
-            let m = self.matrix(name, rows, cols)?;
-            if let Kind::Quant(ty) = m.kind {
-                quants.get(gpu, ty)?;
-            }
-            match &mut pending {
-                Some((kind, bytes, r, _)) if *kind == m.kind => {
-                    bytes.push(m.bytes);
-                    *r += rows;
-                }
-                _ => {
-                    flush(pending.take(), &mut out)?;
-                    pending = Some((m.kind, vec![m.bytes], rows, off));
-                }
             }
             off += rows;
         }
-        flush(pending, &mut out)?;
+        if let Some(p) = pending {
+            out.push(self.place(
+                gpu, p.target, p.kind, &p.bytes, p.scales, p.rows, p.off, cols, load,
+            )?);
+        }
         Ok(Linear { parts: out, cols })
+    }
+
+    /// Uploads a part, converting FP8 to this device's layout. Everything is
+    /// ordered on the stream, so nothing here waits for the GPU.
+    #[allow(clippy::too_many_arguments)]
+    fn place(
+        &self,
+        gpu: &Gpu,
+        target: Target,
+        kind: Kind,
+        bytes: &[Bytes],
+        scales: Vec<u8>,
+        rows: usize,
+        off: usize,
+        cols: usize,
+        load: Load,
+    ) -> Result<Part> {
+        let part = |buf: Buf, kind: Kind, scales: Option<Buf>| Part {
+            buf: Rc::new(buf),
+            kind,
+            scales: scales.map(Rc::new),
+            rows,
+            off,
+        };
+        let pieces: Vec<Piece> = bytes.iter().map(Bytes::piece).collect();
+        // Pieces into device scratch, for a conversion kernel to read.
+        let to_temp = |slot: usize, pieces: &[Piece]| -> Result<u64> {
+            let t = gpu.temp(slot, pieces.iter().map(Piece::len).sum())?;
+            let mut at = 0;
+            for p in pieces {
+                gpu.put(t + at as u64, p)?;
+                at += p.len();
+            }
+            Ok(t)
+        };
+        let grid = |n: usize| ((n.div_ceil(256)).min(65_535) as u32, 1, 1);
+        Ok(match target {
+            Target::Bf16 | Target::Quant(_) => part(upload_kind(gpu, kind, &pieces)?, kind, None),
+            Target::Fp8Checkpoint => {
+                let mode = load.fp8.ok_or_else(|| {
+                    Error::Config(
+                        "FP8 weights need a GPU with FP8 matmuls (Hopper or Blackwell)".into(),
+                    )
+                })?;
+                match mode {
+                    Fp8Mode::Block128 => part(
+                        gpu.upload_pieces(&pieces)?,
+                        Kind::Fp8(mode),
+                        Some(gpu.upload(&scales)?),
+                    ),
+                    Fp8Mode::Mx32 => {
+                        let w = to_temp(0, &pieces)?;
+                        let s = to_temp(1, &[Piece::Mem(&scales)])?;
+                        let q = gpu.alloc(rows * cols)?;
+                        let sx = gpu.alloc_zeroed(mode.weight_scale_bytes(rows, cols))?;
+                        gpu.launch(
+                            gpu.kernel("fp8_block_to_mx")?,
+                            grid(rows * cols / 32),
+                            256,
+                            0,
+                            &[
+                                Arg::P(w),
+                                Arg::P(s),
+                                Arg::I(rows as i32),
+                                Arg::I(cols as i32),
+                                Arg::P(q.ptr),
+                                Arg::P(sx.ptr),
+                            ],
+                        )?;
+                        part(q, Kind::Fp8(mode), Some(sx))
+                    }
+                }
+            }
+            Target::Fp8Quantized => {
+                let mode = load.fp8.expect("checked when chosen");
+                let w = to_temp(0, &pieces)?;
+                let q = gpu.alloc(rows * cols)?;
+                let sx = gpu.alloc_zeroed(mode.weight_scale_bytes(rows, cols))?;
+                let args = [
+                    Arg::P(w),
+                    Arg::I(rows as i32),
+                    Arg::I(cols as i32),
+                    Arg::P(q.ptr),
+                    Arg::P(sx.ptr),
+                ];
+                match mode {
+                    Fp8Mode::Mx32 => gpu.launch(
+                        gpu.kernel("fp8_weights_mx")?,
+                        grid(rows * cols / 32),
+                        256,
+                        0,
+                        &args,
+                    )?,
+                    Fp8Mode::Block128 => gpu.launch(
+                        gpu.kernel("fp8_weights_block")?,
+                        (cols.div_ceil(128) as u32, rows.div_ceil(128) as u32, 1),
+                        256,
+                        0,
+                        &args,
+                    )?,
+                }
+                part(q, Kind::Fp8(mode), Some(sx))
+            }
+        })
     }
 
     /// A single matrix kept as one buffer, for sharing (tied embeddings).

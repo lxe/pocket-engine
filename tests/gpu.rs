@@ -1,6 +1,6 @@
 //! End-to-end checks on a GPU. They run when POCKET_ENGINE_MODEL names a
 //! Qwen3.5 0.8B, 2B, 4B or 9B or Qwen3.8-27B directory, or a
-//! GGUF file of one, and the crate is built with `--features cuda`;
+//! GGUF file of one, optionally with FP8 weights (POCKET_ENGINE_FP8=1), and the crate is built with `--features cuda`;
 //! otherwise they pass without doing anything.
 
 use pocket_engine::engine::{self, Engine, EngineConfig, Scoring};
@@ -28,6 +28,7 @@ fn config(model: PathBuf) -> EngineConfig {
         memory_fraction: 0.95,
         image_pool: 4096,
         max_image_pixels: 1 << 20,
+        fp8: fp8(),
         ..EngineConfig::new(model)
     }
 }
@@ -89,14 +90,26 @@ fn matches_transformers_teacher_forced() {
         )
         .unwrap();
     assert!(reference.iter().map(Vec::len).sum::<usize>() > 200);
-    if !gguf {
+    if gguf {
+        // Quantized weights carry their own error against the bf16 reference.
+        close_enough(&reference, &got, 85, 0.1);
+    } else if fp8() {
+        close_enough(&reference, &got, 93, 0.03);
+    } else {
         assert!(agree(&reference, &got) < 0.01);
-        return;
     }
-    // Quantized weights carry their own error against the bf16 reference:
-    // most picks must agree and log-probabilities must stay close.
+}
+
+/// For quantized weights: at least `pct`% of picks agree with the bf16
+/// reference and the median log-probability difference stays under `median`.
+fn close_enough(
+    reference: &[Vec<Reference>],
+    got: &[Vec<pocket_engine::sched::Scored>],
+    pct: usize,
+    median: f32,
+) {
     let (mut same, mut total, mut diffs) = (0, 0, Vec::new());
-    for (r_seq, g_seq) in reference.iter().zip(&got) {
+    for (r_seq, g_seq) in reference.iter().zip(got) {
         for (r, g) in r_seq.iter().zip(g_seq) {
             total += 1;
             same += (r.argmax == g.argmax) as usize;
@@ -109,13 +122,19 @@ fn matches_transformers_teacher_forced() {
         }
     }
     diffs.sort_by(f32::total_cmp);
-    assert!(same * 100 >= total * 85, "{same} of {total} picks agree");
-    assert!(
-        diffs[diffs.len() / 2] < 0.1,
-        "median {}",
-        diffs[diffs.len() / 2]
-    );
+    assert!(same * 100 >= total * pct, "{same} of {total} picks agree");
+    let m = diffs[diffs.len() / 2];
+    assert!(m < median, "median {m}");
 }
+
+/// POCKET_ENGINE_FP8=1 runs the suite with weights quantized to FP8 at load.
+fn fp8() -> bool {
+    std::env::var("POCKET_ENGINE_FP8").is_ok_and(|v| v == "1")
+}
+
+/// How far apart the reference's top two may be for a miss to count as a
+/// near tie: one bf16 step.
+const TIE_GAP: f32 = 0.126;
 
 fn quantized(dir: &std::path::Path) -> bool {
     pocket_engine::source::gguf_path(dir).is_some()
@@ -134,7 +153,7 @@ fn agree(reference: &[Vec<Reference>], got: &[Vec<pocket_engine::sched::Scored>]
     for (r_seq, g_seq) in reference.iter().zip(got) {
         assert_eq!(r_seq.len(), g_seq.len());
         for (r, g) in r_seq.iter().zip(g_seq) {
-            let tied = r.top[0].1 - r.top[1].1 <= 0.126;
+            let tied = r.top[0].1 - r.top[1].1 <= TIE_GAP;
             assert!(
                 tied || r.argmax == g.argmax,
                 "pick {} vs reference {}",
@@ -191,6 +210,11 @@ fn images_match_transformers() {
     }
     let mut e = Engine::new(config(dir)).unwrap();
     let got = e.score(items).unwrap();
+    if fp8() {
+        // Image tokens pass through every FP8 projection.
+        close_enough(&reference, &got, 95, 0.01);
+        return;
+    }
     assert!(agree(&reference, &got) < 0.01);
 }
 
@@ -232,13 +256,49 @@ fn batching_does_not_change_greedy_output() {
     let Some(dir) = model() else { return };
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let pairs: Vec<Pair> = fixture(&format!("{}.pairs.json", size(&dir)));
-    let prompts: Vec<Vec<u32>> = pairs.into_iter().map(|p| p.prompt).collect();
     let mut e = Engine::new(config(dir)).unwrap();
+    if fp8() {
+        // FP8 rounding of activations magnifies the last-bit differences
+        // that come from GEMM kernels chosen by batch size, about as much as
+        // FP8's own error against bf16, so greedy output may part. Hold the
+        // scores to the FP8 bar instead: the same tokens scored alone and
+        // among the others.
+        let items = |pairs: &[Pair]| -> Vec<Scoring> {
+            pairs
+                .iter()
+                .map(|p| Scoring {
+                    prompt: p.prompt.clone(),
+                    forced: p.forced.clone(),
+                    images: vec![],
+                    rope: None,
+                })
+                .collect()
+        };
+        let alone = e.score(items(&pairs[..1])).unwrap();
+        let together = e.score(items(&pairs)).unwrap();
+        let alone: Vec<Vec<Reference>> = alone
+            .into_iter()
+            .map(|seq| {
+                seq.into_iter()
+                    .map(|s| Reference {
+                        argmax: s.argmax,
+                        top: s.top,
+                    })
+                    .collect()
+            })
+            .collect();
+        close_enough(&alone, &together[..1], 90, 0.03);
+        return;
+    }
+    let prompts: Vec<Vec<u32>> = pairs.into_iter().map(|p| p.prompt).collect();
     let alone = generate(&mut e, &prompts[..1], 24);
     let together = generate(&mut e, &prompts, 24);
     assert_eq!(alone[0], together[0]);
     assert!(together.iter().all(|t| !t.is_empty()));
 }
+
+/// The tokens a sampler should keep, given a row's top five log-probabilities.
+type KeepSet<'a> = dyn Fn(&[(u32, f32)]) -> Vec<u32> + 'a;
 
 /// Draws one token `n` times from the first position of a prompt.
 fn draws(e: &mut Engine, prompt: &[u32], sampling: Sampling, n: usize) -> Vec<u32> {
@@ -282,10 +342,36 @@ fn samplers_follow_the_model_distribution() {
         .clone();
     let p: Vec<f64> = top.iter().map(|t| (t.1 as f64).exp()).collect();
     let n = 400;
+    // Each draw's own top five: the same n requests scored in the same steps
+    // get the same batch layout as the draws. Logits move by a last bit with
+    // batch layout, and FP8 magnifies that, so keep sets are judged per row.
+    let rows: Vec<Vec<(u32, f32)>> = e
+        .score(
+            (0..n)
+                .map(|_| Scoring {
+                    prompt: prompt.clone(),
+                    forced: vec![0],
+                    images: vec![],
+                    rope: None,
+                })
+                .collect(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|s| s[0].top.clone())
+        .collect();
     let count = |d: &[u32], t: u32| d.iter().filter(|&&x| x == t).count();
     let close = |got: usize, want: f64| {
         let sd = (n as f64 * want * (1.0 - want)).sqrt().max(1.0);
         (got as f64 - n as f64 * want).abs() < 4.0 * sd + 2.0
+    };
+    let all_kept = |d: &[u32], keep: &KeepSet<'_>, what: &str| {
+        for (i, (t, row)) in d.iter().zip(&rows).enumerate() {
+            assert!(
+                keep(row).contains(t),
+                "{what}: draw {i} is {t}, row {row:?}"
+            );
+        }
     };
     // top_k = 2: only the top two, in proportion.
     let d = draws(
@@ -298,7 +384,7 @@ fn samplers_follow_the_model_distribution() {
         },
         n,
     );
-    assert_eq!(count(&d, top[0].0) + count(&d, top[1].0), n);
+    all_kept(&d, &|row| vec![row[0].0, row[1].0], "top_k");
     assert!(
         close(count(&d, top[0].0), p[0] / (p[0] + p[1])),
         "top_k split"
@@ -322,10 +408,22 @@ fn samplers_follow_the_model_distribution() {
         },
         n,
     );
-    assert_eq!(
-        (0..3).map(|i| count(&d, top[i].0)).sum::<usize>(),
-        n,
-        "top_p keeps three"
+    all_kept(
+        &d,
+        &|row| {
+            // The smallest prefix holding top_p of the probability.
+            let mut mass = 0.0;
+            let mut keep = Vec::new();
+            for &(t, lp) in row {
+                keep.push(t);
+                mass += lp.exp();
+                if mass >= top_p {
+                    break;
+                }
+            }
+            keep
+        },
+        "top_p",
     );
     assert!(close(count(&d, top[0].0), p[0] / c[2]), "top_p split");
     // min_p at the second token's ratio keeps the top two.
@@ -340,10 +438,13 @@ fn samplers_follow_the_model_distribution() {
         },
         n,
     );
-    assert_eq!(
-        count(&d, top[0].0) + count(&d, top[1].0),
-        n,
-        "min_p keeps two"
+    all_kept(
+        &d,
+        &|row| {
+            let floor = row[0].1 + min_p.ln();
+            row.iter().filter(|x| x.1 >= floor).map(|x| x.0).collect()
+        },
+        "min_p",
     );
     // Plain temperature sampling reaches beyond the top token, reproducibly.
     let plain = Sampling {

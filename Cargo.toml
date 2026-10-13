@@ -9,7 +9,7 @@ repository = "https://github.com/lxe/pocket-engine"
 publish = false
 
 [dependencies]
-cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cublas", "cuda-13000", "dynamic-loading"] }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cublas", "cublaslt", "cuda-13000", "dynamic-loading"] }
 safetensors = "0.8.0"
 memmap2 = "0.9.11"
 half = "2.7.1"

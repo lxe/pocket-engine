@@ -59,6 +59,8 @@ __device__ __forceinline__ uint4 pack8(const float* f) {
     return u;
 }
 
+#include "fp8.cuh"
+
 // out[t] = table[ids[t]], or row emb_src[t] of the image embedding pool when
 // that is not negative.
 extern "C" __global__ void embed(const int* __restrict__ ids, const bf16* __restrict__ table,
@@ -77,11 +79,12 @@ extern "C" __global__ void embed(const int* __restrict__ ids, const bf16* __rest
 //   add == 1: sum = x[src] + res[src]; out[r] = norm(sum); res[src] = bf16(sum)
 //             unless write_res == 0.
 // The norm uses the unrounded f32 sum. `gather` (nullable) maps output rows to
-// source rows. Up to 4 * 8 * blockDim.x elements per row.
+// source rows. Up to 4 * 8 * blockDim.x elements per row. With fmode set,
+// the normalized row is also written as FP8 (see fp8.cuh).
 extern "C" __global__ void rmsnorm(const bf16* __restrict__ x, bf16* __restrict__ res,
                                    const float* __restrict__ w, bf16* __restrict__ out,
                                    const int* __restrict__ gather, int hidden, float eps, int add,
-                                   int write_res) {
+                                   int write_res, uint8_t* fq, void* fs, int fmode, int frows) {
     __shared__ float sh[32];
     const int r = blockIdx.x;
     const size_t src = gather ? (size_t)gather[r] : (size_t)r;
@@ -105,31 +108,47 @@ extern "C" __global__ void rmsnorm(const bf16* __restrict__ x, bf16* __restrict_
     }
     ss = block_sum(ss, sh);
     const float scale = 1.f / sqrtf(ss / hidden + eps);
+    const Fp8Out fo{fq, fs, fmode, frows};
 #pragma unroll
     for (int c = 0; c < 4; c++) {
         const int i = (c * blockDim.x + threadIdx.x) * 8;
+        // hidden is a multiple of 256, so whole warps are in or out of range.
+        if (c * blockDim.x * 8 >= (unsigned)hidden) break;
+        float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         if (i < hidden) {
-            float o[8];
 #pragma unroll
             for (int e = 0; e < 8; e++) o[e] = v[c][e] * scale * w[i + e];
             *reinterpret_cast<uint4*>(out + (size_t)r * hidden + i) = pack8(o);
         }
+        if (fmode) quant8(o, r, i, hidden, fo, i < hidden);
     }
 }
 
-// out[t, c] = bf16(silu(gate) * up) where gu[t] = [gate(inter) | up(inter)].
+// out[t, c] = bf16(silu(gate) * up) where gu[t] = [gate(inter) | up(inter)],
+// and/or the same as FP8 (see fp8.cuh); out may be null.
 extern "C" __global__ void silu_mul(const bf16* __restrict__ gu, bf16* __restrict__ out, int inter,
-                                    int tokens) {
+                                    int tokens, uint8_t* fq, void* fs, int fmode, int frows) {
+    const Fp8Out fo{fq, fs, fmode, frows};
     const int per_row = inter / 8;
-    const int n = tokens * per_row;
-    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += gridDim.x * blockDim.x) {
-        const int t = e / per_row, c = (e - t * per_row) * 8;
-        float g[8], u[8], o[8];
-        unpack8(*reinterpret_cast<const uint4*>(gu + (size_t)t * 2 * inter + c), g);
-        unpack8(*reinterpret_cast<const uint4*>(gu + (size_t)t * 2 * inter + inter + c), u);
+    const long long n = (long long)tokens * per_row;
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    // Warp-uniform trip count: FP8 scale groups reduce across lanes.
+    for (long long base = (long long)blockIdx.x * blockDim.x; base < n; base += stride) {
+        const long long e = base + threadIdx.x;
+        const bool active = e < n;
+        float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int t = 0, c = 0;
+        if (active) {
+            t = (int)(e / per_row);
+            c = (int)(e - (long long)t * per_row) * 8;
+            float g[8], u[8];
+            unpack8(*reinterpret_cast<const uint4*>(gu + (size_t)t * 2 * inter + c), g);
+            unpack8(*reinterpret_cast<const uint4*>(gu + (size_t)t * 2 * inter + inter + c), u);
 #pragma unroll
-        for (int i = 0; i < 8; i++) o[i] = silu(g[i]) * u[i];
-        *reinterpret_cast<uint4*>(out + (size_t)t * inter + c) = pack8(o);
+            for (int i = 0; i < 8; i++) o[i] = silu(g[i]) * u[i];
+            if (out) *reinterpret_cast<uint4*>(out + (size_t)t * inter + c) = pack8(o);
+        }
+        if (fmode) quant8(o, t, c, inter, fo, active);
     }
 }
 
@@ -184,8 +203,10 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
                   int Hk, int Hv, const float* __restrict__ neg_a, const float* __restrict__ dt_bias,
                   const float* __restrict__ norm_w, float* __restrict__ state,
                   const int* __restrict__ cu, const int* __restrict__ slots,
-                  const int* __restrict__ fresh, bf16* __restrict__ out, float eps, int tiled) {
-    __shared__ float qs[GDN_DIM], ks[GDN_DIM], sh[32];
+                  const int* __restrict__ fresh, bf16* __restrict__ out, float eps, int tiled,
+                  uint8_t* fq, void* fs, int fmode, int frows) {
+    __shared__ float qs[GDN_DIM], ks[GDN_DIM], sh[32], ys[GDN_DIM];
+    const Fp8Out fo{fq, fs, fmode, frows};
     const int s = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
     const int j = tid >> 1, half = tid & 1, i0 = half * GDN_HALF;
     const int t0 = cu[s], t1 = cu[s + 1];
@@ -251,6 +272,18 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
         if (!half) {
             const float y = ob * (1.f / sqrtf(var + eps)) * nw * silu(z);
             out[(size_t)t * Hv * GDN_DIM + h * GDN_DIM + j] = f2b(y);
+            ys[j] = y;
+        }
+        if (fmode) {
+            // The head's 128 outputs as FP8: 16 lanes of warp 0, 8 values each.
+            __syncthreads();
+            if (tid < 32) {
+                float v[8];
+#pragma unroll
+                for (int i = 0; i < 8; i++) v[i] = tid < 16 ? ys[8 * tid + i] : 0.f;
+                quant8(v, t, h * GDN_DIM + 8 * (tid & 15), Hv * GDN_DIM, fo, tid < 16);
+            }
+            __syncthreads();
         }
     }
 #pragma unroll
@@ -322,7 +355,8 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16
                                           int qstride, int Hq, int Hkv, const int* __restrict__ pos,
                                           const int* __restrict__ tok_seq,
                                           const int* __restrict__ block_table, int max_blocks,
-                                          int block_size, bf16* __restrict__ out, float scale) {
+                                          int block_size, bf16* __restrict__ out, float scale,
+                                          uint8_t* fq, void* fs, int fmode, int frows) {
     __shared__ float sm_m[WARPS][G], sm_s[WARPS][G];
     __shared__ float sm_acc[WARPS][G][HEAD_DIM];
     const int t = blockIdx.x, kvh = blockIdx.y;
@@ -389,7 +423,21 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16
             const int h = kvh * G + g;
             const float o = rbf(A / S);
             const float gate = b2f(qkv[(size_t)t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d]);
-            out[((size_t)t * Hq + h) * HEAD_DIM + d] = f2b(o / (1.f + expf(-gate)));
+            const float y = o / (1.f + expf(-gate));
+            out[((size_t)t * Hq + h) * HEAD_DIM + d] = f2b(y);
+            if (fmode) sm_acc[0][g][d] = y;  // reused: the merge above has read it
+        }
+    }
+    if (fmode) {
+        // Each head's 256 gated outputs as FP8, one warp per head.
+        __syncthreads();
+        const Fp8Out fo{fq, fs, fmode, frows};
+        const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+        for (int g = w; g < G; g += WARPS) {
+            float v[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++) v[i] = sm_acc[0][g][8 * l + i];
+            quant8(v, t, (kvh * G + g) * HEAD_DIM + 8 * l, Hq * HEAD_DIM, fo, true);
         }
     }
 }
@@ -401,9 +449,10 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const bf16
         const bf16* __restrict__ q, const bf16* __restrict__ kcache, const bf16* __restrict__ vcache,  \
         const bf16* __restrict__ qkv, int qstride, int Hq, int Hkv, const int* __restrict__ pos,      \
         const int* __restrict__ tok_seq, const int* __restrict__ block_table, int max_blocks,         \
-        int block_size, bf16* __restrict__ out, float scale) {                                         \
+        int block_size, bf16* __restrict__ out, float scale, uint8_t* fq, void* fs, int fmode,         \
+        int frows) {                                                                                   \
         attn_body<G, WARPS>(q, kcache, vcache, qkv, qstride, Hq, Hkv, pos, tok_seq, block_table,       \
-                            max_blocks, block_size, out, scale);                                       \
+                            max_blocks, block_size, out, scale, fq, fs, fmode, frows);                 \
     }
 ATTN_KERNEL(1, 8)
 ATTN_KERNEL(2, 8)

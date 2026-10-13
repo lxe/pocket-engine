@@ -2,9 +2,9 @@
 //! one forward step over a flat token batch.
 
 use crate::gguf::Gguf;
-use crate::gpu::{Arg, Buf, Gpu, Kernel, Pinned};
-use crate::linear::{Kind, Linear, Part, Quants};
-use crate::source::Source;
+use crate::gpu::{Arg, Buf, Fp8Mode, Gpu, Kernel, Pinned};
+use crate::linear::{Input, Kind, Linear, Part, Quants};
+use crate::source::{Load, Source};
 use crate::{Error, Result};
 use std::path::Path;
 use std::rc::Rc;
@@ -310,6 +310,8 @@ pub struct Model {
     quants: Quants,
     /// Bytes of weights on the device.
     pub weight_bytes: usize,
+    /// The FP8 layout of the model's FP8 layers, if any.
+    pub fp8: Option<Fp8Mode>,
 }
 
 pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -318,16 +320,16 @@ pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
 
 impl Model {
     /// Loads a Hugging Face directory or a GGUF file (or a directory holding one).
-    pub fn load(gpu: &Gpu, path: &Path) -> Result<Self> {
+    pub fn load(gpu: &Gpu, path: &Path, load: Load) -> Result<Self> {
         let started = gpu.begin_uploads()?;
-        let m = Self::load_weights(gpu, path);
+        let m = Self::load_weights(gpu, path, load);
         if started {
             gpu.end_uploads()?;
         }
         m
     }
 
-    fn load_weights(gpu: &Gpu, path: &Path) -> Result<Self> {
+    fn load_weights(gpu: &Gpu, path: &Path, load: Load) -> Result<Self> {
         let src = Source::open(path)?;
         let mut cfg = match &src {
             Source::Gguf(g) => Config::from_gguf(g)?,
@@ -353,6 +355,7 @@ impl Model {
                             (&format!("{a}v_proj.weight"), cfg.hkv * HEAD_DIM),
                         ],
                         h,
+                        load,
                     )?,
                     q_norm: up(&src.norm(&format!("{a}q_norm.weight"), HEAD_DIM)?)?,
                     k_norm: up(&src.norm(&format!("{a}k_norm.weight"), HEAD_DIM)?)?,
@@ -361,6 +364,7 @@ impl Model {
                         &mut quants,
                         &[(&format!("{a}o_proj.weight"), h)],
                         cfg.hq * HEAD_DIM,
+                        load,
                     )?,
                     cache: n_cache,
                 };
@@ -380,6 +384,7 @@ impl Model {
                             (&format!("{a}in_proj_a.weight"), hv),
                         ],
                         h,
+                        load,
                     )?,
                     conv_w: up(&src.vec_f32(&format!("{a}conv1d.weight"), cfg.conv_dim() * 4)?)?,
                     neg_a: up(&src.neg_a(l, hv)?)?,
@@ -391,6 +396,7 @@ impl Model {
                         &mut quants,
                         &[(&format!("{a}out_proj.weight"), h)],
                         hv * GDN_DIM,
+                        load,
                     )?,
                     state: n_state,
                 };
@@ -409,12 +415,14 @@ impl Model {
                         (&format!("{p}mlp.up_proj.weight"), i),
                     ],
                     h,
+                    load,
                 )?,
                 w_down: src.linear(
                     gpu,
                     &mut quants,
                     &[(&format!("{p}mlp.down_proj.weight"), h)],
                     i,
+                    load,
                 )?,
             });
         }
@@ -422,12 +430,13 @@ impl Model {
             src.shared(gpu, &mut quants, "embed_tokens.weight", cfg.vocab, h)?;
         // The output layer is its own tensor, or tied to the embedding.
         let lm_head = if src.has("/lm_head.weight") {
-            src.linear(gpu, &mut quants, &[("/lm_head.weight", cfg.vocab)], h)?
+            src.linear(gpu, &mut quants, &[("/lm_head.weight", cfg.vocab)], h, load)?
         } else {
             Linear {
                 parts: vec![Part {
                     buf: embed.clone(),
                     kind: embed_kind,
+                    scales: None,
                     rows: cfg.vocab,
                     off: 0,
                 }],
@@ -440,6 +449,7 @@ impl Model {
         let embed_kernel = match embed_kind {
             Kind::Bf16 => gpu.kernel("embed")?,
             Kind::Quant(ty) => quants.get(gpu, ty)?.embed,
+            Kind::Fp8(_) => return Err(Error::Config("FP8 embeddings are not supported".into())),
         };
         let k = Kernels {
             embed: embed_kernel,
@@ -478,7 +488,9 @@ impl Model {
         if src.has("/lm_head.weight") {
             weight_bytes += lm_head.bytes();
         }
+        let fp8 = layers.iter().find_map(|l| l.w_gu.fp8().or(l.w_down.fp8()));
         Ok(Self {
+            fp8,
             final_norm: up(&src.norm("norm.weight", h)?)?,
             inv_freq: up(&inv_freq)?,
             embed,
@@ -621,13 +633,52 @@ pub struct Act {
     pen_dev: Buf,
     pub pen_staging: Pinned,
     pub pen_capacity: usize,
+    /// FP8 copies of the projections' inputs, when the model has FP8 layers.
+    fp8: Option<Fp8Acts>,
+}
+
+/// FP8 values and scales of each projection input: the normalized hidden
+/// state, the MLP activation, the linear-attention output and the gated
+/// attention output.
+struct Fp8Acts {
+    mode: Fp8Mode,
+    xn: (Buf, Buf),
+    act: (Buf, Buf),
+    core: (Buf, Buf),
+    ao: (Buf, Buf),
 }
 
 impl Act {
     /// `pool_rows` image embeddings can wait between the vision encoder and
     /// the prompt step that reads them.
-    pub fn new(gpu: &Gpu, cfg: &Config, meta: Meta, pool_rows: usize) -> Result<Self> {
+    pub fn new(
+        gpu: &Gpu,
+        cfg: &Config,
+        meta: Meta,
+        pool_rows: usize,
+        fp8: Option<Fp8Mode>,
+    ) -> Result<Self> {
         let (t, s) = (meta.max_tokens, meta.max_seqs);
+        let fp8 = match fp8 {
+            None => None,
+            Some(mode) => {
+                // Scale tiles cover whole 128-row tiles (and padding to 4 rows).
+                let rows = (t + 4).next_multiple_of(128);
+                let pair = |k: usize| -> Result<(Buf, Buf)> {
+                    Ok((
+                        gpu.alloc_zeroed(rows * k)?,
+                        gpu.alloc_zeroed(mode.act_scale_bytes(rows, k))?,
+                    ))
+                };
+                Some(Fp8Acts {
+                    mode,
+                    xn: pair(cfg.hidden)?,
+                    act: pair(cfg.inter)?,
+                    core: pair(cfg.lin_v_heads * GDN_DIM)?,
+                    ao: pair(cfg.hq * HEAD_DIM)?,
+                })
+            }
+        };
         let b = |n: usize| gpu.alloc_zeroed(n * 2);
         // Every token a sequence can hold, plus a logit_bias of up to 1,024.
         let pen_capacity = s * (meta.max_blocks * BLOCK_SIZE + 1024);
@@ -652,8 +703,45 @@ impl Act {
             pen_dev: gpu.alloc_zeroed(3 * pen_capacity * 4)?,
             pen_staging: gpu.pinned(3 * pen_capacity * 4)?,
             pen_capacity,
+            fp8,
             meta,
         })
+    }
+
+    /// Kernel arguments for writing FP8 copies into `which` (values, scales,
+    /// mode, rows), or zeros when the model has no FP8 layers.
+    fn fp8_args(&self, which: fn(&Fp8Acts) -> &(Buf, Buf), rows: usize) -> [Arg; 4] {
+        match &self.fp8 {
+            Some(f) => {
+                let (q, s) = which(f);
+                let mode = match f.mode {
+                    Fp8Mode::Block128 => 1,
+                    Fp8Mode::Mx32 => 2,
+                };
+                [
+                    Arg::P(q.ptr),
+                    Arg::P(s.ptr),
+                    Arg::I(mode),
+                    Arg::I(crate::linear::fp8_rows(f.mode, rows) as i32),
+                ]
+            }
+            None => [Arg::P(0), Arg::P(0), Arg::I(0), Arg::I(0)],
+        }
+    }
+
+    /// A projection input: bf16 rows, plus their FP8 copy if there is one.
+    fn input(&self, bf16: &Buf, which: fn(&Fp8Acts) -> &(Buf, Buf)) -> Input {
+        match &self.fp8 {
+            Some(f) => {
+                let (q, s) = which(f);
+                Input {
+                    bf16: bf16.ptr,
+                    fp8: q.ptr,
+                    scales: s.ptr,
+                }
+            }
+            None => Input::bf16(bf16.ptr),
+        }
     }
 
     fn m(&self, word: usize) -> u64 {
@@ -707,24 +795,21 @@ impl Model {
                 I(h as i32),
             ],
         )?;
+        let xn_in = a.input(&a.xn, |f| &f.xn);
         let norm = |x: u64, w: &Buf, add: bool| -> Result<()> {
-            gpu.launch(
-                k.rmsnorm,
-                (ti, 1, 1),
-                256,
-                0,
-                &[
-                    P(x),
-                    P(a.res.ptr),
-                    P(w.ptr),
-                    P(a.xn.ptr),
-                    P(0),
-                    I(h as i32),
-                    F(eps),
-                    I(add as i32),
-                    I(1),
-                ],
-            )
+            let mut args = vec![
+                P(x),
+                P(a.res.ptr),
+                P(w.ptr),
+                P(a.xn.ptr),
+                P(0),
+                I(h as i32),
+                F(eps),
+                I(add as i32),
+                I(1),
+            ];
+            args.extend(a.fp8_args(|f| &f.xn, t));
+            gpu.launch(k.rmsnorm, (ti, 1, 1), 256, 0, &args)
         };
         for (li, layer) in self.layers.iter().enumerate() {
             norm(a.h.ptr, &layer.in_norm, li > 0)?;
@@ -739,7 +824,7 @@ impl Model {
                     state,
                 } => {
                     let (pw, cd, hv) = (c.gdn_proj(), c.conv_dim(), c.lin_v_heads);
-                    w_in.forward(gpu, q, a.xn.ptr, t, a.proj.ptr, pw, false)?;
+                    w_in.forward(gpu, q, xn_in, t, a.proj.ptr, pw, false)?;
                     gpu.launch(
                         k.gdn_conv,
                         (cd.div_ceil(128) as u32, si, 1),
@@ -779,9 +864,12 @@ impl Model {
                             P(a.core.ptr),
                             F(eps),
                             I(c.tiled_v as i32),
-                        ],
+                        ]
+                        .into_iter()
+                        .chain(a.fp8_args(|f| &f.core, t))
+                        .collect::<Vec<_>>(),
                     )?;
-                    w_out.forward(gpu, q, a.core.ptr, t, a.h.ptr, h, false)?;
+                    w_out.forward(gpu, q, a.input(&a.core, |f| &f.core), t, a.h.ptr, h, false)?;
                 }
                 Mixer::Attn {
                     w_qkv,
@@ -791,7 +879,7 @@ impl Model {
                     cache,
                 } => {
                     let qs = c.attn_proj();
-                    w_qkv.forward(gpu, q, a.xn.ptr, t, a.proj.ptr, qs, false)?;
+                    w_qkv.forward(gpu, q, xn_in, t, a.proj.ptr, qs, false)?;
                     gpu.launch(
                         k.attn_prep,
                         (ti, (c.hq + 2 * c.hkv) as u32, 1),
@@ -836,26 +924,33 @@ impl Model {
                             I(BLOCK_SIZE as i32),
                             P(a.ao.ptr),
                             F(1.0 / (HEAD_DIM as f32).sqrt()),
-                        ],
+                        ]
+                        .into_iter()
+                        .chain(a.fp8_args(|f| &f.ao, t))
+                        .collect::<Vec<_>>(),
                     )?;
-                    w_o.forward(gpu, q, a.ao.ptr, t, a.h.ptr, h, false)?;
+                    w_o.forward(gpu, q, a.input(&a.ao, |f| &f.ao), t, a.h.ptr, h, false)?;
                 }
             }
             norm(a.h.ptr, &layer.post_norm, true)?;
             layer
                 .w_gu
-                .forward(gpu, q, a.xn.ptr, t, a.gu.ptr, 2 * c.inter, false)?;
+                .forward(gpu, q, xn_in, t, a.gu.ptr, 2 * c.inter, false)?;
             let blocks = (t * c.inter / 8).div_ceil(256).min(8192) as u32;
             gpu.launch(
                 k.silu_mul,
                 (blocks, 1, 1),
                 256,
                 0,
-                &[P(a.gu.ptr), P(a.act.ptr), I(c.inter as i32), I(t as i32)],
+                &[
+                    [P(a.gu.ptr), P(a.act.ptr), I(c.inter as i32), I(t as i32)].as_slice(),
+                    &a.fp8_args(|f| &f.act, t),
+                ]
+                .concat(),
             )?;
             layer
                 .w_down
-                .forward(gpu, q, a.act.ptr, t, a.h.ptr, h, false)?;
+                .forward(gpu, q, a.input(&a.act, |f| &f.act), t, a.h.ptr, h, false)?;
         }
         gpu.launch(
             k.rmsnorm,
@@ -872,10 +967,21 @@ impl Model {
                 F(eps),
                 I(1),
                 I(0),
+                P(0),
+                P(0),
+                I(0),
+                I(0),
             ],
         )?;
-        self.lm_head
-            .forward(gpu, q, a.fin.ptr, s, a.logits.ptr, c.vocab, true)?;
+        self.lm_head.forward(
+            gpu,
+            q,
+            Input::bf16(a.fin.ptr),
+            s,
+            a.logits.ptr,
+            c.vocab,
+            true,
+        )?;
         let cap = (4 * a.pen_capacity) as u64;
         gpu.launch(
             k.penalize,

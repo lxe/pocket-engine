@@ -41,14 +41,31 @@ A quantized matrix multiply picks one of three paths by the number of rows in th
 
 All three issue no allocation and no host synchronization, so quantized decode steps run inside CUDA graphs like bf16 ones.
 
+## FP8
+
+FP8 layers multiply E4M3 weights by E4M3 activations on cuBLASLt with per-block scales, accumulating in f32. Weights come from two places:
+
+- **Qwen's FP8 checkpoints** (`Qwen3.8-27B-FP8`, `Qwen3.5-27B-FP8`) store E4M3 weights with an f32 scale per 128×128 tile (`weight_scale_inv`). Their `modules_to_not_convert` stay bf16: the embedding, output layer, convolution, the linear-attention `a` and `b` projections, and the vision tower.
+- **`--fp8`** quantizes a bf16 checkpoint's projections on the GPU at load, keeping the same layers in bf16.
+
+The scale layout follows the GPU:
+
+- **Hopper (H100, H200)** runs block-scaled FP8: the checkpoint's 128×128 weight scales as stored, and one activation scale per row and 128 columns. cuBLASLt needs a multiple of 4 rows there, so steps are padded.
+- **Blackwell (RTX 5090)** has only MXFP8 in cuBLASLt: a power-of-two scale per 32 values, for weights and activations. Checkpoint tiles are converted at load.
+
+Activations are converted where they are produced, not in a separate pass. RMSNorm, SiLU-and-multiply, the gated-delta-rule output norm and the gated attention output write their bf16 result and its FP8 copy with scales in the same kernel. The FP8 multiply then reads only the FP8 copy. Every step stays free of allocation and host synchronization, so FP8 decode runs in CUDA graphs.
+
+FP8 output depends slightly on what shares a step. cuBLAS and cuBLASLt choose kernels by row count, so a row's sums can differ in the last bit between batch sizes. bf16 rounding usually absorbs that, but an FP8 rounding that flips carries the difference into later layers. Scored alone and among other requests, the same tokens differ by a median of 0.01 in log-probability on the 0.8B and 2B models, about FP8's own error against bf16; the 4B and 9B models produce identical greedy text either way.
+
 ## Loading
 
-Weights go from the file to the GPU without passing through mapped memory. Tensor ranges are read with parallel `pread` calls into four 64 MB pinned buffers, and the copy engine drains each buffer while the next one fills. GGUF blocks that need padding are repacked on the GPU. All of this is ordered on one stream, so loading never waits for the device. From the page cache on the RTX 5090 machine:
+Weights go from the file to the GPU without passing through mapped memory. Tensor ranges are read with parallel `pread` calls into four 64 MB pinned buffers, and the copy engine drains each buffer while the next one fills. GGUF blocks that need padding are repacked on the GPU, and FP8 conversions run on the GPU too. All of this is ordered on one stream, so loading never waits for the device. From the page cache on the RTX 5090 machine:
 
 | Model | Weights | Ready (to serving) |
 |---|---|---|
 | Qwen3.5-2B, bf16 | 3.8 GB | 1.5 s |
 | Qwen3.5-9B, bf16 | 17.9 GB | 1.8 s |
+| Qwen3.5-9B, `--fp8` | 11.2 GB | 2.0 s |
 | Qwen3.5-9B, Q4_K_M | 5.7 GB | 2.0 s |
 | Qwen3.8-27B, Q4_K_M | 19.4 GB | 1.9 s |
 
@@ -93,6 +110,19 @@ GGUF quantizations are measured against the same bf16 references, so they show t
 | Qwen3.8-27B UD-Q4_K_XL | 210 of 213 | 0.0011, 0.16 |
 | Qwen3.8-27B UD-IQ4_XS | 207 of 213 | 0.0022, 0.19 |
 
+FP8 against the same bf16 references. The 27B checkpoints ran on an H100; `--fp8` ran on the RTX 5090 (MXFP8):
+
+| FP8 | Top-1 agreement | Median, p95 log-prob difference |
+|---|---|---|
+| Qwen3.8-27B-FP8 (checkpoint) | 209 of 213 (2 misses within one bf16 step) | 0.0009, 0.088 |
+| Qwen3.8-27B-FP8, images | 91 of 91 | 0.0005, 0.14 |
+| Qwen3.5-27B-FP8 (checkpoint) | 215 of 217 (both within one bf16 step) | 0.0003, 0.066 |
+| Qwen3.5-27B, bf16, for comparison | 217 of 217 | 0.0001, 0.032 |
+| Qwen3.5-9B, `--fp8` | 213 of 220 (6 within one bf16 step) | 0.0011, 0.16 |
+| Qwen3.5-9B, `--fp8`, images | 84 of 85 | 0.0000, 0.097 |
+| Qwen3.5-4B, `--fp8` | 201 of 210 | 0.0023, 0.18 |
+| Qwen3.5-0.8B, `--fp8` | 209 of 222 (10 within one bf16 step) | 0.019, 0.25 |
+
 ## Throughput
 
 `scripts/load.py` sends streamed chat completions. Prompts are about 60 to 200 tokens and outputs 16 to 64 tokens, decoded greedily. The table gives output tokens per second and median time to first token. [Receipt](receipts/load.json).
@@ -110,27 +140,27 @@ The model was Qwen3.5-2B. Both H100 runs used the same RunPod H100 SXM (driver 5
 
 ### Quantized weights, RTX 5090
 
-Qwen3.5-9B under the same load, output tokens per second and median time to first token at 64 in flight. With `--max-seqs` lowered to fit the recurrent state, 53 requests fit beside the bf16 weights and 192 beside Q4_K_M.
+Qwen3.5-9B under the same load, output tokens per second and median time to first token at 64 in flight. With `--max-seqs` lowered to fit the recurrent state, 53 requests fit beside the bf16 weights, 119 beside FP8 and 187 beside Q4_K_M.
 
-| In flight | bf16 (safetensors) | Q4_K_M (GGUF) | Q8_0 (GGUF) |
-|---:|---|---|---|
-| 1 | 87 | 175 | 135 |
-| 8 | 546 | 607 | 402 |
-| 16 | 909 | 903 | 660 |
-| 32 | 1,284 | 1,285 | 982 |
-| 64 | 1,519, 0.34 s | 1,562, 0.15 s | 1,301, 0.17 s |
-| burst of 64 | 1,294 | 1,546 | 1,150 |
+| In flight | bf16 (safetensors) | `--fp8` (MXFP8) | Q4_K_M (GGUF) | Q8_0 (GGUF) |
+|---:|---|---|---|---|
+| 1 | 87 | 109 | 175 | 135 |
+| 8 | 546 | 739 | 607 | 402 |
+| 16 | 909 | 1,259 | 903 | 660 |
+| 32 | 1,284 | 1,873 | 1,285 | 982 |
+| 64 | 1,519, 0.34 s | 2,508, 0.08 s | 1,562, 0.15 s | 1,301, 0.17 s |
+| burst of 64 | 1,294 | 2,194 | 1,546 | 1,150 |
 
 ### Qwen3.8-27B
 
 Output tokens per second under the same load, and median time to first token. [Receipt](receipts/qwen3.8-27b.json).
 
-| In flight | RTX 5090, Q4_K_M (GGUF) | H100, bf16 |
-|---:|---|---|
-| 1 | 54, 0.07 s | 46, 0.05 s |
-| 8 | 154, 0.14 s | 256, 0.07 s |
-| 16 | 226, 0.18 s | 450, 0.08 s |
-| 32 | 241, 1.6 s | 662, 0.10 s |
-| 64 | 231, 4.7 s | 898, 0.15 s |
+| In flight | RTX 5090, Q4_K_M (GGUF) | H100, bf16 | H100, FP8 checkpoint |
+|---:|---|---|---|
+| 1 | 54, 0.07 s | 46, 0.05 s | 69, 0.05 s |
+| 8 | 154, 0.14 s | 256, 0.07 s | 349, 0.06 s |
+| 16 | 226, 0.18 s | 450, 0.08 s | 558, 0.07 s |
+| 32 | 241, 1.6 s | 662, 0.10 s | 810, 0.10 s |
+| 64 | 231, 4.7 s | 898, 0.15 s | 1,107, 0.14 s |
 
-A request holds 146 MB of recurrent state (48 linear-attention layers × 48 heads × 128 × 128 × f32) plus 64 KB of KV cache per token (16 attention layers). On the 5090, the Q4_K_M weights (19 GB) leave room for 17 requests at once, so throughput levels off from 16 in flight and later requests wait. The H100 holds 63 beside the bf16 weights.
+A request holds 146 MB of recurrent state (48 linear-attention layers × 48 heads × 128 × 128 × f32) plus 64 KB of KV cache per token (16 attention layers). On the 5090, the Q4_K_M weights (19 GB) leave room for 17 requests at once, so throughput levels off from 16 in flight and later requests wait. The H100 holds 63 beside the bf16 weights and 142 beside the FP8 ones (`Qwen3.8-27B-FP8`, about 30 GB).

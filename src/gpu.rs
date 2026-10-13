@@ -5,8 +5,10 @@
 
 use crate::{Error, Result};
 use cudarc::cublas::sys as cb;
+use cudarc::cublaslt::sys as lt;
 use cudarc::driver::sys as cu;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
 
 fn check(r: cu::CUresult, what: &'static str) -> Result<()> {
@@ -181,9 +183,66 @@ impl Drop for Graph {
     }
 }
 
+/// How FP8 matrices carry their scales, by what the device's cuBLASLt runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8Mode {
+    /// f32 scales per 128 x 128 weight tile and per 128 activations of a row
+    /// (Hopper; Qwen's FP8 checkpoints use this layout).
+    Block128,
+    /// MXFP8: power-of-two (E8M0) scales per 32 values of a row, in
+    /// cuBLASLt's 128 x 4 tiles (Blackwell).
+    Mx32,
+}
+
+impl Fp8Mode {
+    /// Values sharing one scale along K.
+    pub fn group(self) -> usize {
+        match self {
+            Fp8Mode::Block128 => 128,
+            Fp8Mode::Mx32 => 32,
+        }
+    }
+    /// Bytes of activation scales for `rows` x `k`.
+    pub fn act_scale_bytes(self, rows: usize, k: usize) -> usize {
+        match self {
+            Fp8Mode::Block128 => rows * k.div_ceil(128) * 4,
+            Fp8Mode::Mx32 => mx_scale_bytes(rows, k),
+        }
+    }
+    /// Bytes of weight scales for an `n` x `k` matrix.
+    pub fn weight_scale_bytes(self, n: usize, k: usize) -> usize {
+        match self {
+            Fp8Mode::Block128 => n.div_ceil(128) * k.div_ceil(128) * 4,
+            Fp8Mode::Mx32 => mx_scale_bytes(n, k),
+        }
+    }
+}
+
+/// MXFP8 scales of a `rows` x `k` matrix: 128-row by 4-block tiles of 512 bytes.
+pub fn mx_scale_bytes(rows: usize, k: usize) -> usize {
+    rows.div_ceil(128) * k.div_ceil(32).div_ceil(4) * 512
+}
+
+/// An FP8 matmul's operands: weights, activation scales, n, k, rows, ldy and
+/// whether the output is f32.
+type PlanKey = (u64, u64, usize, usize, usize, usize, bool);
+
+struct LtPlan {
+    desc: lt::cublasLtMatmulDesc_t,
+    a: lt::cublasLtMatrixLayout_t,
+    b: lt::cublasLtMatrixLayout_t,
+    d: lt::cublasLtMatrixLayout_t,
+    algo: lt::cublasLtMatmulAlgo_t,
+}
+
 pub struct Gpu {
     /// Streaming multiprocessors on the device.
     pub sms: usize,
+    /// Compute capability, as major * 10 + minor.
+    pub arch: u32,
+    lt: lt::cublasLtHandle_t,
+    lt_ws: Buf,
+    lt_plans: RefCell<HashMap<PlanKey, LtPlan>>,
     stream: cu::CUstream,
     blas: cb::cublasHandle_t,
     module: cu::CUmodule,
@@ -218,6 +277,23 @@ impl Gpu {
                 "cuDeviceGetName",
             )?;
             let name = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
+            let (mut major, mut minor) = (0, 0);
+            check(
+                cu::cuDeviceGetAttribute(
+                    &mut major,
+                    cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    dev,
+                ),
+                "cuDeviceGetAttribute",
+            )?;
+            check(
+                cu::cuDeviceGetAttribute(
+                    &mut minor,
+                    cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    dev,
+                ),
+                "cuDeviceGetAttribute",
+            )?;
             let mut sms = 0;
             check(
                 cu::cuDeviceGetAttribute(
@@ -265,8 +341,23 @@ impl Gpu {
                 cb::cublasSetWorkspace_v2(blas, ws as *mut c_void, ws_bytes),
                 "cublasSetWorkspace",
             )?;
+            let mut lth = std::ptr::null_mut();
+            let r = lt::cublasLtCreate(&mut lth);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(Error::Cuda("cublasLtCreate", format!("{r:?}")));
+            }
+            let lt_bytes = 64 << 20;
+            let mut lw = 0;
+            check(cu::cuMemAlloc_v2(&mut lw, lt_bytes), "cuMemAlloc")?;
             Ok(Self {
                 sms: sms as usize,
+                arch: (major * 10 + minor) as u32,
+                lt: lth,
+                lt_ws: Buf {
+                    ptr: lw,
+                    bytes: lt_bytes,
+                },
+                lt_plans: RefCell::new(HashMap::new()),
                 stream,
                 blas,
                 module,
@@ -669,6 +760,206 @@ impl Gpu {
             },
             "cublasGemmStridedBatchedEx",
         )
+    }
+
+    /// The FP8 layout this device's cuBLASLt runs: block scales on Hopper,
+    /// MXFP8 on Blackwell, none before Hopper.
+    pub fn fp8_mode(&self) -> Option<Fp8Mode> {
+        match self.arch {
+            90 => Some(Fp8Mode::Block128),
+            100.. => Some(Fp8Mode::Mx32),
+            _ => None,
+        }
+    }
+
+    /// y[rows, ldy] (from column 0) = x[rows, k] . w[n, k]^T with E4M3 inputs
+    /// scaled as `mode` describes, f32 accumulation, bf16 or f32 output.
+    /// Plans (descriptor, layouts, algorithm) are cached per shape and
+    /// operands, so replays and graph captures issue only the matmul.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_matmul(
+        &self,
+        mode: Fp8Mode,
+        w: u64,
+        w_scale: u64,
+        x: u64,
+        x_scale: u64,
+        y: u64,
+        n: usize,
+        k: usize,
+        rows: usize,
+        ldy: usize,
+        f32_out: bool,
+    ) -> Result<()> {
+        let key = (w, x_scale, n, k, rows, ldy, f32_out);
+        let mut plans = self.lt_plans.borrow_mut();
+        let p = match plans.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(self.fp8_plan(mode, w_scale, x_scale, n, k, rows, ldy, f32_out)?)
+            }
+        };
+        let (alpha, beta) = (1f32, 0f32);
+        // SAFETY: the plan's operands match the buffers passed for its key.
+        let r = unsafe {
+            lt::cublasLtMatmul(
+                self.lt,
+                p.desc,
+                (&alpha as *const f32).cast(),
+                w as *const c_void,
+                p.a,
+                x as *const c_void,
+                p.b,
+                (&beta as *const f32).cast(),
+                y as *const c_void,
+                p.d,
+                y as *mut c_void,
+                p.d,
+                &p.algo,
+                self.lt_ws.ptr as *mut c_void,
+                self.lt_ws.bytes,
+                self.stream.cast(),
+            )
+        };
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(Error::Cuda("cublasLtMatmul", format!("{r:?}")));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fp8_plan(
+        &self,
+        mode: Fp8Mode,
+        w_scale: u64,
+        x_scale: u64,
+        n: usize,
+        k: usize,
+        rows: usize,
+        ldy: usize,
+        f32_out: bool,
+    ) -> Result<LtPlan> {
+        use lt::cublasLtMatmulDescAttributes_t as A;
+        let ok = |r: lt::cublasStatus_t, what: &'static str| -> Result<()> {
+            if r == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                Ok(())
+            } else {
+                Err(Error::Cuda(what, format!("{r:?}")))
+            }
+        };
+        // cuBLASLt scale modes: SCALAR_32F = 0, VEC32_UE8M0 = 2, VEC128_32F = 4, BLK128x128_32F = 5.
+        let (a_mode, b_mode): (u32, u32) = match mode {
+            Fp8Mode::Block128 => (5, 4),
+            Fp8Mode::Mx32 => (2, 2),
+        };
+        // SAFETY: descriptor and layout handles are created here and owned by the plan.
+        unsafe {
+            let mut desc = std::ptr::null_mut();
+            ok(
+                lt::cublasLtMatmulDescCreate(
+                    &mut desc,
+                    lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    lt::cudaDataType_t::CUDA_R_32F,
+                ),
+                "cublasLtMatmulDescCreate",
+            )?;
+            let set = |attr: A, v: *const c_void, size: usize| -> Result<()> {
+                ok(
+                    lt::cublasLtMatmulDescSetAttribute(desc, attr, v, size),
+                    "cublasLtMatmulDescSetAttribute",
+                )
+            };
+            // cublasOperation_t: N = 0, T = 1.
+            let (ta, tb) = (1i32, 0i32);
+            set(
+                A::CUBLASLT_MATMUL_DESC_TRANSA,
+                (&ta as *const i32).cast(),
+                4,
+            )?;
+            set(
+                A::CUBLASLT_MATMUL_DESC_TRANSB,
+                (&tb as *const i32).cast(),
+                4,
+            )?;
+            set(
+                A::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                (&a_mode as *const u32).cast(),
+                4,
+            )?;
+            set(
+                A::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                (&b_mode as *const u32).cast(),
+                4,
+            )?;
+            set(
+                A::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                (&w_scale as *const u64).cast(),
+                8,
+            )?;
+            set(
+                A::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                (&x_scale as *const u64).cast(),
+                8,
+            )?;
+            let layout = |ty: lt::cudaDataType_t,
+                          r: usize,
+                          c: usize,
+                          ld: usize|
+             -> Result<lt::cublasLtMatrixLayout_t> {
+                let mut l = std::ptr::null_mut();
+                ok(
+                    lt::cublasLtMatrixLayoutCreate(&mut l, ty, r as u64, c as u64, ld as i64),
+                    "cublasLtMatrixLayoutCreate",
+                )?;
+                Ok(l)
+            };
+            // Column-major views: W^T is k x n, x^T is k x rows, y^T is n x rows.
+            let a = layout(lt::cudaDataType_t::CUDA_R_8F_E4M3, k, n, k)?;
+            let b = layout(lt::cudaDataType_t::CUDA_R_8F_E4M3, k, rows, k)?;
+            let d_ty = if f32_out {
+                lt::cudaDataType_t::CUDA_R_32F
+            } else {
+                lt::cudaDataType_t::CUDA_R_16BF
+            };
+            let d = layout(d_ty, n, rows, ldy)?;
+            let mut pref = std::ptr::null_mut();
+            ok(
+                lt::cublasLtMatmulPreferenceCreate(&mut pref),
+                "cublasLtMatmulPreferenceCreate",
+            )?;
+            let ws = self.lt_ws.bytes;
+            ok(
+                lt::cublasLtMatmulPreferenceSetAttribute(
+                    pref,
+                    lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    (&ws as *const usize).cast(),
+                    8,
+                ),
+                "cublasLtMatmulPreferenceSetAttribute",
+            )?;
+            let mut res: lt::cublasLtMatmulHeuristicResult_t = std::mem::zeroed();
+            let mut found = 0;
+            ok(
+                lt::cublasLtMatmulAlgoGetHeuristic(
+                    self.lt, desc, a, b, d, d, pref, 1, &mut res, &mut found,
+                ),
+                "cublasLtMatmulAlgoGetHeuristic",
+            )?;
+            lt::cublasLtMatmulPreferenceDestroy(pref);
+            if found == 0 {
+                return Err(Error::Cuda(
+                    "cublasLtMatmulAlgoGetHeuristic",
+                    format!("no FP8 algorithm for {mode:?} {n}x{k}, {rows} rows"),
+                ));
+            }
+            Ok(LtPlan {
+                desc,
+                a,
+                b,
+                d,
+                algo: res.algo,
+            })
+        }
     }
 
     pub fn begin_capture(&self) -> Result<()> {

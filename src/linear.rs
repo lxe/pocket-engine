@@ -4,7 +4,7 @@
 //! different formats.
 
 use crate::gguf::GgmlType;
-use crate::gpu::{Arg, Buf, Gpu, Kernel};
+use crate::gpu::{Arg, Buf, Fp8Mode, Gpu, Kernel};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -13,11 +13,15 @@ use std::rc::Rc;
 pub enum Kind {
     Bf16,
     Quant(GgmlType),
+    /// E4M3 weights with scales in the given layout (see `Part::scales`).
+    Fp8(Fp8Mode),
 }
 
 pub struct Part {
     pub buf: Rc<Buf>,
     pub kind: Kind,
+    /// FP8 weight scales.
+    pub scales: Option<Rc<Buf>>,
     /// Output features of this part and their first column in the output.
     pub rows: usize,
     pub off: usize,
@@ -27,6 +31,35 @@ pub struct Linear {
     pub parts: Vec<Part>,
     /// Input features.
     pub cols: usize,
+}
+
+/// Rows an FP8 matmul runs: Hopper's block-scaled FP8 needs a multiple of 4.
+/// The extra rows read stale inputs and write rows of the output buffers that
+/// this step does not use; every activation buffer has room for them.
+pub fn fp8_rows(mode: Fp8Mode, rows: usize) -> usize {
+    match mode {
+        Fp8Mode::Block128 => rows.next_multiple_of(4),
+        Fp8Mode::Mx32 => rows,
+    }
+}
+
+/// A layer's input: bf16 rows, and the same rows as FP8 with their scales
+/// when FP8 parts read them (0 otherwise).
+#[derive(Clone, Copy)]
+pub struct Input {
+    pub bf16: u64,
+    pub fp8: u64,
+    pub scales: u64,
+}
+
+impl Input {
+    pub fn bf16(ptr: u64) -> Self {
+        Self {
+            bf16: ptr,
+            fp8: 0,
+            scales: 0,
+        }
+    }
 }
 
 /// Kernels of one quantized format.
@@ -142,7 +175,18 @@ impl Linear {
 
     /// Bytes of weights on the device.
     pub fn bytes(&self) -> usize {
-        self.parts.iter().map(|p| p.buf.bytes).sum()
+        self.parts
+            .iter()
+            .map(|p| p.buf.bytes + p.scales.as_ref().map_or(0, |s| s.bytes))
+            .sum()
+    }
+
+    /// The FP8 layout of this layer's FP8 parts, if any.
+    pub fn fp8(&self) -> Option<Fp8Mode> {
+        self.parts.iter().find_map(|p| match p.kind {
+            Kind::Fp8(m) => Some(m),
+            _ => None,
+        })
     }
 
     /// y[rows, ldy] (columns from 0) = x[rows, cols] . W^T. Issues no host
@@ -152,16 +196,39 @@ impl Linear {
         &self,
         gpu: &Gpu,
         q: &Quants,
-        x: u64,
+        input: Input,
         rows: usize,
         y: u64,
         ldy: usize,
         f32_out: bool,
     ) -> Result<()> {
         use Arg::{I, P};
+        let x = input.bf16;
         let elem = if f32_out { 4 } else { 2 };
         for p in &self.parts {
             match p.kind {
+                Kind::Fp8(mode) => {
+                    if input.fp8 == 0 {
+                        return Err(Error::Config("an FP8 layer got no FP8 input".into()));
+                    }
+                    let s = p
+                        .scales
+                        .as_ref()
+                        .ok_or_else(|| Error::Config("FP8 part without scales".into()))?;
+                    gpu.fp8_matmul(
+                        mode,
+                        p.buf.ptr,
+                        s.ptr,
+                        input.fp8,
+                        input.scales,
+                        y + (p.off * elem) as u64,
+                        p.rows,
+                        self.cols,
+                        fp8_rows(mode, rows),
+                        ldy,
+                        f32_out,
+                    )?;
+                }
                 Kind::Bf16 => gpu.gemm_ld(
                     x,
                     p.buf.ptr,

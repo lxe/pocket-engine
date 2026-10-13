@@ -44,6 +44,10 @@ struct EngineArgs {
     /// Image embeddings that can wait at once for their prompt steps.
     #[arg(long, default_value_t = 16_384)]
     image_pool: usize,
+    /// Quantize bf16 weights to FP8 at load (Hopper and Blackwell). FP8
+    /// checkpoints load as FP8 without it.
+    #[arg(long)]
+    fp8: bool,
 }
 
 impl EngineArgs {
@@ -59,6 +63,7 @@ impl EngineArgs {
             vision: !self.no_vision,
             max_image_pixels: self.max_image_pixels,
             image_pool: self.image_pool,
+            fp8: self.fp8,
             ..EngineConfig::new(self.model.clone())
         }
     }
@@ -95,6 +100,21 @@ enum Cmd {
         #[arg(long)]
         tensor: String,
         #[arg(long, value_delimiter = ',', default_value = "1,4,8,16,32,64,128,512")]
+        rows: Vec<usize>,
+    },
+    /// Quantizes a bf16 weight matrix to FP8 on the GPU (in the layout this
+    /// device's cuBLASLt runs) and times cuBLASLt FP8 against bf16 cuBLAS.
+    BenchFp8 {
+        #[arg(long)]
+        model: PathBuf,
+        /// Text-model tensor, e.g. layers.0.mlp.gate_proj.weight.
+        #[arg(long)]
+        tensor: String,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "1,8,16,32,64,128,512,2048"
+        )]
         rows: Vec<usize>,
     },
     /// Prints the token ids of a chat message, for checking tokenizers.
@@ -221,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 parts: vec![Part {
                     buf: w,
                     kind: Kind::Quant(info.ty),
+                    scales: None,
                     rows: n,
                     off: 0,
                 }],
@@ -230,6 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 parts: vec![Part {
                     buf: wb,
                     kind: Kind::Bf16,
+                    scales: None,
                     rows: n,
                     off: 0,
                 }],
@@ -251,11 +273,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             for &m in &rows {
                 let time = |l: &Linear, y: u64| -> Result<f64, Box<dyn std::error::Error>> {
-                    l.forward(&gpu, &quants, x.ptr, m, y, n, true)?;
+                    l.forward(
+                        &gpu,
+                        &quants,
+                        pocket_engine::linear::Input::bf16(x.ptr),
+                        m,
+                        y,
+                        n,
+                        true,
+                    )?;
                     gpu.sync()?;
                     let t0 = std::time::Instant::now();
                     for _ in 0..20 {
-                        l.forward(&gpu, &quants, x.ptr, m, y, n, true)?;
+                        l.forward(
+                            &gpu,
+                            &quants,
+                            pocket_engine::linear::Input::bf16(x.ptr),
+                            m,
+                            y,
+                            n,
+                            true,
+                        )?;
                     }
                     gpu.sync()?;
                     Ok(t0.elapsed().as_secs_f64() / 20.0)
@@ -274,6 +312,126 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "rows {m:4}: quant {:8.1} us ({:6.0} GB/s of weights)  bf16 cuBLAS {:8.1} us  max rel diff {err:.1e}",
                     tq * 1e6,
                     data.len() as f64 / tq / 1e9,
+                    tb * 1e6
+                );
+            }
+        }
+        Cmd::BenchFp8 {
+            model,
+            tensor,
+            rows,
+        } => {
+            use pocket_engine::gpu::{Arg, Fp8Mode, Gpu};
+            let src = pocket_engine::source::Source::open(&model)?;
+            let dims = src.dims(&tensor).ok_or("no such tensor")?;
+            let (n, k) = (dims[0], dims[1]);
+            let gpu = Gpu::new(0)?;
+            let mode = gpu.fp8_mode().ok_or("this GPU has no FP8 matmul")?;
+            gpu.begin_uploads()?;
+            let wb = src.matrix(&tensor, n, k)?.upload(&gpu)?;
+            gpu.end_uploads()?;
+            let wq = gpu.alloc(n * k)?;
+            let ws = gpu.alloc(mode.weight_scale_bytes(n, k))?;
+            match mode {
+                Fp8Mode::Mx32 => gpu.launch(
+                    gpu.kernel("fp8_weights_mx")?,
+                    (((n * k / 32).div_ceil(256)).min(65_535) as u32, 1, 1),
+                    256,
+                    0,
+                    &[
+                        Arg::P(wb.ptr),
+                        Arg::I(n as i32),
+                        Arg::I(k as i32),
+                        Arg::P(wq.ptr),
+                        Arg::P(ws.ptr),
+                    ],
+                )?,
+                Fp8Mode::Block128 => gpu.launch(
+                    gpu.kernel("fp8_weights_block")?,
+                    (k.div_ceil(128) as u32, n.div_ceil(128) as u32, 1),
+                    256,
+                    0,
+                    &[
+                        Arg::P(wb.ptr),
+                        Arg::I(n as i32),
+                        Arg::I(k as i32),
+                        Arg::P(wq.ptr),
+                        Arg::P(ws.ptr),
+                    ],
+                )?,
+            }
+            let max = *rows.iter().max().unwrap_or(&1);
+            let x: Vec<u8> = (0..max * k)
+                .flat_map(|i| {
+                    half::bf16::from_f32(((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
+                        .to_le_bytes()
+                })
+                .collect();
+            let x = gpu.upload(&x)?;
+            let xq = gpu.alloc(max * k)?;
+            let xs = gpu.alloc(mode.act_scale_bytes(max.next_multiple_of(128), k))?;
+            let (ya, yb) = (gpu.alloc(max * n * 4)?, gpu.alloc(max * n * 4)?);
+            let act = gpu.kernel("fp8_activations")?;
+            let mode_id = match mode {
+                Fp8Mode::Block128 => 1,
+                Fp8Mode::Mx32 => 2,
+            };
+            println!("{tensor}: {n} x {k}, {mode:?}");
+            for &m in &rows {
+                let quantize = || {
+                    gpu.launch(
+                        act,
+                        (((m * k / 8).div_ceil(256)).min(65_535) as u32, 1, 1),
+                        256,
+                        0,
+                        &[
+                            Arg::P(x.ptr),
+                            Arg::I(m as i32),
+                            Arg::I(k as i32),
+                            Arg::P(xq.ptr),
+                            Arg::P(xs.ptr),
+                            Arg::I(mode_id),
+                            Arg::I(m as i32),
+                        ],
+                    )
+                };
+                let fp8 = || -> Result<(), Box<dyn std::error::Error>> {
+                    quantize()?;
+                    gpu.fp8_matmul(
+                        mode, wq.ptr, ws.ptr, xq.ptr, xs.ptr, ya.ptr, n, k, m, n, true,
+                    )?;
+                    Ok(())
+                };
+                let dense = || gpu.gemm(x.ptr, wb.ptr, yb.ptr, m, k, n, true);
+                let time = |f: &dyn Fn() -> Result<(), Box<dyn std::error::Error>>| -> Result<f64, Box<dyn std::error::Error>> {
+                    f()?;
+                    gpu.sync()?;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..20 {
+                        f()?;
+                    }
+                    gpu.sync()?;
+                    Ok(t0.elapsed().as_secs_f64() / 20.0)
+                };
+                let tf = time(&fp8)?;
+                let tb = time(&|| dense().map_err(Into::into))?;
+                let mut ha = gpu.pinned(m * n * 4)?;
+                let mut hb = gpu.pinned(m * n * 4)?;
+                gpu.dtoh(&mut ha, ya.ptr, m * n * 4)?;
+                gpu.dtoh(&mut hb, yb.ptr, m * n * 4)?;
+                gpu.sync()?;
+                let (a, b) = (ha.as_slice::<f32>(), hb.as_slice::<f32>());
+                let norm = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let err = a
+                    .iter()
+                    .zip(b)
+                    .map(|(p, q)| (p - q) * (p - q))
+                    .sum::<f32>()
+                    .sqrt()
+                    / norm.max(1e-9);
+                println!(
+                    "rows {m:4}: fp8 (with activation quantization) {:8.1} us  bf16 cuBLAS {:8.1} us  relative error {err:.2e}",
+                    tf * 1e6,
                     tb * 1e6
                 );
             }

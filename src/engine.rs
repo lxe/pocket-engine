@@ -34,6 +34,8 @@ pub struct EngineConfig {
     pub max_image_pixels: usize,
     /// Image embeddings that can wait at once for their prompt steps.
     pub image_pool: usize,
+    /// Quantize bf16 weights to FP8 at load.
+    pub fp8: bool,
 }
 
 impl EngineConfig {
@@ -50,6 +52,7 @@ impl EngineConfig {
             vision: true,
             max_image_pixels: 4 << 20,
             image_pool: 16_384,
+            fp8: false,
         }
     }
 }
@@ -123,10 +126,19 @@ impl Engine {
         if let Some(path) = &cfg.wait_for {
             wait_for(path);
         }
+        let load = crate::source::Load {
+            fp8: gpu.fp8_mode(),
+            quantize: cfg.fp8,
+        };
+        if cfg.fp8 && load.fp8.is_none() {
+            return Err(Error::Config(
+                "--fp8 needs a GPU with FP8 matmuls (Hopper or Blackwell)".into(),
+            ));
+        }
         let t_wait = started.elapsed().as_secs_f64();
         // One set of staging buffers serves the model and the vision tower.
         gpu.begin_uploads()?;
-        let model = Model::load(&gpu, &cfg.model)?;
+        let model = Model::load(&gpu, &cfg.model, load)?;
         let t_model = started.elapsed().as_secs_f64();
         let mc = model.cfg.clone();
         let vision = if cfg.vision {
@@ -155,11 +167,12 @@ impl Engine {
         }
         let max_blocks = cfg.max_context.div_ceil(BLOCK_SIZE);
         let meta = Meta {
-            max_tokens: cfg.max_batch_tokens.max(cfg.max_seqs),
+            // A multiple of 4, so FP8 matmuls padded to 4 rows stay in bounds.
+            max_tokens: cfg.max_batch_tokens.max(cfg.max_seqs).next_multiple_of(4),
             max_seqs: cfg.max_seqs,
             max_blocks,
         };
-        let act = Act::new(&gpu, &mc, meta, pool_rows)?;
+        let act = Act::new(&gpu, &mc, meta, pool_rows, model.fp8)?;
         // One extra slot absorbs the padding rows of graph replays.
         let slots = cfg.max_seqs + 1;
         let (free, total) = gpu.mem_info()?;

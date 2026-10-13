@@ -328,11 +328,18 @@ impl Gpu {
                 "cuStreamCreate",
             )?;
             let mut module = std::ptr::null_mut();
+            // POCKET_KERNELS names a cubin or fatbin to load in place of the
+            // built-in image, for timing kernel variants without a rebuild.
+            let custom = std::env::var_os("POCKET_KERNELS")
+                .map(std::fs::read)
+                .transpose()
+                .map_err(|e| Error::Config(format!("POCKET_KERNELS: {e}")))?;
+            let bytes = custom.as_deref().unwrap_or(KERNEL_IMAGE);
             let image = {
                 // The driver wants an aligned image.
-                let mut v = vec![0u64; KERNEL_IMAGE.len().div_ceil(8)];
-                std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), KERNEL_IMAGE.len())
-                    .copy_from_slice(KERNEL_IMAGE);
+                let mut v = vec![0u64; bytes.len().div_ceil(8)];
+                std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), bytes.len())
+                    .copy_from_slice(bytes);
                 v
             };
             check(

@@ -32,6 +32,9 @@ default = []
 # Compiles the kernels with nvcc. Without it the crate builds (for CPU CI) but
 # cannot load a model.
 cuda = []
+# Compiles the same kernels with hipcc for AMD Instinct GPUs (ROCm) and runs
+# them through HIP and hipBLAS (src/hip.rs).
+rocm = []
 
 [profile.release]
 debug = "line-tables-only"

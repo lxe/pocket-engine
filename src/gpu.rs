@@ -3,9 +3,14 @@
 //! engine thread that created it.
 #![allow(unsafe_code)]
 
+#[cfg(feature = "rocm")]
+use crate::hip::{cb, cu, lt};
 use crate::{Error, Result};
+#[cfg(not(feature = "rocm"))]
 use cudarc::cublas::sys as cb;
+#[cfg(not(feature = "rocm"))]
 use cudarc::cublaslt::sys as lt;
+#[cfg(not(feature = "rocm"))]
 use cudarc::driver::sys as cu;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -264,7 +269,7 @@ impl Gpu {
     pub fn new(ordinal: i32) -> Result<Self> {
         if KERNEL_IMAGE.is_empty() {
             return Err(Error::Config(
-                "built without the `cuda` feature: no kernels".into(),
+                "built without the `cuda` or `rocm` feature: no kernels".into(),
             ));
         }
         // SAFETY: plain driver calls with out-parameters; handles are owned by Self.

@@ -5,6 +5,8 @@
 pub mod engine;
 pub mod gguf;
 pub mod gpu;
+#[cfg(feature = "rocm")]
+mod hip;
 pub mod image;
 pub mod linear;
 pub mod model;

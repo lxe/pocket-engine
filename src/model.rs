@@ -13,6 +13,10 @@ pub const GDN_DIM: usize = 128;
 pub const HEAD_DIM: usize = 256;
 pub const ROPE_DIM: usize = 64;
 pub const BLOCK_SIZE: usize = 16;
+/// Most top tokens a log-probability request returns (LOGPROBS_TOP in the kernels).
+pub const LOGPROBS_TOP: usize = 20;
+/// f32 per output row of the `logprobs` kernel: the pick's, then (id, logprob) pairs.
+const LOGPROBS_ROW: usize = 1 + 2 * LOGPROBS_TOP;
 /// Tokens drafts pick from (see Mtp::head): on Qwen3.5-9B, 65,536 keep
 /// almost every accepted draft of the full 248,320 at a quarter of the cost.
 const DRAFT_VOCAB: usize = 65_536;
@@ -457,6 +461,7 @@ struct Kernels {
     /// Combines split decode attention's key ranges.
     attn_merge: Kernel,
     penalize: Kernel,
+    logprobs: Kernel,
     sample: Kernel,
 }
 
@@ -491,6 +496,35 @@ impl Model {
             gpu.end_uploads()?;
         }
         m
+    }
+
+    /// Queues log-probabilities for the step's output rows in `rows` (row,
+    /// top count) and their download; read them with `Act::logprobs` after
+    /// the step's sync.
+    pub fn logprobs(&self, gpu: &Gpu, a: &mut Act, rows: &[(usize, usize)]) -> Result<()> {
+        use Arg::{I, P};
+        let n = rows.len();
+        let req = a.lp_req_host.as_mut_slice::<i32>();
+        for (i, &(r, k)) in rows.iter().enumerate() {
+            req[i] = r as i32;
+            req[n + i] = k.min(LOGPROBS_TOP) as i32;
+        }
+        gpu.htod(a.lp_req.ptr, &a.lp_req_host, 0, 2 * n * 4)?;
+        gpu.launch(
+            self.k.logprobs,
+            (n as u32, 1, 1),
+            1024,
+            0,
+            &[
+                P(a.logits.ptr),
+                I(self.cfg.vocab as i32),
+                P(a.lp_req.ptr),
+                P(a.lp_req.ptr + 4 * n as u64),
+                P(a.ids_out.ptr),
+                P(a.lp_out.ptr),
+            ],
+        )?;
+        gpu.dtoh(&mut a.lp_out_host, a.lp_out.ptr, n * LOGPROBS_ROW * 4)
     }
 
     /// The linear layers adapters may target, in the order `attach_lora` takes.
@@ -873,6 +907,7 @@ impl Model {
             fp8_rows: gpu.kernel("fp8_activations")?,
             attn_merge: gpu.kernel("attn_merge")?,
             penalize: gpu.kernel("penalize")?,
+            logprobs: gpu.kernel("logprobs")?,
             sample: gpu.kernel("sample")?,
         };
         let largest = layers
@@ -1138,8 +1173,12 @@ impl Meta {
     pub fn max_lora_tiles(&self) -> usize {
         self.max_tokens / crate::lora::TILE + self.max_seqs
     }
-    pub fn words(&self) -> usize {
+    /// Per output row, the index of its grammar mask in the step's masks, or -1.
+    pub fn masks(&self) -> usize {
         self.lora() + 1 + 3 * self.max_lora_tiles()
+    }
+    pub fn words(&self) -> usize {
+        self.masks() + self.max_outs()
     }
 }
 
@@ -1172,6 +1211,17 @@ pub struct Act {
     pen_dev: Buf,
     pub pen_staging: Pinned,
     pub pen_capacity: usize,
+    /// Grammar masks of the step's constrained rows: a bit per vocabulary
+    /// entry, `mask_words` u32 per row, up to one row per sequence.
+    mask_dev: Buf,
+    pub mask_staging: Pinned,
+    pub mask_words: usize,
+    /// Log-probability requests: output rows then top counts (i32), and
+    /// the kernel's results (see the `logprobs` kernel).
+    lp_req: Buf,
+    pub lp_req_host: Pinned,
+    lp_out: Buf,
+    pub lp_out_host: Pinned,
     /// FP8 copies of the projections' inputs, when the model has FP8 layers.
     fp8: Option<Fp8Acts>,
     /// The draft layer's buffers, with multi-token prediction.
@@ -1293,6 +1343,13 @@ impl Act {
             pen_dev: gpu.alloc_zeroed(3 * pen_capacity * 4)?,
             pen_staging: gpu.pinned(3 * pen_capacity * 4)?,
             pen_capacity,
+            mask_dev: gpu.alloc_zeroed(meta.max_seqs * cfg.vocab.div_ceil(32) * 4)?,
+            mask_staging: gpu.pinned(meta.max_seqs * cfg.vocab.div_ceil(32) * 4)?,
+            mask_words: cfg.vocab.div_ceil(32),
+            lp_req: gpu.alloc_zeroed(2 * outs * 4)?,
+            lp_req_host: gpu.pinned(2 * outs * 4)?,
+            lp_out: gpu.alloc_zeroed(outs * LOGPROBS_ROW * 4)?,
+            lp_out_host: gpu.pinned(outs * LOGPROBS_ROW * 4)?,
             fp8,
             gdn: {
                 let rows = t * cfg.lin_v_heads;
@@ -1392,6 +1449,38 @@ impl Act {
     }
 
     /// Copies the first `n` staged penalty entries to the device.
+    /// The results of `Model::logprobs` for its `rows`, by output row.
+    pub fn logprobs(
+        &self,
+        rows: &[(usize, usize)],
+        outs: usize,
+    ) -> Vec<Option<crate::sched::TokenLogprobs>> {
+        let mut v = vec![None; outs];
+        let o = self.lp_out_host.as_slice::<f32>();
+        for (i, &(r, k)) in rows.iter().enumerate() {
+            let e = &o[i * LOGPROBS_ROW..(i + 1) * LOGPROBS_ROW];
+            let top = (0..k.min(LOGPROBS_TOP))
+                .map(|j| (e[1 + 2 * j].to_bits(), e[2 + 2 * j]))
+                .filter(|&(id, _)| id as i32 >= 0)
+                .collect();
+            v[r] = Some(crate::sched::TokenLogprobs { logprob: e[0], top });
+        }
+        v
+    }
+
+    /// Uploads the step's first `n` grammar masks.
+    pub fn upload_masks(&self, gpu: &Gpu, n: usize) -> Result<()> {
+        if n > 0 {
+            gpu.htod(
+                self.mask_dev.ptr,
+                &self.mask_staging,
+                0,
+                n * self.mask_words * 4,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn upload_pen(&self, gpu: &Gpu, n: usize) -> Result<()> {
         let cap = 4 * self.pen_capacity;
         for region in 0..3 {
@@ -1550,6 +1639,9 @@ impl Model {
                 P(a.pen_dev.ptr),
                 P(a.pen_dev.ptr + cap),
                 P(a.pen_dev.ptr + 2 * cap),
+                P(a.m(me.masks())),
+                P(a.mask_dev.ptr),
+                I(a.mask_words as i32),
             ],
         )?;
         gpu.launch(

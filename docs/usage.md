@@ -60,6 +60,13 @@ Adapters are PEFT directories (`adapter_config.json` and `adapter_model.safetens
 
 Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`) plus vLLM's `top_k`, `min_p` and `repetition_penalty`. The default temperature is 1.0. Prompts that share a beginning reuse its cache.
 
+### Structured output and log-probabilities
+
+- `response_format`: `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}` for output that follows a JSON Schema. vLLM's `guided_json`, `guided_regex`, `guided_choice` and `guided_grammar` (Lark) work too. Grammars run on [llguidance](https://github.com/guidance-ai/llguidance).
+- `logprobs: true` returns each token's log-probability in OpenAI's `choices[].logprobs.content`, with up to 20 alternatives by `top_logprobs`. They come from the logits sampling saw: after penalties, `logit_bias` and the grammar, before temperature (vLLM's `processed_logprobs`).
+
+Neither turns on speculative decoding for the request. On an RTX 5090 with 9B Q4_K_M, JSON output costs 4 to 12% of throughput and log-probabilities 2 to 4%.
+
 ## Options
 
 | Option | Default | |

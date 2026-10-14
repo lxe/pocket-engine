@@ -1918,10 +1918,20 @@ __device__ __forceinline__ uint32_t mix32(uint32_t x) {
 // Adjusts logits before sampling: for each (token, add, rep) entry of a row,
 // logit = (logit > 0 ? logit / rep : logit * rep) + add. Entries of a row name
 // distinct tokens. pen_cu[r]..pen_cu[r + 1] are row r's entries.
+// Also applies grammar masks: a row with mask_idx >= 0 keeps only the
+// tokens whose bit is set in mask number mask_idx.
 extern "C" __global__ void penalize(float* __restrict__ logits, int V, const int* __restrict__ pen_cu,
                                     const int* __restrict__ pen_tok, const float* __restrict__ pen_add,
-                                    const float* __restrict__ pen_rep) {
+                                    const float* __restrict__ pen_rep, const int* __restrict__ mask_idx,
+                                    const uint32_t* __restrict__ masks, int words) {
     float* row = logits + (size_t)blockIdx.x * V;
+    const int mi = mask_idx[blockIdx.x];
+    if (mi >= 0) {
+        const uint32_t* bits = masks + (size_t)mi * words;
+        for (int i = threadIdx.x; i < V; i += blockDim.x)
+            if (!((bits[i >> 5] >> (i & 31)) & 1u)) row[i] = -INFINITY;
+        __syncthreads();
+    }
     for (int e = pen_cu[blockIdx.x] + threadIdx.x; e < pen_cu[blockIdx.x + 1]; e += blockDim.x) {
         const int t = pen_tok[e];
         float l = row[t];
@@ -2076,6 +2086,79 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS)
             }
         }
         if (l == 0) out[blockIdx.x] = bi;
+    }
+}
+
+// Log-probabilities for the output rows that ask for them, from the logits
+// as sampling saw them (after penalties, biases and grammar masks, before
+// temperature): for entry i, output row rows[i], the picked token's
+// log-probability and the ks[i] (at most LOGPROBS_TOP) most likely tokens,
+// written to out + i * (1 + 2 * LOGPROBS_TOP) as [picked, (id bits, logprob) ...].
+#define LOGPROBS_TOP 20
+#define LOGPROBS_CAND 64
+extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS)
+    logprobs(const float* __restrict__ logits, int V, const int* __restrict__ rows, const int* __restrict__ ks,
+             const int* __restrict__ picked, float* __restrict__ out) {
+    __shared__ float sv[32];
+    __shared__ float hist[SAMPLE_WARPS * 256];
+    __shared__ float bins[256];
+    __shared__ uint32_t shared[2];
+    __shared__ float cv[LOGPROBS_CAND];
+    __shared__ int ci[LOGPROBS_CAND];
+    __shared__ int nc;
+    const int r = rows[blockIdx.x], k = min(ks[blockIdx.x], LOGPROBS_TOP);
+    const float* row = logits + (size_t)r * V;
+    float* o = out + (size_t)blockIdx.x * (1 + 2 * LOGPROBS_TOP);
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < V; i += SAMPLE_THREADS) m = fmaxf(m, row[i]);
+    m = block_max(m, sv);
+    float s = 0.f;
+    for (int i = threadIdx.x; i < V; i += SAMPLE_THREADS) s += expf(row[i] - m);
+    // Block sum, as block_max does it.
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) s += __shfl_xor_sync(0xffffffffu, s, d);
+    if ((threadIdx.x & 31) == 0) sv[threadIdx.x >> 5] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int w = 0; w < SAMPLE_WARPS; w++) t += sv[w];
+        sv[0] = t;
+        nc = 0;
+    }
+    __syncthreads();
+    const float lse = m + logf(sv[0]);
+    if (threadIdx.x == 0) o[0] = row[picked[r]] - lse;
+    if (k == 0) return;
+    // The k-th largest key, then every element at or above it (ties may add a few).
+    const uint32_t floor = radix_select(row, V, 1.f, m, 0, (float)k, false, hist, bins, shared);
+    for (int i = threadIdx.x; i < V; i += SAMPLE_THREADS)
+        if (fkey(row[i]) >= floor) {
+            const int at = atomicAdd(&nc, 1);
+            if (at < LOGPROBS_CAND) {
+                cv[at] = row[i];
+                ci[at] = i;
+            }
+        }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int n = min(nc, LOGPROBS_CAND);
+        // Largest first, ties by lower id.
+        for (int a = 1; a < n; a++) {
+            const float v = cv[a];
+            const int id = ci[a];
+            int b = a - 1;
+            while (b >= 0 && (cv[b] < v || (cv[b] == v && ci[b] > id))) {
+                cv[b + 1] = cv[b];
+                ci[b + 1] = ci[b];
+                b--;
+            }
+            cv[b + 1] = v;
+            ci[b + 1] = id;
+        }
+        for (int j = 0; j < k; j++) {
+            o[1 + 2 * j] = __int_as_float(j < n ? ci[j] : -1);
+            o[2 + 2 * j] = j < n ? cv[j] - lse : -INFINITY;
+        }
     }
 }
 

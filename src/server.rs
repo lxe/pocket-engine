@@ -1,7 +1,7 @@
 //! OpenAI-compatible chat completions over the engine thread.
 
 use crate::engine::{Adapters, Health, Info, Msg};
-use crate::sched::{Event, Finish, Request, Sampling};
+use crate::sched::{Event, Finish, Request, Sampling, TokenLogprobs};
 use crate::{Error, Result};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -35,6 +35,11 @@ const QWEN_TOKENIZER_PARTS: &str = r#"{
 }"#;
 
 impl ChatTokenizer {
+    /// The tokenizer as tokenizer.json.
+    pub fn json(&self) -> String {
+        self.tok.to_string(false).unwrap_or_default()
+    }
+
     /// From a model directory (tokenizer.json, chat_template.jinja) or a GGUF
     /// file, whose metadata carries the vocabulary, merges and chat template.
     pub fn load(path: &Path) -> Result<Self> {
@@ -254,6 +259,8 @@ struct App {
     model: String,
     /// Adapter names routable through `model`, when adapters are on.
     adapters: Option<Adapters>,
+    /// Compiles structured-output grammars against the tokenizer.
+    grammars: Arc<llguidance::ParserFactory>,
     info: Info,
     health: Arc<Mutex<Health>>,
     next: AtomicU64,
@@ -294,9 +301,86 @@ struct ChatRequest {
     stream: bool,
     #[serde(default)]
     stream_options: Option<Value>,
+    #[serde(default)]
+    logprobs: bool,
+    #[serde(default)]
+    top_logprobs: Option<usize>,
+    /// OpenAI's structured output: {"type": "json_object"} or {"type":
+    /// "json_schema", "json_schema": {"schema": ...}}.
+    #[serde(default)]
+    response_format: Option<Value>,
+    /// vLLM's guided decoding.
+    #[serde(default)]
+    guided_json: Option<Value>,
+    #[serde(default)]
+    guided_regex: Option<String>,
+    #[serde(default)]
+    guided_choice: Option<Vec<String>>,
+    #[serde(default)]
+    guided_grammar: Option<String>,
 }
 
 impl ChatRequest {
+    /// The grammar the output must follow, if the request sets one.
+    fn grammar(&self) -> std::result::Result<Option<llguidance::api::TopLevelGrammar>, String> {
+        use llguidance::api::TopLevelGrammar as G;
+        let schema = |v: &Value| -> std::result::Result<Value, String> {
+            match v {
+                Value::String(s) => {
+                    serde_json::from_str(s).map_err(|e| format!("guided_json: {e}"))
+                }
+                v => Ok(v.clone()),
+            }
+        };
+        let mut found = Vec::new();
+        if let Some(f) = &self.response_format {
+            match f["type"].as_str() {
+                Some("text") | None => {}
+                Some("json_object") => found.push(G::from_json_schema(json!({ "type": "object" }))),
+                Some("json_schema") => {
+                    let s = f["json_schema"]
+                        .get("schema")
+                        .ok_or("response_format json_schema needs json_schema.schema")?;
+                    found.push(G::from_json_schema(s.clone()));
+                }
+                Some(t) => return Err(format!("unsupported response_format type {t}")),
+            }
+        }
+        if let Some(v) = &self.guided_json {
+            found.push(G::from_json_schema(schema(v)?));
+        }
+        if let Some(r) = &self.guided_regex {
+            found.push(G::from_regex(r));
+        }
+        if let Some(c) = &self.guided_choice {
+            if c.is_empty() {
+                return Err("guided_choice needs at least one choice".into());
+            }
+            let alts: Vec<String> = c.iter().map(|x| regex_escape(x)).collect();
+            found.push(G::from_regex(&format!("({})", alts.join("|"))));
+        }
+        if let Some(g) = &self.guided_grammar {
+            found.push(G::from_lark(g.clone()));
+        }
+        if found.len() > 1 {
+            return Err("set one of response_format, guided_json, guided_regex, guided_choice, guided_grammar".into());
+        }
+        Ok(found.pop())
+    }
+
+    /// The top-token count for log-probabilities, if asked for.
+    fn logprobs(&self) -> std::result::Result<Option<usize>, String> {
+        match (self.logprobs, self.top_logprobs) {
+            (false, Some(n)) if n > 0 => Err("top_logprobs needs logprobs: true".into()),
+            (false, _) => Ok(None),
+            (true, Some(n)) if n > crate::model::LOGPROBS_TOP => Err(format!(
+                "top_logprobs takes at most {}",
+                crate::model::LOGPROBS_TOP
+            )),
+            (true, n) => Ok(Some(n.unwrap_or(0))),
+        }
+    }
+
     /// Validates the sampling fields the way OpenAI and vLLM accept them.
     fn sampling(&self, vocab: usize, default_seed: u64) -> std::result::Result<Sampling, String> {
         let d = Sampling::default();
@@ -447,6 +531,24 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         Ok(s) => s,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
+    let logprobs = match req.logprobs() {
+        Ok(l) => l,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    let constraint = match req.grammar() {
+        Ok(None) => None,
+        Ok(Some(g)) => {
+            let m = llguidance::Matcher::new(app.grammars.create_parser(g));
+            if let Some(e) = m.get_error() {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid structured output: {e}"),
+                );
+            }
+            Some(Box::new(m))
+        }
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
     let (ids, urls) = match app.tok.chat(&req.messages) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
@@ -502,6 +604,8 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         images,
         rope,
         adapter,
+        logprobs,
+        constraint,
     };
     if app
         .engine
@@ -530,6 +634,8 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
 struct Output {
     /// The model name to answer with: the base's or the adapter's.
     model: String,
+    /// Log-probabilities of the next token, as they arrive before it.
+    pending: Option<TokenLogprobs>,
     detok: Detok,
     text: String,
     sent: usize,
@@ -542,6 +648,7 @@ impl Output {
     fn new(model: String, stops: Vec<String>, prompt_tokens: usize) -> Self {
         Self {
             model,
+            pending: None,
             prompt_tokens,
             detok: Detok {
                 ids: Vec::new(),
@@ -611,6 +718,32 @@ impl Output {
     }
 }
 
+/// A literal as a regular expression.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.+*?()|[]{}^$#&-~/\"".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One token of OpenAI's `logprobs.content`: its text, raw bytes,
+/// log-probability and the most likely alternatives.
+fn logprob_entry(app: &App, tok: u32, lp: &TokenLogprobs) -> Value {
+    let trie = app.grammars.tok_env().tok_trie();
+    let one = |id: u32, logprob: f32| {
+        let bytes = trie.token(id).to_vec();
+        json!({ "token": String::from_utf8_lossy(&bytes), "bytes": bytes,
+            "logprob": if logprob.is_finite() { logprob } else { -9999.0 } })
+    };
+    let mut e = one(tok, lp.logprob);
+    e["top_logprobs"] = Value::Array(lp.top.iter().map(|&(id, l)| one(id, l)).collect());
+    e
+}
+
 async fn whole_response(
     app: Arc<App>,
     mut rx: UnboundedReceiver<Event>,
@@ -618,9 +751,14 @@ async fn whole_response(
     id: String,
 ) -> Response {
     let mut content = String::new();
+    let mut lp_content: Vec<Value> = Vec::new();
     let (finish, prompt_tokens, completion_tokens) = loop {
         match rx.recv().await {
+            Some(Event::Logprobs(lp)) => out.pending = Some(lp),
             Some(Event::Token(t)) => {
+                if let Some(lp) = out.pending.take() {
+                    lp_content.push(logprob_entry(&app, t, &lp));
+                }
                 let (text, stopped) = out.push(&app.tok, t);
                 content.push_str(&text);
                 if stopped {
@@ -650,7 +788,8 @@ async fn whole_response(
     Json(json!({
         "id": id, "object": "chat.completion", "created": now(), "model": out.model,
         "choices": [{ "index": 0, "finish_reason": finish,
-            "message": { "role": "assistant", "content": content } }],
+            "message": { "role": "assistant", "content": content },
+            "logprobs": if lp_content.is_empty() { Value::Null } else { json!({ "content": lp_content }) } }],
         "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens }
     }))
@@ -667,12 +806,15 @@ fn stream_response(
     impl futures_util::Stream<Item = std::result::Result<Sse, std::convert::Infallible>>,
 > {
     let created = now();
-    let chunk = move |model: &str, id: &str, delta: Value, finish: Option<&str>| {
+    let chunk_lp = move |model: &str, id: &str, delta: Value, finish: Option<&str>, lp: Value| {
         Sse::default().data(
             json!({ "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }] })
+                "choices": [{ "index": 0, "delta": delta, "logprobs": lp, "finish_reason": finish }] })
             .to_string(),
         )
+    };
+    let chunk = move |model: &str, id: &str, delta: Value, finish: Option<&str>| {
+        chunk_lp(model, id, delta, finish, Value::Null)
     };
     let closing = move |model: &str, id: &str, finish: &str, prompt: usize, completion: usize| {
         let mut events = vec![chunk(model, id, json!({}), Some(finish))];
@@ -711,9 +853,24 @@ fn stream_response(
                     Phase::Run
                 }
                 Phase::Run => match rx.as_mut()?.recv().await {
+                    Some(Event::Logprobs(lp)) => {
+                        out.pending = Some(lp);
+                        Phase::Run
+                    }
                     Some(Event::Token(t)) => {
+                        let lp = out.pending.take().map(|lp| logprob_entry(&app, t, &lp));
                         let (text, stopped) = out.push(&app.tok, t);
-                        if !text.is_empty() {
+                        if let Some(lp) = lp {
+                            // Every token with log-probabilities gets a chunk, its
+                            // text held back if it may start a stop string.
+                            events.push(chunk_lp(
+                                &out.model,
+                                &id,
+                                json!({ "content": text }),
+                                None,
+                                json!({ "content": [lp] }),
+                            ));
+                        } else if !text.is_empty() {
                             events.push(chunk(&out.model, &id, json!({ "content": text }), None));
                         }
                         if stopped {
@@ -865,6 +1022,20 @@ async fn health_report(State(app): State<Arc<App>>) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// The structured-output compiler for this tokenizer.
+fn grammars(tok: &ChatTokenizer, info: &Info) -> Result<llguidance::ParserFactory> {
+    fn e(e: impl std::fmt::Display) -> Error {
+        Error::Config(format!("structured output setup: {e}"))
+    }
+    let mut bt =
+        toktrie_hf_tokenizers::ByteTokenizer::from_json_bytes(tok.json().as_bytes()).map_err(e)?;
+    bt.set_eos_tokens(&info.cfg.eos);
+    let env = bt.into_tok_env(Some(info.cfg.vocab)).map_err(e)?;
+    let mut f = llguidance::ParserFactory::new_simple(&env).map_err(e)?;
+    f.quiet();
+    Ok(f)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     tok: ChatTokenizer,
@@ -880,10 +1051,12 @@ pub async fn serve(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Config(e.to_string()))?;
+    let grammars = Arc::new(grammars(&tok, &info)?);
     let app = Arc::new(App {
         tok,
         spec,
         http,
+        grammars,
         engine: Mutex::new(engine),
         model,
         adapters,

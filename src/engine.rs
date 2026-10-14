@@ -503,11 +503,14 @@ impl Engine {
         }
         let tiles = step.lora_tiles;
         let (t, s, r) = (step.tokens, step.seqs(), step.outs);
-        let pens = self.sched.fill(
+        let (pens, masks) = self.sched.fill(
             &step,
             self.act.staging.as_mut_slice(),
             &mut Pen::split(self.act.pen_staging.as_mut_slice()),
+            self.act.mask_staging.as_mut_slice(),
         );
+        self.act.upload_masks(&self.gpu, masks)?;
+        let lp_rows = self.sched.logprob_rows(&step);
         let spec = self.act.meta.spec;
         let (graphs, n) = match (step.verify_only(spec), tiles > 0) {
             (true, false) => (&self.verify_graphs, spec),
@@ -543,6 +546,9 @@ impl Engine {
                     .forward(&self.gpu, &self.state, &self.act, t, s, r, lora)?;
             }
         }
+        if !lp_rows.is_empty() {
+            self.model.logprobs(&self.gpu, &mut self.act, &lp_rows)?;
+        }
         self.act.download_ids(&self.gpu, r, s)?;
         self.gpu.sync()?;
         self.stats.step_seconds += t0.elapsed().as_secs_f64();
@@ -561,8 +567,9 @@ impl Engine {
                 },
             );
         }
+        let mut lps = self.act.logprobs(&lp_rows, r);
         let drafts = self.act.drafts(s);
-        Ok(self.sched.finish(step, &picked, drafts, scored))
+        Ok(self.sched.finish(step, &picked, drafts, scored, &mut lps))
     }
 
     /// Runs the vision encoder for newly admitted requests, in batches the

@@ -46,7 +46,7 @@ fn fixture<T: serde::de::DeserializeOwned>(name: &str) -> T {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 struct Pair {
     prompt: Vec<u32>,
     forced: Vec<u32>,
@@ -1108,4 +1108,107 @@ fn serves_adapters() {
         assert_eq!(chat("syn").await.unwrap().status(), 404);
     });
     let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// Log-probabilities streamed with generated tokens match teacher-forced
+/// scoring of the same tokens.
+#[test]
+fn logprobs_match_scoring() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let pairs: Vec<Pair> = fixture(&format!("{}.pairs.json", size(&dir)));
+    let mut e = Engine::new(EngineConfig {
+        prefix_cache: Some(0),
+        ..config(dir)
+    })
+    .unwrap();
+    let prompt = pairs[0].prompt.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut req = Request::text(prompt.clone(), 12, Sampling::default(), tx);
+    req.logprobs = Some(5);
+    e.sched.submit(req);
+    while !e.sched.idle() {
+        e.step().unwrap();
+    }
+    let (mut toks, mut lps) = (Vec::new(), Vec::new());
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            Event::Logprobs(lp) => lps.push(lp),
+            Event::Token(t) => toks.push(t),
+            _ => {}
+        }
+    }
+    assert_eq!(toks.len(), lps.len());
+    let scored = e
+        .score(scorings(
+            &[Pair {
+                prompt,
+                forced: toks.clone(),
+            }],
+            &[0],
+        ))
+        .unwrap();
+    for ((t, lp), sc) in toks.iter().zip(&lps).zip(&scored[0]) {
+        // Greedy: the pick is the most likely token.
+        assert_eq!(lp.top[0].0, *t);
+        assert!((lp.logprob - lp.top[0].1).abs() < 1e-6);
+        assert_eq!(lp.top.len(), 5);
+        assert!(lp.top.windows(2).all(|w| w[0].1 >= w[1].1));
+        // Scoring runs the same continuation in one prompt step.
+        let want = sc.top.iter().find(|x| x.0 == *t).map(|x| x.1).unwrap();
+        assert!((lp.logprob - want).abs() < 0.05, "{} vs {want}", lp.logprob);
+    }
+}
+
+/// OpenAI's structured output and log-probabilities over HTTP.
+#[test]
+fn serves_structured_output() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let (tx, info, health, _) = engine::spawn(config(dir.clone())).unwrap();
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let bind = "127.0.0.1:18199";
+        tokio::spawn(server::serve(tok, None, tx, info, health, None, "m".into(), bind));
+        let client = reqwest::Client::new();
+        let url = format!("http://{bind}");
+        for _ in 0..100 {
+            if client.get(format!("{url}/health")).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let chat = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({ "max_tokens": 160, "temperature": 0.7, "seed": 1,
+                "messages": [{ "role": "user", "content": "Extract the receipt: Joe's Diner, burger and fries, total $14.50." }] });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            client.post(format!("{url}/v1/chat/completions")).json(&body).send()
+        };
+        let schema = serde_json::json!({ "type": "object", "required": ["merchant", "total"],
+            "properties": { "merchant": { "type": "string" }, "total": { "type": "number" } },
+            "additionalProperties": false });
+        let r: serde_json::Value = chat(serde_json::json!({ "response_format":
+            { "type": "json_schema", "json_schema": { "name": "receipt", "schema": schema } } }))
+            .await.unwrap().json().await.unwrap();
+        let out: serde_json::Value = serde_json::from_str(r["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+        assert!(out["merchant"].is_string() && out["total"].is_number(), "{out}");
+        assert_eq!(out.as_object().unwrap().len(), 2);
+        let r: serde_json::Value = chat(serde_json::json!({ "guided_choice": ["cash", "card"] }))
+            .await.unwrap().json().await.unwrap();
+        let c = r["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(c == "cash" || c == "card", "{c}");
+        let r: serde_json::Value = chat(serde_json::json!({ "max_tokens": 4, "logprobs": true, "top_logprobs": 2 }))
+            .await.unwrap().json().await.unwrap();
+        let lp = r["choices"][0]["logprobs"]["content"].as_array().unwrap();
+        assert_eq!(lp.len(), 4);
+        assert_eq!(lp[0]["top_logprobs"].as_array().unwrap().len(), 2);
+        let text: String = lp.iter().map(|e| e["token"].as_str().unwrap()).collect();
+        assert_eq!(text, r["choices"][0]["message"]["content"].as_str().unwrap());
+        let bad = chat(serde_json::json!({ "response_format": { "type": "json_schema", "json_schema": { "schema": { "type": 3 } } } }))
+            .await.unwrap();
+        assert_eq!(bad.status(), 400);
+    });
 }

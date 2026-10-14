@@ -28,7 +28,20 @@ Qwen3.8-27B (too large for an RTX 5090 in bf16):
 | B200 | pocket-engine | **3.3–8.7** | **18.7** | 7.94 | **93** | 1,698 | **197** |
 | | vLLM | 68–174 | 26.9 | **3.54** | 92 | **1,803** | 178 |
 
-On a B200 the engine has no Blackwell-specific prompt kernels yet, so long prompts lag vLLM there.
+The B200 rows predate its own prompt attention and decode kernels: see [B200 kernels](#b200-kernels).
+
+## B200 kernels
+
+On a B200, prompt attention now runs on tcgen05 tensor cores with tensor memory, as FlashAttention 4 does. The heads that share keys and values form one cluster that loads each tile once. The linear-attention decode keeps the next heads' states loading while one computes. Measured on two pods of the same kind ([receipt](receipts/b200-kernels.json)):
+
+| | Before | Now | vLLM, same pod |
+|---|---:|---:|---:|
+| Qwen3.5-9B, first token for a 64k-token prompt | 2.50 s | 1.48 s | 1.32–1.38 s |
+| Prompt attention at 64k tokens (`bench-attn`) | 251 TFLOPS | 1,000 TFLOPS | |
+| Linear-attention decode, 64 sequences of 27B (`bench-gdn`) | 115 µs | 78 µs | |
+| Qwen3.8-27B, 64 requests in flight | 1,583 tok/s | 1,672 tok/s | 1,236 tok/s |
+
+These pods capped each container at 20 CPUs on a busy host. That slows vLLM's scheduler: its one-stream rates there were 20–30% under its own in the table above, so its last number here understates it. Against that table's 1,803 tok/s, 27B at 64 in flight is close but not yet matched.
 
 ## First token by prompt length, H100
 
@@ -73,10 +86,12 @@ bf16:
 | 9b | vLLM + prefix cache | 72 s | 134 | 750 | 1,252 | 2,155 | 3,238 | 2,455 | 0.126 s |
 | 9b | llama.cpp | 4 s | 124 | 217 | 172 | 174 | 390 | 274 | 0.232 s |
 | 9b | llama.cpp, default cache | 4 s | 94 | 149 | 135 | 120 | 197 | 158 | 1.358 s |
-| 27b | pocket-engine | 5 s | 48 | 270 | 478 | 689 | 924 | 736 | 0.165 s |
+| 27b | pocket-engine | 5 s | 50 | 301 | 552 | 824 | 1,069 | 797 | 0.117 s |
 | 27b | vLLM | 101 s | 45 | 275 | 513 | 778 | 1,092 | 814 | 0.194 s |
 | 27b | vLLM + prefix cache | 102 s | 45 | 268 | 492 | 771 | 1,046 | 767 | 0.228 s |
 | 27b | llama.cpp | 10 s | 45 | 72 | 62 | 72 | 158 | 116 | 0.643 s |
+
+pocket-engine's 27B rows in this table and the next were measured again after the linear-attention changes of October 13 ([receipt](receipts/h100-27b.json)).
 
 FP8 (pocket-engine `--fp8`, vLLM `--quantization fp8`; the Qwen3.8-27B-FP8 checkpoint for 27B):
 
@@ -94,7 +109,7 @@ FP8 (pocket-engine `--fp8`, vLLM `--quantization fp8`; the Qwen3.8-27B-FP8 check
 | 9b | pocket-engine | 3 s | 192 | 1,072 | 1,738 | 2,549 | 3,523 | 2,994 | 0.069 s |
 | 9b | vLLM | 93 s | 178 | 943 | 1,509 | 2,642 | 3,460 | 2,921 | 0.128 s |
 | 9b | vLLM + prefix cache | 96 s | 185 | 972 | 1,548 | 2,460 | 3,499 | 2,997 | 0.124 s |
-| 27b | pocket-engine | 4 s | 70 | 355 | 579 | 866 | 1,150 | 964 | 0.168 s |
+| 27b | pocket-engine | 4 s | 71 | 425 | 736 | 1,082 | 1,380 | 1,096 | 0.096 s |
 | 27b | vLLM | 117 s | 64 | 352 | 611 | 925 | 1,299 | 1,093 | 0.249 s |
 | 27b | vLLM + prefix cache | 170 s | 64 | 351 | 628 | 921 | 1,306 | 1,049 | 0.192 s |
 
@@ -175,17 +190,45 @@ Qwen3.5-9B, bf16, one request at a time (`scripts/workloads.py long`):
 
 ## Quantized weights, RTX 5090
 
-Qwen3.5-9B Q4_K_M, output tokens per second by requests in flight:
+GGUF batches multiply on int8 tensor cores, with activations quantized to int8 per 32 values as llama.cpp does them; `--no-int8` dequantizes the weights to bf16 instead. Output tokens per second by requests in flight ([receipt](receipts/rtx5090-features.json)):
 
 | | 1 | 8 | 16 | 32 | 64 |
 |---|---:|---:|---:|---:|---:|
-| GGUF blocks as stored | 166 | 573 | 863 | 1,232 | 1,566 |
-| Q4_K and Q6_K in the tiled layout (default) | 170 | 782 | 1,087 | 1,444 | 1,666 |
+| Qwen3.5-9B Q4_K_M | 177 | 1,022 | 1,807 | 2,074 | 2,372 |
+| Qwen3.5-9B Q4_K_M, `--no-int8` | 176 | 933 | 1,511 | 1,599 | 1,780 |
+| Qwen3.8-27B UD-Q4_K_XL | 56 | 266 | 431 | 484 | 542 |
+| Qwen3.8-27B UD-Q4_K_XL, `--no-int8` | 54 | 234 | 333 | 390 | 378 |
+| Qwen3.8-27B NVFP4 checkpoint (as MXFP4) | 56 | 304 | 455 | 571 | 551 |
 
-Qwen3.8-27B, 4-bit, by requests in flight:
+## Adapters, RTX 5090
+
+Qwen3.5-9B Q4_K_M with four copies of a rank-16 adapter on every linear layer ([Bespoke-Nimble-9B](https://huggingface.co/bespokelabs/Bespoke-Nimble-9B)), by requests in flight ([receipt](receipts/rtx5090-features.json)):
+
+| Requests name | 1 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|
+| the base model | 181 | 1,054 | 1,847 | 2,113 | 2,391 |
+| one adapter | 161 | 872 | 1,471 | 1,550 | 1,779 |
+| four adapters, in turn | 163 | 859 | 1,498 | 1,563 | 1,761 |
+
+Requests for the base model cost nothing extra with adapters loaded. Adapters cost 11% at one request and 26% at 64 (issue [#11](https://github.com/lxe/pocket-engine/issues/11)).
+
+## Structured output and log-probabilities, RTX 5090
+
+Qwen3.5-9B Q4_K_M, by requests in flight ([receipt](receipts/rtx5090-features.json)):
 
 | | 1 | 8 | 16 | 32 | 64 |
 |---|---:|---:|---:|---:|---:|
-| NVFP4 checkpoint (as MXFP4) | 56 | 304 | 455 | 571 | 551 |
-| Q4_K_M (GGUF) | 52 | 182 | 250 | 321 | 335 |
+| plain | 177 | 1,022 | 1,807 | 2,074 | 2,372 |
+| `"response_format": {"type": "json_object"}` | 173 | 924 | 1,670 | 1,863 | 2,196 |
+| `"logprobs": true, "top_logprobs": 5` | 176 | 1,014 | 1,804 | 2,033 | 2,347 |
 
+## Prompt lookup, RTX 5090
+
+`--ngram` drafts tokens by finding the last few generated tokens earlier in the prompt. It pays when answers copy from their prompts (editing, extraction, quoting) and stays out of the way otherwise. Output tokens per second, greedy ([receipt](receipts/rtx5090-features.json)):
+
+| | Plain | `--ngram` |
+|---|---:|---:|
+| Qwen3.5-9B Q4_K_M, one copy-heavy request | 182–191 | 662–719 |
+| Qwen3.5-9B Q4_K_M, 16 copy-heavy requests at once | 2,072–2,410 | 3,557–4,602 |
+| Qwen3.5-9B Q4_K_M, standard load, 64 in flight | 2,372 | 2,394 |
+| Qwen3.8-27B UD-Q4_K_XL, one copy-heavy request | 61 (`--mtp 2`: 143–148) | 233–236 |

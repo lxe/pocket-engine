@@ -138,19 +138,21 @@ __device__ __forceinline__ void tc_wait_ld() { asm volatile("tcgen05.wait::ld.sy
 __device__ __forceinline__ void tc_wait_st() { asm volatile("tcgen05.wait::st.sync.aligned;\n" ::: "memory"); }
 #endif
 
-// Keys per tile, and stages: Q (64 KB) and two stages each of a key half
-// and a value half (32 KB each) fill 192 KB of shared memory.
+// Keys per tile, and the load ring: Q (64 KB) and five 32 KB slots, each a
+// key half or a value half, fill 224 KB of shared memory. Loads go in
+// FlashAttention 4's order, K0 K1 V0 K2 V1 ..., about two and a half tiles
+// ahead of the MMAs.
 #define TC_BN 128
-#define TC_NST 2
+#define TC_NSLOT 5
 #define TC_HALF (64 * 256 * 2)  // a key half (64 keys) or a value half (128 keys x 128 columns)
 // Instruction descriptors (bf16 inputs, f32 accumulate, M = 256 across the
 // pair): S = Q K^T at N 128 with both operands K-major; O += P V at N 256
 // with V N-major.
 #define TC_IDESC_QK 0x10200490u
 #define TC_IDESC_PV 0x10410490u
-// Q, the key and value stages, then barriers, the row maxima and sums of
-// each half (2 x 2 x 128 and 2 x 128) and the TMEM address.
-#define TC_SMEM (128 * HEAD_DIM * 2 + 2 * TC_NST * TC_HALF + 256 + 6 * 128 * 4 + 16)
+// Q, the ring, then barriers, the row maxima of each half (2 x 2 x 128; the
+// row sums reuse them at the end) and the TMEM address.
+#define TC_SMEM (128 * HEAD_DIM * 2 + TC_NSLOT * TC_HALF + 256 + 4 * 128 * 4 + 16)
 
 __device__ __forceinline__ void pair_sync(int id) { asm volatile("bar.sync %0, 64;\n" ::"r"(id) : "memory"); }
 
@@ -159,24 +161,25 @@ __device__ __forceinline__ void attn_tc_body(ATTN_FLASH_ARGS, const CUtensorMap*
                                              int nslots) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200  // tcgen05: B200, not RTX 50
     static_assert(G % 2 == 0, "pairs of heads");
-    constexpr int BN = TC_BN, NST = TC_NST, NPAR = G / 2;
+    constexpr int BN = TC_BN, NSLOT = TC_NSLOT, NPAR = G / 2;
     constexpr int KCH = 64 * 128, VCH = 128 * 128;  // chunk strides of a key half and a value half
     extern __shared__ __align__(1024) unsigned char tsm[];
     const uint32_t base = (uint32_t)__cvta_generic_to_shared(tsm);
-    const uint32_t sQ = base, sK = base + 128 * HEAD_DIM * 2, sV = sK + NST * TC_HALF, bars = sV + NST * TC_HALF;
-    // Barriers: Q staged; per stage of keys and of values, full (the bytes
-    // landed) and empty (every pair's MMAs are done with it); per score
-    // tile, full and probabilities ready; O full after each tile's P V, and
-    // O done after the last (a parity wait on O full could not tell the last
-    // phase from the one before it). The even CTA also counts its partner's
-    // progress: *_peer.
-    const uint32_t q_full = bars, k_full = bars + 8, k_empty = k_full + 8 * NST, v_full = k_empty + 8 * NST,
-                   v_empty = v_full + 8 * NST, s_full = v_empty + 8 * NST, p_ready = s_full + 16, o_full = p_ready + 16,
-                   q_peer = o_full + 8, k_peer = q_peer + 8, v_peer = k_peer + 8 * NST, p_peer = v_peer + 8 * NST,
-                   o_done = p_peer + 16;
+    const uint32_t sQ = base, ring = base + 128 * HEAD_DIM * 2, bars = ring + NSLOT * TC_HALF;
+    // Barriers: Q staged; per ring slot, full (the bytes landed) and empty
+    // (every pair's MMAs are done with it); per score tile, full and
+    // probabilities ready; O full after each tile's P V, and O done after
+    // the last (a parity wait on O full could not tell the last phase from
+    // the one before it). The even CTA also counts its partner's progress:
+    // *_peer.
+    const uint32_t q_full = bars, full = bars + 8, empty = full + 8 * NSLOT, s_full = empty + 8 * NSLOT,
+                   p_ready = s_full + 16, o_full = p_ready + 16, o_done = o_full + 8, q_peer = o_done + 8,
+                   full_peer = q_peer + 8, p_peer = full_peer + 8 * NSLOT;
     float* sMax = reinterpret_cast<float*>(tsm + (bars - base) + 256);  // [tile parity][half][128]
-    float* sSum = sMax + 512;                                            // [half][128]
-    uint32_t* sTmem = reinterpret_cast<uint32_t*>(sSum + 256);
+    uint32_t* sTmem = reinterpret_cast<uint32_t*>(sMax + 512);
+    // The ring's order: K0, then K(i + 1) and V(i) for each tile i.
+    auto seq_k = [&](int i) { return i == 0 ? 0 : 2 * i - 1; };
+    auto seq_v = [&](int i, int T) { return i + 1 < T ? 2 * i + 2 : 2 * T - 1; };
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
 
     // The item: head of the group (the CTA's rank in its cluster), query
@@ -204,22 +207,19 @@ __device__ __forceinline__ void attn_tc_body(ATTN_FLASH_ARGS, const CUtensorMap*
 
     if (tid == 0) {
         mbar_init(q_full, 256);
-        for (int i = 0; i < NST; i++) {
-            mbar_init(k_full + 8 * i, 1);
-            mbar_init(k_empty + 8 * i, NPAR);
-            mbar_init(v_full + 8 * i, 1);
-            mbar_init(v_empty + 8 * i, NPAR);
-            mbar_init(k_peer + 8 * i, 1);
-            mbar_init(v_peer + 8 * i, 1);
+        for (int i = 0; i < NSLOT; i++) {
+            mbar_init(full + 8 * i, 1);
+            mbar_init(empty + 8 * i, NPAR);
+            mbar_init(full_peer + 8 * i, 1);
         }
         for (int i = 0; i < 2; i++) {
             mbar_init(s_full + 8 * i, 1);
             mbar_init(p_ready + 8 * i, 256);
-            mbar_init(p_peer + 8 * i, 1);
+            mbar_init(p_peer + 8 * i, 8);  // a warp's arrival each
         }
         mbar_init(o_full, 1);
         mbar_init(o_done, 1);
-        mbar_init(q_peer, 1);
+        mbar_init(q_peer, 8);
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     }
     if (warp == 8) {
@@ -254,7 +254,12 @@ __device__ __forceinline__ void attn_tc_body(ATTN_FLASH_ARGS, const CUtensorMap*
                 *reinterpret_cast<uint4*>(tsm + (c >> 3) * 16384 + r * 128 + (((c & 7) ^ (r & 7)) << 4)) = v;
             }
             asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-            mbar_arrive(q_full);
+            if (rp == 0) {
+                mbar_arrive(q_full);
+            } else {
+                __syncwarp();
+                if (lane == 0) mbar_arrive_at(q_peer, j - 1);
+            }
         }
         const int qp = r < nb ? pos[tb + r] : -1;
         float m = -INFINITY, l = 0.f;
@@ -322,10 +327,18 @@ __device__ __forceinline__ void attn_tc_body(ATTN_FLASH_ARGS, const CUtensorMap*
             tc_st32(slot + BN / 2 + (BN / 4) * hf, p);
             tc_wait_st();
             tc_before();
-            mbar_arrive(p_ready + 8 * (i & 1));
+            // The odd CTA's warps tell the even CTA's MMA warp directly.
+            if (rp == 0) {
+                mbar_arrive(p_ready + 8 * (i & 1));
+            } else {
+                __syncwarp();
+                if (lane == 0) mbar_arrive_at(p_peer + 8 * (i & 1), j - 1);
+            }
             l = l * sc + sum2[0] + sum2[1];
         }
-        // The output: this half's 128 columns, over the row's whole sum.
+        // The output: this half's 128 columns, over the row's whole sum (the
+        // halves swap sums in the maxima buffer the last tile did not use).
+        float* sSum = sMax + 256 * (T & 1);
         sSum[128 * hf + r] = l;
         pair_sync(pair);
         const float sum = l + sSum[128 * (1 - hf) + r], inv = sum > 0.f ? 1.f / sum : 0.f;
@@ -356,12 +369,17 @@ __device__ __forceinline__ void attn_tc_body(ATTN_FLASH_ARGS, const CUtensorMap*
         // MMA issue for the pair, from one elected thread, once both CTAs
         // are ready.
         const bool leader = elect_one();
+        // Waits for ring entry n in both CTAs; returns its slot.
+        auto ready = [&](int n) {
+            const int sl = n % NSLOT, ph = (n / NSLOT) & 1;
+            mbar_wait(full + 8 * sl, ph);
+            mbar_wait_cl(full_peer + 8 * sl, ph);
+            return sl;
+        };
         auto qk = [&](int i) {
-            const int st = i % NST, ph = (i / NST) & 1;
-            mbar_wait(k_full + 8 * st, ph);
-            mbar_wait_cl(k_peer + 8 * st, ph);
+            const int sl = ready(seq_k(i));
             tc_after();
-            const uint32_t d = tS + BN * (i & 1), k = sK + st * TC_HALF;
+            const uint32_t d = tS + BN * (i & 1), k = ring + sl * TC_HALF;
             if (leader) {
 #pragma unroll
                 for (int kk = 0; kk < 16; kk++) {
@@ -369,7 +387,7 @@ __device__ __forceinline__ void attn_tc_body(ATTN_FLASH_ARGS, const CUtensorMap*
                     tc2_mma_ss(d, tc_desc(sQ + qo, 16, 1024), tc_desc(k + ko, 16, 1024), TC_IDESC_QK, kk > 0);
                 }
                 tc2_commit(s_full + 8 * (i & 1), pair_mask);
-                tc2_commit(k_empty + 8 * st, all);
+                tc2_commit(empty + 8 * sl, all);
             }
             __syncwarp();
         };
@@ -378,78 +396,69 @@ __device__ __forceinline__ void attn_tc_body(ATTN_FLASH_ARGS, const CUtensorMap*
         qk(0);
         for (int i = 0; i < T; i++) {
             if (i + 1 < T) qk(i + 1);
-            const int st = i % NST, ph = (i / NST) & 1;
             mbar_wait(p_ready + 8 * (i & 1), (i >> 1) & 1);
             mbar_wait_cl(p_peer + 8 * (i & 1), (i >> 1) & 1);
-            mbar_wait(v_full + 8 * st, ph);
-            mbar_wait_cl(v_peer + 8 * st, ph);
+            const int sl = ready(seq_v(i, T));
             tc_after();
-            const uint32_t pt = tS + BN * (i & 1) + BN / 2, v = sV + st * TC_HALF;
+            const uint32_t pt = tS + BN * (i & 1) + BN / 2, v = ring + sl * TC_HALF;
             if (leader) {
 #pragma unroll
                 for (int kk = 0; kk < BN / 16; kk++)
                     tc2_mma_ts(tO, pt + 8 * kk, tc_desc(v + kk * 2048, VCH, 1024), TC_IDESC_PV, i > 0 || kk > 0);
                 tc2_commit(o_full, pair_mask);
                 if (i == T - 1) tc2_commit(o_done, pair_mask);
-                tc2_commit(v_empty + 8 * st, all);
+                tc2_commit(empty + 8 * sl, all);
             }
             __syncwarp();
         }
     } else if (warp == 8) {
-        // The odd CTA's progress, relayed to the even CTA in the order its
-        // MMA warp waits for it.
+        // The odd CTA's ring entries, relayed to the even CTA as they land,
+        // in ring order.
         const int even = j - 1;
         const bool leader = elect_one();
-        auto relay = [&](uint32_t local, int ph, uint32_t peer) {
-            mbar_wait(local, ph);
-            if (leader) mbar_arrive_at(peer, even);
+        for (int n = 0; n < 2 * T; n++) {
+            const int sl = n % NSLOT;
+            mbar_wait(full + 8 * sl, (n / NSLOT) & 1);
+            if (leader) mbar_arrive_at(full_peer + 8 * sl, even);
             __syncwarp();
-        };
-        relay(q_full, 0, q_peer);
-        relay(k_full, 0, k_peer);
-        for (int i = 0; i < T; i++) {
-            if (i + 1 < T) relay(k_full + 8 * ((i + 1) % NST), ((i + 1) / NST) & 1, k_peer + 8 * ((i + 1) % NST));
-            relay(p_ready + 8 * (i & 1), (i >> 1) & 1, p_peer + 8 * (i & 1));
-            relay(v_full + 8 * (i % NST), (i / NST) & 1, v_peer + 8 * (i % NST));
         }
     } else {
-        // Loads: this CTA's halves. A key half is 4 pages of 16 tokens, a
-        // value half 8 pages of 2 column chunks; of the NPAR CTAs of this
-        // parity, the one at pair index p % NPAR loads page p (lane p) and
-        // multicasts it to the others.
+        // Loads: this CTA's halves, in ring order. A key half is 4 pages of
+        // 16 tokens, a value half 8 pages of 2 column chunks; of the NPAR CTAs
+        // of this parity, the one at pair index p % NPAR loads page p (lane p)
+        // and multicasts it to the others.
         if (lane == 0) {
             asm volatile("prefetch.tensormap [%0];\n" ::"l"(kmap) : "memory");
             asm volatile("prefetch.tensormap [%0];\n" ::"l"(vmap) : "memory");
         }
         const int* bt = block_table + (size_t)s * max_blocks;
         auto slot_of = [&](int kp) { return kp < L ? bt[kp / block_size] * block_size : nslots; };
-        auto wait_empty = [&](int i, uint32_t full, uint32_t empty) {
-            const int st = i % NST;
+        auto claim = [&](int n) {
+            const int sl = n % NSLOT;
             if (lane == 0) {
-                if (i >= NST) mbar_wait(empty + 8 * st, (i / NST - 1) & 1);
-                mbar_expect(full + 8 * st, TC_HALF);
+                if (n >= NSLOT) mbar_wait(empty + 8 * sl, (n / NSLOT - 1) & 1);
+                mbar_expect(full + 8 * sl, TC_HALF);
             }
             __syncwarp();
+            return sl;
         };
         auto load_k = [&](int i) {
-            wait_empty(i, k_full, k_empty);
-            const int st = i % NST;
+            const int sl = claim(seq_k(i));
             if (lane < 4 && lane % NPAR == pr) {
-                const int sl = slot_of(BN * i + 64 * rp + 16 * lane);
+                const int ts = slot_of(BN * i + 64 * rp + 16 * lane);
 #pragma unroll
                 for (int a = 0; a < 4; a++)
-                    tma3_all(sK + st * TC_HALF + a * KCH + lane * 2048, kmap, 64 * a, kvh, sl, k_full + 8 * st, same);
+                    tma3_all(ring + sl * TC_HALF + a * KCH + lane * 2048, kmap, 64 * a, kvh, ts, full + 8 * sl, same);
             }
         };
         auto load_v = [&](int i) {
-            wait_empty(i, v_full, v_empty);
-            const int st = i % NST;
+            const int sl = claim(seq_v(i, T));
             if (lane < 8 && lane % NPAR == pr) {
-                const int sl = slot_of(BN * i + 16 * lane);
+                const int ts = slot_of(BN * i + 16 * lane);
 #pragma unroll
                 for (int a = 0; a < 2; a++)
-                    tma3_all(sV + st * TC_HALF + a * VCH + lane * 2048, vmap, 64 * (2 * rp + a), kvh, sl,
-                             v_full + 8 * st, same);
+                    tma3_all(ring + sl * TC_HALF + a * VCH + lane * 2048, vmap, 64 * (2 * rp + a), kvh, ts,
+                             full + 8 * sl, same);
             }
         };
         load_k(0);
@@ -459,10 +468,7 @@ __device__ __forceinline__ void attn_tc_body(ATTN_FLASH_ARGS, const CUtensorMap*
         }
         // Every pair's last commits have reached this CTA's barriers.
         if (lane == 0)
-            for (int i = max(0, T - NST); i < T; i++) {
-                mbar_wait(k_empty + 8 * (i % NST), (i / NST) & 1);
-                mbar_wait(v_empty + 8 * (i % NST), (i / NST) & 1);
-            }
+            for (int n = max(0, 2 * T - NSLOT); n < 2 * T; n++) mbar_wait(empty + 8 * (n % NSLOT), (n / NSLOT) & 1);
     }
     // Everyone is done with TMEM once the output is written, and no CTA
     // leaves while another may still send to it.

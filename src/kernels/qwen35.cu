@@ -1087,6 +1087,9 @@ __device__ __forceinline__ int split_parts(int L, int Z, int min_chunk) {
     return max(1, min(Z, (L + min_chunk - 1) / min_chunk));
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+#include "amd/attn_decode.cuh"
+#endif
 template <int G, int WARPS, bool F8>
 __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void* __restrict__ kcache,
                                           const void* __restrict__ vcache,
@@ -1099,6 +1102,14 @@ __device__ __forceinline__ void attn_body(const bf16* __restrict__ q, const void
                                           uint8_t* fq, void* fs, int fmode, int frows,
                                           const int* __restrict__ cu, int skip_prompts, int min_chunk,
                                           float* __restrict__ part, const int* __restrict__ outs, int spec) {
+#ifdef __HIP_PLATFORM_AMD__
+    if constexpr (!F8) {
+        attn_decode_mfma<G, WARPS>(q, kcache, vcache, qkv, qstride, Hq, Hkv, pos, tok_seq, block_table, max_blocks,
+                                   block_size, out, scale, fq, fs, fmode, frows, cu, skip_prompts, min_chunk, part, outs,
+                                   spec);
+        return;
+    }
+#endif
     __shared__ float sm_m[WARPS][G], sm_s[WARPS][G];
     __shared__ float sm_acc[WARPS][G][HEAD_DIM];
     const int t = blockIdx.x, kvh = blockIdx.y;

@@ -1,0 +1,485 @@
+{
+ "date": "2026-10-14",
+ "gpu": "NVIDIA B200 (RunPod secure cloud), two pods; containers with a 20-CPU quota on busy hosts",
+ "load_script": "scripts/load.py (standard cases); scripts/workloads.py long --tokens 65536 --conc 1",
+ "note": "The CPU quota slows the Python load client and vLLM's scheduler: vLLM's one-stream rates here are under its own gauntlet's (receipts/b200-gauntlet.json), so its load numbers understate it. The 64k first tokens depend little on the host.",
+ "pod1": {
+  "f8d1914 (before)": {
+   "9b": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 2.61,
+     "out_tok_s": 222.1,
+     "ttft_p50": 0.014,
+     "ttft_p95": 0.037,
+     "lat_p50": 0.137,
+     "lat_p95": 0.27,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.62,
+     "out_tok_s": 1390.7,
+     "ttft_p50": 0.023,
+     "ttft_p95": 0.044,
+     "lat_p50": 0.177,
+     "lat_p95": 0.331,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.51,
+     "out_tok_s": 2298.3,
+     "ttft_p50": 0.028,
+     "ttft_p95": 0.079,
+     "lat_p50": 0.203,
+     "lat_p95": 0.383,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 1.33,
+     "out_tok_s": 3382.3,
+     "ttft_p50": 0.05,
+     "ttft_p95": 0.166,
+     "lat_p50": 0.273,
+     "lat_p95": 0.508,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 2.38,
+     "out_tok_s": 2778.8,
+     "ttft_p50": 0.291,
+     "ttft_p95": 1.325,
+     "lat_p50": 0.535,
+     "lat_p95": 1.515,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.09,
+     "out_tok_s": 2068.7,
+     "ttft_p50": 0.412,
+     "ttft_p95": 0.703,
+     "lat_p50": 0.632,
+     "lat_p95": 0.955,
+     "first_error": null
+    }
+   ],
+   "27b": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 4.61,
+     "out_tok_s": 84.4,
+     "ttft_p50": 0.026,
+     "ttft_p95": 0.035,
+     "lat_p50": 0.225,
+     "lat_p95": 0.374,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 3.4,
+     "out_tok_s": 495.5,
+     "ttft_p50": 0.037,
+     "ttft_p95": 0.081,
+     "lat_p50": 0.325,
+     "lat_p95": 0.683,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 2.9,
+     "out_tok_s": 904.4,
+     "ttft_p50": 0.043,
+     "ttft_p95": 0.11,
+     "lat_p50": 0.373,
+     "lat_p95": 0.898,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.81,
+     "out_tok_s": 1214.7,
+     "ttft_p50": 0.066,
+     "ttft_p95": 0.287,
+     "lat_p50": 0.529,
+     "lat_p95": 1.212,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 3.17,
+     "out_tok_s": 1583.4,
+     "ttft_p50": 0.165,
+     "ttft_p95": 0.49,
+     "lat_p50": 0.788,
+     "lat_p95": 1.67,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.56,
+     "out_tok_s": 1077.6,
+     "ttft_p50": 0.435,
+     "ttft_p95": 0.676,
+     "lat_p50": 0.958,
+     "lat_p95": 1.344,
+     "first_error": null
+    }
+   ],
+   "9b_64k_first_token_s": 2.497
+  }
+ },
+ "pod2": {
+  "be7ef26 (tcgen05 attention, gdn_decode)": {
+   "9b": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 2.63,
+     "out_tok_s": 220.2,
+     "ttft_p50": 0.014,
+     "ttft_p95": 0.036,
+     "lat_p50": 0.139,
+     "lat_p95": 0.274,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.6,
+     "out_tok_s": 1411.2,
+     "ttft_p50": 0.022,
+     "ttft_p95": 0.061,
+     "lat_p50": 0.168,
+     "lat_p95": 0.322,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.46,
+     "out_tok_s": 2379.1,
+     "ttft_p50": 0.03,
+     "ttft_p95": 0.079,
+     "lat_p50": 0.2,
+     "lat_p95": 0.365,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 1.41,
+     "out_tok_s": 3210.0,
+     "ttft_p50": 0.061,
+     "ttft_p95": 0.178,
+     "lat_p50": 0.281,
+     "lat_p95": 0.53,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 2.26,
+     "out_tok_s": 2891.4,
+     "ttft_p50": 0.257,
+     "ttft_p95": 1.336,
+     "lat_p50": 0.499,
+     "lat_p95": 1.499,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.05,
+     "out_tok_s": 2145.3,
+     "ttft_p50": 0.406,
+     "ttft_p95": 0.671,
+     "lat_p50": 0.644,
+     "lat_p95": 0.852,
+     "first_error": null
+    }
+   ],
+   "27b": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 4.61,
+     "out_tok_s": 84.3,
+     "ttft_p50": 0.026,
+     "ttft_p95": 0.035,
+     "lat_p50": 0.225,
+     "lat_p95": 0.373,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 3.33,
+     "out_tok_s": 503.7,
+     "ttft_p50": 0.032,
+     "ttft_p95": 0.078,
+     "lat_p50": 0.318,
+     "lat_p95": 0.668,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 2.81,
+     "out_tok_s": 928.0,
+     "ttft_p50": 0.038,
+     "ttft_p95": 0.109,
+     "lat_p50": 0.37,
+     "lat_p95": 0.892,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.74,
+     "out_tok_s": 1245.4,
+     "ttft_p50": 0.068,
+     "ttft_p95": 0.223,
+     "lat_p50": 0.513,
+     "lat_p95": 1.147,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 3.03,
+     "out_tok_s": 1671.8,
+     "ttft_p50": 0.144,
+     "ttft_p95": 0.479,
+     "lat_p50": 0.744,
+     "lat_p95": 1.636,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.48,
+     "out_tok_s": 1133.6,
+     "ttft_p50": 0.399,
+     "ttft_p95": 0.631,
+     "lat_p50": 0.868,
+     "lat_p95": 1.253,
+     "first_error": null
+    }
+   ],
+   "9b_64k_first_token_s": 1.475
+  },
+  "vLLM 0.31.0": {
+   "9b": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 3.76,
+     "out_tok_s": 154.8,
+     "ttft_p50": 0.085,
+     "ttft_p95": 0.091,
+     "lat_p50": 0.208,
+     "lat_p95": 0.363,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 3.7,
+     "out_tok_s": 613.3,
+     "ttft_p50": 0.131,
+     "ttft_p95": 0.182,
+     "lat_p50": 0.413,
+     "lat_p95": 0.75,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 3.17,
+     "out_tok_s": 1099.5,
+     "ttft_p50": 0.159,
+     "ttft_p95": 0.225,
+     "lat_p50": 0.471,
+     "lat_p95": 0.785,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.19,
+     "out_tok_s": 2067.5,
+     "ttft_p50": 0.211,
+     "ttft_p95": 0.304,
+     "lat_p50": 0.458,
+     "lat_p95": 0.79,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 2.53,
+     "out_tok_s": 2636.3,
+     "ttft_p50": 0.303,
+     "ttft_p95": 0.502,
+     "lat_p50": 0.664,
+     "lat_p95": 1.124,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.07,
+     "out_tok_s": 2127.5,
+     "ttft_p50": 0.454,
+     "ttft_p95": 0.686,
+     "lat_p50": 0.834,
+     "lat_p95": 0.995,
+     "first_error": null
+    }
+   ],
+   "27b": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 5.77,
+     "out_tok_s": 70.0,
+     "ttft_p50": 0.103,
+     "ttft_p95": 0.108,
+     "lat_p50": 0.32,
+     "lat_p95": 0.44,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 6.73,
+     "out_tok_s": 255.8,
+     "ttft_p50": 0.186,
+     "ttft_p95": 0.232,
+     "lat_p50": 0.695,
+     "lat_p95": 1.506,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 6.26,
+     "out_tok_s": 437.6,
+     "ttft_p50": 0.21,
+     "ttft_p95": 0.272,
+     "lat_p50": 0.907,
+     "lat_p95": 1.813,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 4.94,
+     "out_tok_s": 715.6,
+     "ttft_p50": 0.287,
+     "ttft_p95": 0.411,
+     "lat_p50": 1.038,
+     "lat_p95": 2.183,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 4.26,
+     "out_tok_s": 1235.5,
+     "ttft_p50": 0.31,
+     "ttft_p95": 0.589,
+     "lat_p50": 1.112,
+     "lat_p95": 2.61,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.55,
+     "out_tok_s": 1130.0,
+     "ttft_p50": 0.58,
+     "ttft_p95": 0.756,
+     "lat_p50": 1.029,
+     "lat_p95": 1.365,
+     "first_error": null
+    }
+   ],
+   "9b_64k_first_token_s": [
+    1.379,
+    1.324
+   ],
+   "flags": "--max-num-seqs 256 --no-enable-prefix-caching --max-model-len 4096 (load); --max-model-len 70000 --max-num-seqs 64 (64k)"
+  }
+ },
+ "kernels": [
+  "fresh, against chunked: outputs median/p99/max rel diff (0.0, 0.0, 0.00077160494), state (0.0, 0.0, 0.0)",
+  "carried, against chunked: outputs median/p99/max rel diff (0.0, 0.0, 0.0030864198), state (0.0, 0.0, 0.0034482758)",
+  "carried, against gdn_recurrent: outputs median/p99/max rel diff (0.0, 0.0, 0.0030864198), state (0.0, 0.0, 0.0034482758)",
+  "fresh, against chunked: outputs median/p99/max rel diff (0.0, 0.002631579, 0.010526316), state (0.0, 0.0034013605, 0.006802721)",
+  "carried, against chunked: outputs median/p99/max rel diff (0.0, 0.0028901733, 0.011560693), state (0.0, 0.0025510204, 0.0051020407)",
+  "carried, against gdn_recurrent: outputs median/p99/max rel diff (0.0, 0.0, 0.0014450867), state (0.0, 0.0, 0.0051020407)",
+  "gdn_decode: 16 x 1 tokens, 48 heads: 22.8 us (22.78 us per token per sequence)",
+  "  gdn_recurrent 27.4 us",
+  "gdn_decode: 64 x 1 tokens, 48 heads: 78.1 us (78.10 us per token per sequence)",
+  "  gdn_recurrent 114.9 us",
+  "gdn_decode: 128 x 1 tokens, 48 heads: 150.4 us (150.40 us per token per sequence)",
+  "  gdn_recurrent 231.5 us",
+  "flash against paged: |diff| median 7.63e-6, p99 1.22e-4, max 3.91e-3 (outputs up to 0.723)",
+  "attn_tc_g4: 1 x 65536 tokens after 0, 16 heads: 34.87 ms, 1009.0 TFLOPS",
+  "flash against paged: |diff| median 7.63e-6, p99 1.22e-4, max 3.91e-3 (outputs up to 0.719)",
+  "attn_tc_g6: 1 x 65536 tokens after 0, 24 heads: 52.87 ms, 998.2 TFLOPS"
+ ]
+}

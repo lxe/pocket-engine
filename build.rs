@@ -7,6 +7,7 @@ fn main() {
         "fp8.cuh",
         "fp4.cuh",
         "lora.cuh",
+        "attn_sm100.cuh",
         "ggml-common.h",
         "backend/cuda.cuh",
         "backend/hip.cuh",

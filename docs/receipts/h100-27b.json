@@ -1,0 +1,166 @@
+{
+ "date": "2026-10-13",
+ "commit": "10fa181",
+ "gpu": "NVIDIA H100 80GB HBM3 (RunPod)",
+ "load_script": "scripts/load.py (standard cases)",
+ "runs": [
+  {
+   "name": "27b bf16",
+   "model": "Qwen/Qwen3.8-27B",
+   "flags": [],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 7.8,
+     "out_tok_s": 49.5,
+     "ttft_p50": 0.035,
+     "ttft_p95": 0.041,
+     "lat_p50": 0.387,
+     "lat_p95": 0.638,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 5.57,
+     "out_tok_s": 301.3,
+     "ttft_p50": 0.051,
+     "ttft_p95": 0.071,
+     "lat_p50": 0.531,
+     "lat_p95": 1.109,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 4.72,
+     "out_tok_s": 552.4,
+     "ttft_p50": 0.056,
+     "ttft_p95": 0.183,
+     "lat_p50": 0.606,
+     "lat_p95": 1.475,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 4.17,
+     "out_tok_s": 823.6,
+     "ttft_p50": 0.068,
+     "ttft_p95": 0.344,
+     "lat_p50": 0.743,
+     "lat_p95": 1.71,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 4.67,
+     "out_tok_s": 1069.2,
+     "ttft_p50": 0.117,
+     "ttft_p95": 0.667,
+     "lat_p50": 1.104,
+     "lat_p95": 2.55,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 2.1,
+     "out_tok_s": 796.8,
+     "ttft_p50": 0.496,
+     "ttft_p95": 0.731,
+     "lat_p50": 1.239,
+     "lat_p95": 1.822,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "27b FP8",
+   "model": "Qwen/Qwen3.8-27B-FP8",
+   "flags": [],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 6.09,
+     "out_tok_s": 70.8,
+     "ttft_p50": 0.021,
+     "ttft_p95": 0.025,
+     "lat_p50": 0.296,
+     "lat_p95": 0.802,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 4.07,
+     "out_tok_s": 424.5,
+     "ttft_p50": 0.037,
+     "ttft_p95": 0.048,
+     "lat_p50": 0.39,
+     "lat_p95": 0.93,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 3.66,
+     "out_tok_s": 735.7,
+     "ttft_p50": 0.042,
+     "ttft_p95": 0.102,
+     "lat_p50": 0.464,
+     "lat_p95": 1.097,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 3.25,
+     "out_tok_s": 1081.7,
+     "ttft_p50": 0.057,
+     "ttft_p95": 0.259,
+     "lat_p50": 0.587,
+     "lat_p95": 1.389,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 3.72,
+     "out_tok_s": 1379.6,
+     "ttft_p50": 0.096,
+     "ttft_p95": 0.459,
+     "lat_p50": 0.858,
+     "lat_p95": 1.963,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.62,
+     "out_tok_s": 1095.7,
+     "ttft_p50": 0.35,
+     "ttft_p95": 0.578,
+     "lat_p50": 0.979,
+     "lat_p95": 1.476,
+     "first_error": null
+    }
+   ]
+  }
+ ]
+}

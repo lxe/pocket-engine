@@ -4,7 +4,9 @@ An inference server for Qwen3.5 and Qwen3.8 models, written from scratch in Rust
 
 - **Starts in seconds.** Serving 3 seconds after launch, where vLLM takes 1.5 to 3 minutes.
 - **Fast first tokens.** 13.5 ms for a short prompt against vLLM's 57.5 ms.
-- **Higher throughput** on most models, with optional speculative decoding from the checkpoint's own multi-token-prediction layer.
+- **Higher throughput** on most models, with optional speculative decoding from the checkpoint's own multi-token-prediction layer, or from the prompt itself.
+- **LoRA adapters,** many per server, loaded at runtime through vLLM's API.
+- **JSON output and log-probabilities** in OpenAI's format.
 - **bf16, FP8, FP4 and GGUF weights,** and images.
 
 Qwen3.5-9B on one H100, against vLLM 0.31.0 on the same machine:
@@ -41,6 +43,7 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 - **Models:** Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Dense models only.
 - **GPUs:** H100, H200, B200 and RTX 50-series; AMD MI325X (ROCm).
 - **Weights:** bf16, FP8, FP4 (RTX 50-series) and GGUF.
+- **Adapters:** PEFT and llama.cpp LoRA, over any of those weights.
 
 ## Documentation
 

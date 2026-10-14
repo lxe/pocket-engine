@@ -42,6 +42,21 @@ GGUF rows use int8 activations, the default. With `--no-int8` they differ only b
 
 FP8 receipts: [fp8.json](receipts/fp8.json).
 
+## Adapters
+
+LoRA adapters applied at runtime, against Transformers running the same PEFT adapter unmerged, as PEFT and vLLM serve it (`scripts/accuracy.py reference ... --adapter`). Merging an adapter into bf16 weights rounds them again, which moves a strong adapter's reference more than the engine differs from it.
+
+| Model | Adapter | Top-1 agreement | Median, p95 log-prob difference |
+|---|---|---|---|
+| Qwen3.5-0.8B | Pocket Model adapter | 211 of 212 (the miss within one bf16 step) | 0.0020, 0.040 |
+| Qwen3.5-2B | Pocket Model adapter | 199 of 199 | 0.0011, 0.034 |
+| Qwen3.5-4B | Pocket Model adapter | 207 of 208 (within one step) | 0.0004, 0.034 |
+| Qwen3.5-9B | Bespoke-Nimble-9B | 221 of 221 | 0.0004, 0.033 |
+| Qwen3.8-27B | donto predicate extractor | 211 of 213 (both within one step) | 0.0003, 0.039 |
+| Qwen3.8-27B | Samantha 1.1 | 211 of 213 (both within one step) | 0.0009, 0.034 |
+
+`tests/fixtures/<size>.lora.*.json` hold the references for one adapter per size (donto for 27B); `lora_matches_merged_reference` checks an adapter against them when `POCKET_ENGINE_LORA` names it.
+
 ## Long prompts and the FP8 KV cache
 
 Prompts of about 3,300 tokens, so most of the context comes from the KV cache:

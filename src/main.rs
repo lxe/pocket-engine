@@ -183,10 +183,11 @@ enum Cmd {
         #[arg(long, default_value_t = 128)]
         tokens: usize,
         /// The chunked tensor-core kernels for prompts (gdn_prep, gdn_scan
-        /// and the norm) instead of gdn_recurrent.
+        /// and the norm) instead of gdn_decode.
         #[arg(long)]
         chunk: bool,
-        /// Compare the chunked kernels' outputs and state with gdn_recurrent's.
+        /// Compare gdn_decode's outputs and state with the chunked kernels' and
+        /// gdn_recurrent's.
         #[arg(long)]
         check: bool,
         /// gdn_scan's blocks per head: 1, 2 or 4.
@@ -216,7 +217,8 @@ enum Cmd {
         /// device's choice).
         #[arg(long)]
         shape: Option<String>,
-        /// The wgmma kernel (Hopper; groups of 4 or 6).
+        /// The warp-specialized kernel (wgmma on Hopper, tcgen05 on B200;
+        /// groups of 4 or 6).
         #[arg(long)]
         wg: bool,
     },
@@ -601,7 +603,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gpu.alloc(t * hv * 32 * 2)?,
                 gpu.alloc(t * hv * 4)?,
             ];
-            // Phases: 1 the prep, 2 the scan (or the recurrent kernel), 4 the norm.
+            // Kernels by name: "chunk" (prep, scan, norm), "decode" (gdn_decode)
+            // or "recurrent" (gdn_recurrent). Phases: 1 the prep, 2 the scan or
+            // recurrence, 4 the norm.
+            let (nbuf, per_sm) = pocket_engine::model::gdn_decode_shape(true, gpu.smem_per_sm)
+                .ok_or("no room for gdn_decode")?;
+            let kdecode = gpu.kernel("gdn_decode")?;
+            gpu.set_smem(kdecode, nbuf * 2 * d * d)?;
             let launch = |name: &str, fresh_ptr: u64, phases: u8| -> pocket_engine::Result<()> {
                 if name == "chunk" && phases & 1 != 0 {
                     gpu.launch(
@@ -633,18 +641,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                 }
                 if phases & 2 != 0 {
-                    let (kern, smem, z) = match name {
+                    let (kern, smem, grid, extra) = match name {
                         "chunk" => (
                             kscan,
                             pocket_engine::model::gdn_scan_smem(split) as u32,
-                            split as u32,
+                            (seqs as u32, hv as u32, split as u32),
+                            vec![
+                                Arg::P(scratch[0].ptr),
+                                Arg::P(scratch[1].ptr),
+                                Arg::P(scratch[2].ptr),
+                                Arg::P(scratch[3].ptr),
+                                Arg::P(scratch[4].ptr),
+                                Arg::P(scratch[5].ptr),
+                                Arg::P(0),
+                            ],
                         ),
-                        _ => (gpu.kernel("gdn_recurrent")?, 0, 1),
+                        "decode" => (
+                            kdecode,
+                            (nbuf * 2 * d * d) as u32,
+                            ((seqs * hv).min(gpu.sms * per_sm) as u32, 1, 1),
+                            vec![Arg::I(seqs as i32), Arg::I(nbuf as i32)],
+                        ),
+                        _ => (
+                            gpu.kernel("gdn_recurrent")?,
+                            0,
+                            (seqs as u32, hv as u32, 1),
+                            vec![],
+                        ),
                     };
+                    let threads = if name == "decode" { 256 } else { 2 * d as u32 };
                     gpu.launch(
                         kern,
-                        (seqs as u32, hv as u32, z),
-                        2 * d as u32,
+                        grid,
+                        threads,
                         smem,
                         &[
                             Arg::P(conv.ptr),
@@ -670,17 +699,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Arg::I(0),
                             Arg::P(0),
                             Arg::I(1),
-                            Arg::P(scratch[0].ptr),
-                            Arg::P(scratch[1].ptr),
-                            Arg::P(scratch[2].ptr),
-                            Arg::P(scratch[3].ptr),
-                            Arg::P(scratch[4].ptr),
-                            Arg::P(scratch[5].ptr),
-                            Arg::P(0),
-                        ],
+                        ]
+                        .into_iter()
+                        .chain(extra)
+                        .collect::<Vec<_>>(),
                     )?;
                 }
-                if name != "decode" && phases & 4 != 0 {
+                if name == "chunk" && phases & 4 != 0 {
                     gpu.launch(
                         norm,
                         (t as u32, 1, 1),
@@ -725,12 +750,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|&b| half::bf16::from_bits(b).to_f32())
                         .collect())
                 };
-                for (label, f) in [("fresh", fresh1.ptr), ("carried", fresh.ptr)] {
+                for (label, f, other) in [
+                    ("fresh, against chunked", fresh1.ptr, "chunk"),
+                    ("carried, against chunked", fresh.ptr, "chunk"),
+                    ("carried, against gdn_recurrent", fresh.ptr, "recurrent"),
+                ] {
                     gpu.dtod(state.ptr, saved.ptr, sbytes)?;
                     launch("decode", f, 7)?;
                     let (o1, s1) = (fetch(out.ptr, t * hv * d * 2)?, fetch(state.ptr, sbytes)?);
                     gpu.dtod(state.ptr, saved.ptr, sbytes)?;
-                    launch("chunk", f, 7)?;
+                    launch(other, f, 7)?;
                     let (o2, s2) = (fetch(out.ptr, t * hv * d * 2)?, fetch(state.ptr, sbytes)?);
                     let rel = |a: &[f32], b: &[f32]| {
                         let scale = a.iter().fold(0f32, |m, x| m.max(x.abs()));
@@ -754,7 +783,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return Ok(());
             }
-            let time = |phases: u8| -> pocket_engine::Result<f64> {
+            let time = |which: &str, phases: u8| -> pocket_engine::Result<f64> {
                 launch(which, fresh.ptr, phases)?;
                 gpu.sync()?;
                 let n = 50;
@@ -765,8 +794,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gpu.sync()?;
                 Ok(t0.elapsed().as_secs_f64() / n as f64 * 1e6)
             };
-            let us = time(7)?;
-            let kernel = if chunk { "chunked" } else { "gdn_recurrent" };
+            let us = time(which, 7)?;
+            let kernel = if chunk { "chunked" } else { "gdn_decode" };
             println!(
                 "{kernel}: {seqs} x {tokens} tokens, {hv} heads: {us:.1} us ({:.2} us per token per sequence)",
                 us / tokens as f64
@@ -774,10 +803,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if chunk {
                 println!(
                     "  gdn_prep {:.1} us, gdn_scan{split} {:.1} us, gdn_norm {:.1} us",
-                    time(1)?,
-                    time(2)?,
-                    time(4)?
+                    time(which, 1)?,
+                    time(which, 2)?,
+                    time(which, 4)?
                 );
+            } else {
+                println!("  gdn_recurrent {:.1} us", time("recurrent", 2)?);
             }
         }
         Cmd::BenchAttn {
@@ -835,12 +866,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => pocket_engine::model::fa_shape(group, gpu.arch, false),
             };
             let (tiles, smem) = (sh.tiles, sh.smem(group));
-            let (name, grid, threads, smem) = if wg {
+            let ws = if wg {
+                Some(
+                    pocket_engine::model::FaWs::get(group, gpu.arch, false)
+                        .ok_or("--wg needs Hopper or B200 and a group of 4 or 6")?,
+                )
+            } else {
+                None
+            };
+            let (name, grid, threads, smem) = if let Some(ws) = ws {
                 (
-                    format!("attn_ws_g{group}"),
-                    (gpu.sms as u32, 1, 1),
-                    384,
-                    pocket_engine::model::WS_SMEM,
+                    ws.name(),
+                    ws.grid(t, seqs, hq, gpu.sms),
+                    ws.threads(),
+                    ws.smem(),
                 )
             } else {
                 (

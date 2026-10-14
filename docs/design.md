@@ -27,7 +27,7 @@ Steps that only decode replay a CUDA graph captured at startup, which costs one 
 
 Each request keeps a 128×128 state per head (25 MB per request on 9B), stored in bf16 between steps and computed in f32.
 
-- **Decoding** updates the state one token at a time.
+- **Decoding** updates the state one token at a time. Blocks stay resident and load the next heads' states into shared memory while they compute one, so the update runs near memory bandwidth.
 - **Prompts** run in chunks of 32 tokens on tensor cores, in the same chunked form FLA and FlashInfer use. A first kernel computes each chunk's local terms for all chunks at once; a second walks the chunks in order, carrying the state. The second kernel loads the next chunk while it computes the current one.
 
 ## Full attention
@@ -35,7 +35,7 @@ Each request keeps a 128×128 state per head (25 MB per request on 9B), stored i
 Keys and values live in a paged cache of 16-token blocks.
 
 - **Decoding** reads a request's cached keys and values directly. For long contexts, one request's keys are split across the whole GPU and the partial results merged.
-- **Prompts** run flash attention. On H100 and H200 it is a FlashAttention-3-style kernel: one warpgroup loads key and value tiles with TMA while two others compute, overlapping the softmax with the matrix multiplies. On other GPUs it is a FlashAttention-2-style kernel on `mma.sync`.
+- **Prompts** run flash attention. On H100 and H200 it is a FlashAttention-3-style kernel: one warpgroup loads key and value tiles with TMA while two others compute, overlapping the softmax with the matrix multiplies. On B200 it is FlashAttention-4-style: tcgen05 matrix multiplies accumulate in tensor memory, and separate warps issue them, load, run the softmax and correct the output. The query heads that share a key/value head run as one cluster, which loads each key and value tile once for all of them. On other GPUs it is a FlashAttention-2-style kernel on `mma.sync`.
 
 ## Prefix cache
 

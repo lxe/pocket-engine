@@ -1,0 +1,923 @@
+{
+ "date": "2026-10-13",
+ "commit": "f8d1914",
+ "gpu": "NVIDIA GeForce RTX 5090, 615.78.08",
+ "load_script": "scripts/load.py (standard cases)",
+ "copy_script": "three copy-heavy prompts, 400 tokens max, temperature 0",
+ "runs": [
+  {
+   "name": "9b-q4km int8 (default)",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 3.42,
+     "out_tok_s": 177.3,
+     "ttft_p50": 0.013,
+     "ttft_p95": 0.017,
+     "lat_p50": 0.18,
+     "lat_p95": 0.356,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 2.23,
+     "out_tok_s": 1021.8,
+     "ttft_p50": 0.022,
+     "ttft_p95": 0.032,
+     "lat_p50": 0.248,
+     "lat_p95": 0.457,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.98,
+     "out_tok_s": 1807.4,
+     "ttft_p50": 0.022,
+     "ttft_p95": 0.051,
+     "lat_p50": 0.286,
+     "lat_p95": 0.486,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.19,
+     "out_tok_s": 2074.2,
+     "ttft_p50": 0.064,
+     "ttft_p95": 0.241,
+     "lat_p50": 0.458,
+     "lat_p95": 0.943,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 2.83,
+     "out_tok_s": 2372.1,
+     "ttft_p50": 0.108,
+     "ttft_p95": 0.471,
+     "lat_p50": 0.785,
+     "lat_p95": 1.667,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.03,
+     "out_tok_s": 2198.7,
+     "ttft_p50": 0.476,
+     "ttft_p95": 0.497,
+     "lat_p50": 0.794,
+     "lat_p95": 1.007,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "9b-q4km --no-int8",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [
+    "--no-int8"
+   ],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 3.48,
+     "out_tok_s": 175.5,
+     "ttft_p50": 0.016,
+     "ttft_p95": 0.022,
+     "lat_p50": 0.179,
+     "lat_p95": 0.36,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 2.49,
+     "out_tok_s": 933.1,
+     "ttft_p50": 0.027,
+     "ttft_p95": 0.054,
+     "lat_p50": 0.287,
+     "lat_p95": 0.51,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 2.36,
+     "out_tok_s": 1511.2,
+     "ttft_p50": 0.03,
+     "ttft_p95": 0.067,
+     "lat_p50": 0.321,
+     "lat_p95": 0.623,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.87,
+     "out_tok_s": 1598.6,
+     "ttft_p50": 0.093,
+     "ttft_p95": 0.333,
+     "lat_p50": 0.627,
+     "lat_p95": 1.233,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 3.76,
+     "out_tok_s": 1780.0,
+     "ttft_p50": 0.144,
+     "ttft_p95": 0.613,
+     "lat_p50": 1.103,
+     "lat_p95": 2.193,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.23,
+     "out_tok_s": 1918.5,
+     "ttft_p50": 0.525,
+     "ttft_p95": 0.631,
+     "lat_p50": 0.988,
+     "lat_p95": 1.212,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "27b-ud-q4kxl int8 (default)",
+   "model": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+   "flags": [],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 6.98,
+     "out_tok_s": 55.5,
+     "ttft_p50": 0.038,
+     "ttft_p95": 0.051,
+     "lat_p50": 0.381,
+     "lat_p95": 0.559,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 6.34,
+     "out_tok_s": 266.0,
+     "ttft_p50": 0.072,
+     "ttft_p95": 0.217,
+     "lat_p50": 0.633,
+     "lat_p95": 1.354,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 6.03,
+     "out_tok_s": 430.5,
+     "ttft_p50": 0.089,
+     "ttft_p95": 0.48,
+     "lat_p50": 0.81,
+     "lat_p95": 1.649,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 7.07,
+     "out_tok_s": 483.8,
+     "ttft_p50": 0.177,
+     "ttft_p95": 0.836,
+     "lat_p50": 1.426,
+     "lat_p95": 3.11,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 9.42,
+     "out_tok_s": 541.8,
+     "ttft_p50": 1.407,
+     "ttft_p95": 2.027,
+     "lat_p50": 2.574,
+     "lat_p95": 4.191,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 3.35,
+     "out_tok_s": 496.5,
+     "ttft_p50": 0.902,
+     "ttft_p95": 2.379,
+     "lat_p50": 2.403,
+     "lat_p95": 3.059,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "27b-ud-q4kxl --no-int8",
+   "model": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+   "flags": [
+    "--no-int8"
+   ],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 7.26,
+     "out_tok_s": 54.0,
+     "ttft_p50": 0.05,
+     "ttft_p95": 0.07,
+     "lat_p50": 0.369,
+     "lat_p95": 0.576,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 7.2,
+     "out_tok_s": 233.7,
+     "ttft_p50": 0.106,
+     "ttft_p95": 0.303,
+     "lat_p50": 0.746,
+     "lat_p95": 1.58,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 7.85,
+     "out_tok_s": 333.3,
+     "ttft_p50": 0.136,
+     "ttft_p95": 0.553,
+     "lat_p50": 1.119,
+     "lat_p95": 2.266,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 8.82,
+     "out_tok_s": 389.7,
+     "ttft_p50": 0.211,
+     "ttft_p95": 1.077,
+     "lat_p50": 1.836,
+     "lat_p95": 3.984,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 13.51,
+     "out_tok_s": 377.8,
+     "ttft_p50": 2.148,
+     "ttft_p95": 2.667,
+     "lat_p50": 3.941,
+     "lat_p95": 6.344,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 4.25,
+     "out_tok_s": 395.1,
+     "ttft_p50": 1.184,
+     "ttft_p95": 3.252,
+     "lat_p50": 3.276,
+     "lat_p95": 3.966,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "9b-q4km lora: base requests",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [
+    "--lora",
+    "a0=models/loras/nimble-9b",
+    "--lora",
+    "a1=models/loras/nimble-9b",
+    "--lora",
+    "a2=models/loras/nimble-9b",
+    "--lora",
+    "a3=models/loras/nimble-9b"
+   ],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 3.35,
+     "out_tok_s": 180.9,
+     "ttft_p50": 0.013,
+     "ttft_p95": 0.018,
+     "lat_p50": 0.181,
+     "lat_p95": 0.346,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 2.16,
+     "out_tok_s": 1054.4,
+     "ttft_p50": 0.022,
+     "ttft_p95": 0.034,
+     "lat_p50": 0.237,
+     "lat_p95": 0.443,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.94,
+     "out_tok_s": 1846.6,
+     "ttft_p50": 0.022,
+     "ttft_p95": 0.048,
+     "lat_p50": 0.283,
+     "lat_p95": 0.473,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.16,
+     "out_tok_s": 2113.1,
+     "ttft_p50": 0.065,
+     "ttft_p95": 0.238,
+     "lat_p50": 0.458,
+     "lat_p95": 0.929,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 2.81,
+     "out_tok_s": 2391.3,
+     "ttft_p50": 0.098,
+     "ttft_p95": 0.474,
+     "lat_p50": 0.796,
+     "lat_p95": 1.549,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.01,
+     "out_tok_s": 2231.3,
+     "ttft_p50": 0.466,
+     "ttft_p95": 0.49,
+     "lat_p50": 0.784,
+     "lat_p95": 0.995,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "9b-q4km lora: one adapter",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [
+    "--lora",
+    "a0=models/loras/nimble-9b",
+    "--lora",
+    "a1=models/loras/nimble-9b",
+    "--lora",
+    "a2=models/loras/nimble-9b",
+    "--lora",
+    "a3=models/loras/nimble-9b"
+   ],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 2.81,
+     "out_tok_s": 161.1,
+     "ttft_p50": 0.015,
+     "ttft_p95": 0.019,
+     "lat_p50": 0.171,
+     "lat_p95": 0.266,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 2.15,
+     "out_tok_s": 872.0,
+     "ttft_p50": 0.025,
+     "ttft_p95": 0.036,
+     "lat_p50": 0.251,
+     "lat_p95": 0.415,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.94,
+     "out_tok_s": 1470.5,
+     "ttft_p50": 0.024,
+     "ttft_p95": 0.059,
+     "lat_p50": 0.289,
+     "lat_p95": 0.559,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.36,
+     "out_tok_s": 1550.4,
+     "ttft_p50": 0.051,
+     "ttft_p95": 0.298,
+     "lat_p50": 0.517,
+     "lat_p95": 0.983,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 3.13,
+     "out_tok_s": 1778.9,
+     "ttft_p50": 0.11,
+     "ttft_p95": 0.563,
+     "lat_p50": 0.946,
+     "lat_p95": 1.68,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.18,
+     "out_tok_s": 1526.7,
+     "ttft_p50": 0.567,
+     "ttft_p95": 0.59,
+     "lat_p50": 0.935,
+     "lat_p95": 1.061,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "9b-q4km lora: four adapters",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [
+    "--lora",
+    "a0=models/loras/nimble-9b",
+    "--lora",
+    "a1=models/loras/nimble-9b",
+    "--lora",
+    "a2=models/loras/nimble-9b",
+    "--lora",
+    "a3=models/loras/nimble-9b"
+   ],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 2.88,
+     "out_tok_s": 163.4,
+     "ttft_p50": 0.014,
+     "ttft_p95": 0.021,
+     "lat_p50": 0.173,
+     "lat_p95": 0.264,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 2.14,
+     "out_tok_s": 859.0,
+     "ttft_p50": 0.025,
+     "ttft_p95": 0.033,
+     "lat_p50": 0.243,
+     "lat_p95": 0.423,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.94,
+     "out_tok_s": 1497.5,
+     "ttft_p50": 0.024,
+     "ttft_p95": 0.048,
+     "lat_p50": 0.289,
+     "lat_p95": 0.547,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.35,
+     "out_tok_s": 1562.5,
+     "ttft_p50": 0.053,
+     "ttft_p95": 0.286,
+     "lat_p50": 0.542,
+     "lat_p95": 0.952,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 3.17,
+     "out_tok_s": 1761.0,
+     "ttft_p50": 0.106,
+     "ttft_p95": 0.566,
+     "lat_p50": 0.956,
+     "lat_p95": 1.701,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.18,
+     "out_tok_s": 1576.3,
+     "ttft_p50": 0.33,
+     "ttft_p95": 0.599,
+     "lat_p50": 0.949,
+     "lat_p95": 1.077,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "9b-q4km json_object",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 2.9,
+     "out_tok_s": 172.9,
+     "ttft_p50": 0.014,
+     "ttft_p95": 0.017,
+     "lat_p50": 0.174,
+     "lat_p95": 0.284,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 2.17,
+     "out_tok_s": 923.5,
+     "ttft_p50": 0.023,
+     "ttft_p95": 0.033,
+     "lat_p50": 0.259,
+     "lat_p95": 0.443,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.84,
+     "out_tok_s": 1670.0,
+     "ttft_p50": 0.022,
+     "ttft_p95": 0.052,
+     "lat_p50": 0.265,
+     "lat_p95": 0.472,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.14,
+     "out_tok_s": 1863.2,
+     "ttft_p50": 0.05,
+     "ttft_p95": 0.24,
+     "lat_p50": 0.494,
+     "lat_p95": 0.821,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 2.69,
+     "out_tok_s": 2195.9,
+     "ttft_p50": 0.088,
+     "ttft_p95": 0.472,
+     "lat_p50": 0.814,
+     "lat_p95": 1.461,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.03,
+     "out_tok_s": 1969.4,
+     "ttft_p50": 0.47,
+     "ttft_p95": 0.496,
+     "lat_p50": 0.803,
+     "lat_p95": 0.958,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "9b-q4km logprobs top 5",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 3.45,
+     "out_tok_s": 175.5,
+     "ttft_p50": 0.014,
+     "ttft_p95": 0.019,
+     "lat_p50": 0.182,
+     "lat_p95": 0.357,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 2.24,
+     "out_tok_s": 1014.0,
+     "ttft_p50": 0.022,
+     "ttft_p95": 0.032,
+     "lat_p50": 0.246,
+     "lat_p95": 0.456,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.98,
+     "out_tok_s": 1804.4,
+     "ttft_p50": 0.021,
+     "ttft_p95": 0.049,
+     "lat_p50": 0.273,
+     "lat_p95": 0.488,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.21,
+     "out_tok_s": 2033.1,
+     "ttft_p50": 0.071,
+     "ttft_p95": 0.239,
+     "lat_p50": 0.471,
+     "lat_p95": 0.963,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 2.82,
+     "out_tok_s": 2347.2,
+     "ttft_p50": 0.102,
+     "ttft_p95": 0.473,
+     "lat_p50": 0.789,
+     "lat_p95": 1.554,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.03,
+     "out_tok_s": 2184.5,
+     "ttft_p50": 0.466,
+     "ttft_p95": 0.494,
+     "lat_p50": 0.788,
+     "lat_p95": 1.01,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "9b-q4km --ngram",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [
+    "--ngram"
+   ],
+   "result": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 3.27,
+     "out_tok_s": 185.2,
+     "ttft_p50": 0.013,
+     "ttft_p95": 0.017,
+     "lat_p50": 0.17,
+     "lat_p95": 0.342,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 2.13,
+     "out_tok_s": 1065.6,
+     "ttft_p50": 0.022,
+     "ttft_p95": 0.032,
+     "lat_p50": 0.234,
+     "lat_p95": 0.437,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.93,
+     "out_tok_s": 1853.6,
+     "ttft_p50": 0.022,
+     "ttft_p95": 0.049,
+     "lat_p50": 0.281,
+     "lat_p95": 0.473,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.19,
+     "out_tok_s": 2094.3,
+     "ttft_p50": 0.065,
+     "ttft_p95": 0.235,
+     "lat_p50": 0.469,
+     "lat_p95": 0.927,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 2.79,
+     "out_tok_s": 2393.8,
+     "ttft_p50": 0.104,
+     "ttft_p95": 0.464,
+     "lat_p50": 0.779,
+     "lat_p95": 1.542,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.08,
+     "out_tok_s": 2139.9,
+     "ttft_p50": 0.345,
+     "ttft_p95": 0.558,
+     "lat_p50": 0.83,
+     "lat_p95": 1.044,
+     "first_error": null
+    }
+   ]
+  },
+  {
+   "name": "9b-q4km copy prompts",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [
+    "--max-seqs",
+    "16"
+   ],
+   "result": [
+    "400 tokens in 2.19s = 182 tok/s",
+    "400 tokens in 2.09s = 191 tok/s",
+    "83 tokens in 0.47s = 178 tok/s"
+   ]
+  },
+  {
+   "name": "9b-q4km copy prompts --ngram",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [
+    "--max-seqs",
+    "16",
+    "--ngram"
+   ],
+   "result": [
+    "400 tokens in 0.60s = 662 tok/s",
+    "400 tokens in 0.56s = 719 tok/s",
+    "83 tokens in 0.16s = 510 tok/s"
+   ]
+  },
+  {
+   "name": "9b-q4km 16 copy requests at once",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [],
+   "result": [
+    "16 copy requests at once: 4769 tokens in 2.30s = 2072 tok/s",
+    "16 copy requests at once: 4769 tokens in 1.98s = 2410 tok/s",
+    "16 copy requests at once: 4769 tokens in 1.99s = 2398 tok/s"
+   ]
+  },
+  {
+   "name": "9b-q4km 16 copy requests at once --ngram",
+   "model": "Qwen3.5-9B-Q4_K_M.gguf",
+   "flags": [
+    "--ngram"
+   ],
+   "result": [
+    "16 copy requests at once: 4769 tokens in 1.34s = 3557 tok/s",
+    "16 copy requests at once: 4769 tokens in 1.05s = 4525 tok/s",
+    "16 copy requests at once: 4769 tokens in 1.04s = 4602 tok/s"
+   ]
+  },
+  {
+   "name": "27b copy prompts",
+   "model": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+   "flags": [
+    "--max-seqs",
+    "16"
+   ],
+   "result": [
+    "400 tokens in 6.57s = 61 tok/s",
+    "400 tokens in 6.53s = 61 tok/s",
+    "116 tokens in 1.95s = 59 tok/s"
+   ]
+  },
+  {
+   "name": "27b copy prompts --mtp 2",
+   "model": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+   "flags": [
+    "--max-seqs",
+    "16",
+    "--mtp",
+    "2"
+   ],
+   "result": [
+    "400 tokens in 2.80s = 143 tok/s",
+    "400 tokens in 2.71s = 148 tok/s",
+    "116 tokens in 0.91s = 128 tok/s"
+   ]
+  },
+  {
+   "name": "27b copy prompts --ngram",
+   "model": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+   "flags": [
+    "--max-seqs",
+    "16",
+    "--ngram"
+   ],
+   "result": [
+    "400 tokens in 1.71s = 233 tok/s",
+    "400 tokens in 1.70s = 236 tok/s",
+    "116 tokens in 1.00s = 116 tok/s"
+   ]
+  }
+ ]
+}

@@ -968,7 +968,7 @@ extern "C" __global__ void gdn_norm(const bf16* __restrict__ proj, int pstride, 
     const Fp8Out fo{fq, fs, fmode, frows};
     const int t = blockIdx.x, lane = threadIdx.x & 31;
     const int sq = tok_seq[t];
-    if (cu[sq + 1] - cu[sq] == 1 || is_spec(outs, spec, sq)) return;  // finished by gdn_one
+    if (cu[sq + 1] - cu[sq] == 1 || is_spec(outs, spec, sq)) return;  // finished by gdn_one or gdn_decode
 #pragma unroll 2
     for (int h = threadIdx.x >> 5; h < Hv; h += blockDim.x >> 5) {
         float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1589,7 +1589,7 @@ __device__ __forceinline__ void wg_o(float* d, const uint32_t* a, uint64_t db) {
 }
 #endif
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 __device__ __forceinline__ void mbar_init(uint32_t bar, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar), "r"(count));
 }
@@ -1620,6 +1620,191 @@ __device__ __forceinline__ void mbar_wait(uint32_t bar, int parity) {
         : "memory");
 }
 #endif
+
+// gdn_one's math for the step's first `seqs` sequences (one-token and
+// verifying rows), built to keep memory busy: persistent blocks of 256
+// threads take (sequence, value head) items in turn, and while one item
+// computes, the next nbuf - 1 items' states (32 KB each in bf16, contiguous)
+// load into shared memory, nbuf of 2 or 3 buffers. Thread (warp w,
+// lane l) holds columns 8 (l % 16) .. + 7 of rows l / 16 + 2 w + 16 i,
+// i < 8, so a warp reads two whole rows per step.
+// With kS = k^T S and qS = q^T S of the decayed state, the update needs no
+// second pass:
+//   delta = (v - kS) * beta;  o = qS + delta (q . k);  S += k delta^T
+extern "C" __global__ void __launch_bounds__(256, 2) gdn_decode(GDN_ARGS, int seqs, int nbuf) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    extern __shared__ __align__(128) unsigned char dsm[];
+    __shared__ float qs[GDN_DIM], ks[GDN_DIM], ds[GDN_DIM], ys[GDN_DIM], red[2][8][GDN_DIM], sh[32];
+    __shared__ __align__(8) uint64_t full[3];
+    const Fp8Out fo{fq, fs, fmode, frows};
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int col = 8 * (lane & 15), row0 = (lane >> 4) + 2 * warp;
+    const int bytes = (state_bf16 ? 2 : 4) * GDN_DIM * GDN_DIM;
+    const int items = seqs * Hv;
+    const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(full), buf0 = (uint32_t)__cvta_generic_to_shared(dsm);
+    auto state_at = [&](int slot, int h) { return (size_t)slot * Hv + h; };
+    // Every thread issues its share of item n's state load as 16-byte
+    // cp.async copies that arrive on the item's barrier when they land (a
+    // fresh or empty sequence's just arrive). TMA's bulk copy would be one
+    // instruction, but a kernel using it costs about 14 MB of device memory
+    // per CUDA graph node.
+    auto issue = [&](int n) {
+        const int it = blockIdx.x + n * gridDim.x;
+        if (it >= items) return;
+        const int s = it / Hv, h = it % Hv, b = n % nbuf;
+        const uint32_t bar = bar0 + 8 * b;
+        if (!fresh[s] && cu[s] < cu[s + 1]) {
+            const char* src = (const char*)state + state_at(slots[s], h) * bytes;
+            for (int c = tid; c < bytes / 16; c += blockDim.x)
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(buf0 + b * bytes + 16 * c),
+                             "l"(src + 16 * c)
+                             : "memory");
+            mbar_arrive_cp(bar);
+        } else {
+            mbar_arrive(bar);
+        }
+    };
+    if (tid == 0)
+        for (int b = 0; b < nbuf; b++) mbar_init(bar0 + 8 * b, blockDim.x);
+    __syncthreads();
+    for (int n = 0; n < nbuf - 1; n++) issue(n);
+    const float qscale = rsqrtf((float)GDN_DIM);
+    for (int n = 0; blockIdx.x + n * gridDim.x < items; n++) {
+        const int it = blockIdx.x + n * gridDim.x, s = it / Hv, h = it % Hv, b = n % nbuf;
+        const int t0 = cu[s], t1 = cu[s + 1];
+        const bool is_fresh = fresh[s] != 0;
+        mbar_wait(bar0 + 8 * b, (n / nbuf) & 1);
+        float r[8][8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int at = (row0 + 16 * i) * GDN_DIM + col;
+            if (is_fresh) {
+#pragma unroll
+                for (int e = 0; e < 8; e++) r[i][e] = 0.f;
+            } else if (state_bf16) {
+                unpack8(reinterpret_cast<const uint4*>(dsm + b * bytes)[at / 8], r[i]);
+            } else {
+                const float4* p = reinterpret_cast<const float4*>(dsm + b * bytes) + at / 4;
+                const float4 x = p[0], y = p[1];
+                r[i][0] = x.x, r[i][1] = x.y, r[i][2] = x.z, r[i][3] = x.w;
+                r[i][4] = y.x, r[i][5] = y.y, r[i][6] = y.z, r[i][7] = y.w;
+            }
+        }
+        __syncthreads();  // buffer b is read; the buffer of item n - 1 too
+        issue(n + nbuf - 1);
+        if (t0 == t1) continue;
+        const int kh = tiled ? h % Hk : h / (Hv / Hk);
+        const bool keep = is_spec(outs, spec, s);
+        const bool round_qk = ((t1 - t0) > 1 && !keep) || is_fresh;
+        const float na = neg_a[h], db = dt_bias[h];
+        for (int t = t0; t < t1; t++) {
+            const bf16* crow = conv + (size_t)t * C;
+            const bf16* prow = proj + (size_t)t * pstride + C;
+            float q = 0.f, k = 0.f, v = 0.f;
+            if (tid < GDN_DIM) {
+                q = b2f(crow[kh * GDN_DIM + tid]);
+                k = b2f(crow[Hk * GDN_DIM + kh * GDN_DIM + tid]);
+                v = b2f(crow[2 * Hk * GDN_DIM + h * GDN_DIM + tid]);
+            }
+            const float bb = b2f(prow[Hv * GDN_DIM + h]), a = b2f(prow[Hv * GDN_DIM + Hv + h]);
+            const float qq = block_sum(q * q, sh), kk = block_sum(k * k, sh);
+            q = q / sqrtf(qq + 1e-6f);
+            k = k / sqrtf(kk + 1e-6f);
+            if (round_qk) {
+                q = rbf(q);
+                k = rbf(k);
+            }
+            q *= qscale;
+            if (tid < GDN_DIM) {
+                qs[tid] = q;
+                ks[tid] = k;
+            }
+            const float qk = block_sum(tid < GDN_DIM ? q * k : 0.f, sh);  // its syncs publish qs and ks
+            const float beta = 1.f / (1.f + expf(-bb));
+            const float x = a + db;
+            const float decay = expf(na * (fmaxf(x, 0.f) + logf(1.f + expf(-fabsf(x)))));
+            float kS[8] = {}, qS[8] = {};
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float ki = ks[row0 + 16 * i], qi = qs[row0 + 16 * i];
+#pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    r[i][e] *= decay;
+                    kS[e] += ki * r[i][e];
+                    qS[e] += qi * r[i][e];
+                }
+            }
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                kS[e] += __shfl_xor_sync(0xffffffffu, kS[e], 16);
+                qS[e] += __shfl_xor_sync(0xffffffffu, qS[e], 16);
+            }
+            if (lane < 16) {
+#pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    red[0][warp][col + e] = kS[e];
+                    red[1][warp][col + e] = qS[e];
+                }
+            }
+            __syncthreads();
+            if (tid < GDN_DIM) {
+                float ksum = 0.f, qsum = 0.f;
+#pragma unroll
+                for (int w = 0; w < 8; w++) {
+                    ksum += red[0][w][tid];
+                    qsum += red[1][w][tid];
+                }
+                const float delta = (v - ksum) * beta;
+                ds[tid] = delta;
+                ys[tid] = rbf(qsum + delta * qk);
+            }
+            __syncthreads();
+            float dl[8];
+#pragma unroll
+            for (int e = 0; e < 8; e++) dl[e] = ds[col + e];
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+#pragma unroll
+                for (int e = 0; e < 8; e++) r[i][e] += ks[row0 + 16 * i] * dl[e];
+            if (warp == 0) {
+                float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                if (lane < 16)
+#pragma unroll
+                    for (int e = 0; e < 8; e++) o[e] = ys[col + e];
+                gdn_gate8(o, t, h, Hv, proj, pstride, C, norm_w, out, eps, fo, fmode, lane);
+            }
+            if (keep) {
+                // The state after each token, so rejected drafts cost nothing.
+                const size_t kb = state_at(outs[(size_t)s * spec + (t - t0)], h) * GDN_DIM * GDN_DIM;
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    const size_t at = kb + (row0 + 16 * i) * GDN_DIM + col;
+                    if (state_bf16) {
+                        *reinterpret_cast<uint4*>((bf16*)state + at) = pack8(r[i]);
+                    } else {
+                        float4* p = reinterpret_cast<float4*>((float*)state + at);
+                        p[0] = make_float4(r[i][0], r[i][1], r[i][2], r[i][3]);
+                        p[1] = make_float4(r[i][4], r[i][5], r[i][6], r[i][7]);
+                    }
+                }
+            }
+        }
+        if (keep) continue;
+        const size_t sb = state_at(slots[s], h) * GDN_DIM * GDN_DIM;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const size_t at = sb + (row0 + 16 * i) * GDN_DIM + col;
+            if (state_bf16) {
+                *reinterpret_cast<uint4*>((bf16*)state + at) = pack8(r[i]);
+            } else {
+                float4* p = reinterpret_cast<float4*>((float*)state + at);
+                p[0] = make_float4(r[i][0], r[i][1], r[i][2], r[i][3]);
+                p[1] = make_float4(r[i][4], r[i][5], r[i][6], r[i][7]);
+            }
+        }
+    }
+#endif
+}
 
 // Warp-specialized as FlashAttention 3 is, and persistent: a block per SM
 // loops over work items (64 query tokens of two heads of one key/value
@@ -1911,6 +2096,7 @@ __device__ __forceinline__ void attn_ws_body(ATTN_FLASH_ARGS, const CUtensorMap*
 #define ATTN_WS_PASS ATTN_FLASH_PASS, &kmap, &vmap, nslots
 extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g4(ATTN_WS_ARGS) { attn_ws_body<4>(ATTN_WS_PASS); }
 extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g6(ATTN_WS_ARGS) { attn_ws_body<6>(ATTN_WS_PASS); }
+#include "attn_sm100.cuh"
 
 
 // Combines the key ranges of split decode attention (attn_body with `part`)

@@ -132,10 +132,66 @@ impl FaShape {
 /// warpgroups' queries and two stages of keys and values, 64 x 256 bf16
 /// each, the stages' mbarriers and 8 bytes per consumer thread.
 pub const WS_SMEM: usize = 6 * 64 * HEAD_DIM * 2 + 128 + 8 * 256;
-/// Whether prompts take the wgmma flash kernel: Hopper, a bf16 cache and
-/// groups of 4 or 6.
-pub fn fa_wgmma(g: usize, arch: u32, kv_fp8: bool) -> bool {
-    arch == 90 && !kv_fp8 && matches!(g, 4 | 6)
+/// Dynamic shared memory of attn_tc_g<G> (TC_SMEM in attn_sm100.cuh): 128
+/// queries, two stages each of 64 keys and values (256 bf16 per row), the
+/// mbarriers, row scales and sums, and the tensor memory address.
+pub const TC_SMEM: usize = 3 * 128 * HEAD_DIM * 2 + 256 + 3 * 128 * 4 + 16;
+
+/// The warp-specialized flash kernel that prompts take when the GPU has one
+/// (a bf16 cache and groups of 4 or 6): wgmma on Hopper, tcgen05 on B200.
+/// Both read the cache through TMA maps.
+#[derive(Clone, Copy, Debug)]
+pub struct FaWs {
+    pub blackwell: bool,
+    pub group: usize,
+}
+impl FaWs {
+    pub fn get(g: usize, arch: u32, kv_fp8: bool) -> Option<Self> {
+        if std::env::var_os("POCKET_NO_WS").is_some_and(|v| !v.is_empty()) {
+            return None;
+        }
+        let blackwell = match arch {
+            90 => false,
+            100 => true,
+            _ => return None,
+        };
+        (!kv_fp8 && matches!(g, 4 | 6)).then_some(Self {
+            blackwell,
+            group: g,
+        })
+    }
+    pub fn name(&self) -> String {
+        let kind = if self.blackwell { "tc" } else { "ws" };
+        format!("attn_{kind}_g{}", self.group)
+    }
+    pub fn threads(&self) -> u32 {
+        if self.blackwell { 320 } else { 384 }
+    }
+    pub fn smem(&self) -> usize {
+        if self.blackwell { TC_SMEM } else { WS_SMEM }
+    }
+    /// Hopper's is persistent, a block per SM; Blackwell's takes a block per
+    /// 128 queries of a head (bounded here; blocks past the work exit).
+    pub fn grid(&self, tokens: usize, seqs: usize, hq: usize, sms: usize) -> (u32, u32, u32) {
+        if self.blackwell {
+            (((tokens.div_ceil(128) + seqs) * hq) as u32, 1, 1)
+        } else {
+            (sms as u32, 1, 1)
+        }
+    }
+}
+
+/// gdn_decode's static shared memory: q, k, delta and outputs, the column
+/// sums of 8 warps, block_sum's slots and the buffers' barriers.
+const GDN_DECODE_STATIC: usize = 4 * GDN_DIM * 4 + 2 * 8 * GDN_DIM * 4 + 32 * 4 + 3 * 8;
+/// How gdn_decode runs: state buffers per block and blocks per SM, or None
+/// where two buffers do not fit (an f32 state on RTX 50-series), which
+/// leaves gdn_recurrent.
+pub fn gdn_decode_shape(state_bf16: bool, smem_per_sm: usize) -> Option<(usize, usize)> {
+    let bytes = if state_bf16 { 2 } else { 4 } * GDN_DIM * GDN_DIM;
+    let block = |nbuf: usize| nbuf * bytes + GDN_DECODE_STATIC + 1024;
+    let nbuf = (2..=3).rev().find(|&n| block(n) <= smem_per_sm)?;
+    Some((nbuf, (smem_per_sm / block(nbuf)).clamp(1, 2)))
 }
 
 /// Dynamic shared memory of the two-pass chunked gated delta rule
@@ -482,6 +538,7 @@ struct Kernels {
     silu_mul: Kernel,
     gdn_conv: Kernel,
     gdn_recurrent: Kernel,
+    gdn_decode: Kernel,
     /// The recurrence for steps with prompt tokens, chunked on tensor cores
     /// in two passes (see gdn_prep in qwen35.cu), gdn_scan with 1, 2 or 4
     /// blocks per head; and its gated norm.
@@ -498,9 +555,9 @@ struct Kernels {
     attn_flash8: Kernel,
     fa_shape: FaShape,
     fa_shape8: FaShape,
-    /// On Hopper: flash attention on wgmma, warp-specialized with TMA loads,
-    /// for a bf16 cache.
-    attn_wg: Option<Kernel>,
+    /// On Hopper and B200: warp-specialized flash attention with TMA loads,
+    /// for a bf16 cache (see [`FaWs`]).
+    attn_wg: Option<(Kernel, FaWs)>,
     /// FP8 copies of bf16 rows (the flash kernel's output, for FP8 layers).
     fp8_rows: Kernel,
     /// Combines split decode attention's key ranges.
@@ -908,6 +965,20 @@ impl Model {
             silu_mul: gpu.kernel("silu_mul")?,
             gdn_conv: gpu.kernel("gdn_conv")?,
             gdn_recurrent: gpu.kernel("gdn_recurrent")?,
+            gdn_decode: {
+                let k = gpu.kernel("gdn_decode")?;
+                let most = [(false, 4), (true, 2)]
+                    .into_iter()
+                    .filter_map(|(bf16, size)| {
+                        gdn_decode_shape(bf16, gpu.smem_per_sm)
+                            .map(|(nbuf, _)| nbuf * size * GDN_DIM * GDN_DIM)
+                    })
+                    .max();
+                if let Some(bytes) = most {
+                    gpu.set_smem(k, bytes)?;
+                }
+                k
+            },
             gdn_prep: {
                 let k = gpu.kernel("gdn_prep")?;
                 gpu.set_smem(k, GDN_PREP_SMEM)?;
@@ -942,10 +1013,10 @@ impl Model {
             },
             fa_shape: fa_shape(cfg.hq / cfg.hkv, gpu.arch, false),
             fa_shape8: fa_shape(cfg.hq / cfg.hkv, gpu.arch, true),
-            attn_wg: if fa_wgmma(cfg.hq / cfg.hkv, gpu.arch, false) {
-                let k = gpu.kernel(&format!("attn_ws_g{}", cfg.hq / cfg.hkv))?;
-                gpu.set_smem(k, WS_SMEM)?;
-                Some(k)
+            attn_wg: if let Some(ws) = FaWs::get(cfg.hq / cfg.hkv, gpu.arch, false) {
+                let k = gpu.kernel(&ws.name())?;
+                gpu.set_smem(k, ws.smem())?;
+                Some((k, ws))
             } else {
                 None
             },
@@ -1069,7 +1140,7 @@ impl State {
                 s.vs.push(gpu.alloc_zeroed(heads * 4)?);
             }
         }
-        if fa_wgmma(cfg.hq / cfg.hkv, gpu.arch, kv_fp8) {
+        if FaWs::get(cfg.hq / cfg.hkv, gpu.arch, kv_fp8).is_some() {
             for (k, v) in s.kc.iter().zip(&s.vc) {
                 let map = |ptr| {
                     gpu.tensor_map_3d(
@@ -1575,7 +1646,7 @@ struct View {
     /// The step's adapters, for the decoder layers.
     lora: Option<crate::lora::StepLora>,
     /// Leading sequences of one token or verifying drafts, which a prompt
-    /// step runs through gdn_recurrent rather than the chunked kernels.
+    /// step runs through gdn_decode rather than the chunked kernels.
     head: usize,
 }
 
@@ -2073,6 +2144,29 @@ impl Model {
                         F(eps),
                         I(c.tiled_v as i32),
                     ];
+                    // gdn_one's math for the first n sequences (see gdn_decode).
+                    let decode = |n: usize| {
+                        let tail = [a.fp8_args(|f| &f.core, t).as_slice(), &outs].concat();
+                        match gdn_decode_shape(st.state_bf16, gpu.smem_per_sm) {
+                            Some((nbuf, per_sm)) => {
+                                let bytes = if st.state_bf16 { 2 } else { 4 } * GDN_DIM * GDN_DIM;
+                                gpu.launch(
+                                    k.gdn_decode,
+                                    ((n * hv).min(gpu.sms * per_sm) as u32, 1, 1),
+                                    256,
+                                    (nbuf * bytes) as u32,
+                                    &[&args[..], &tail, &[I(n as i32), I(nbuf as i32)]].concat(),
+                                )
+                            }
+                            None => gpu.launch(
+                                k.gdn_recurrent,
+                                (n as u32, hv as u32, 1),
+                                2 * GDN_DIM as u32,
+                                0,
+                                &[&args[..], &tail].concat(),
+                            ),
+                        }
+                    };
                     if t > s {
                         // Prompt tokens: chunked on tensor cores, in two
                         // passes, then the norm.
@@ -2104,18 +2198,12 @@ impl Model {
                             .concat(),
                         )?;
                         // The step's leading one-token and verifying rows take
-                        // the recurrent kernel (its blocks need no shared
-                        // memory, so many more run at once); the chunked scan
-                        // takes the rest, from sequence `d` on.
+                        // gdn_decode (its blocks need no shared memory, so
+                        // many more run at once); the chunked scan takes the
+                        // rest, from sequence `d` on.
                         let d = v.head.min(s);
                         if d > 0 {
-                            gpu.launch(
-                                k.gdn_recurrent,
-                                (d as u32, hv as u32, 1),
-                                2 * GDN_DIM as u32,
-                                0,
-                                &[args.as_slice(), &a.fp8_args(|f| &f.core, t), &outs].concat(),
-                            )?;
+                            decode(d)?;
                         }
                         if d < s {
                             let at = |p: u64, per: usize| P(p + (4 * per * d) as u64);
@@ -2164,13 +2252,7 @@ impl Model {
                             .concat(),
                         )?;
                     } else {
-                        gpu.launch(
-                            k.gdn_recurrent,
-                            (si, hv as u32, 1),
-                            2 * GDN_DIM as u32,
-                            0,
-                            &[args.as_slice(), &a.fp8_args(|f| &f.core, t), &outs].concat(),
-                        )?;
+                        decode(s)?;
                     }
                     w_out.forward(
                         gpu,
@@ -2296,7 +2378,9 @@ impl Model {
                         let sh = if st.kv_fp8 { k.fa_shape8 } else { k.fa_shape };
                         let maps = st.maps.get(*cache);
                         let (kern, grid, threads, smem) = match (k.attn_wg, maps) {
-                            (Some(wg), Some(_)) => (wg, (gpu.sms as u32, 1, 1), 384, WS_SMEM),
+                            (Some((wg, ws)), Some(_)) => {
+                                (wg, ws.grid(t, s, c.hq, gpu.sms), ws.threads(), ws.smem())
+                            }
                             _ => (
                                 if st.kv_fp8 {
                                     k.attn_flash8

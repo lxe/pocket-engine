@@ -1,5 +1,7 @@
 """Closed-loop and burst load against an OpenAI-style /v1/chat/completions endpoint (streamed): output tok/s, TTFT and
-latency percentiles. Usage: load.py URL MODEL OUT.json"""
+latency percentiles. Usage: load.py URL MODEL OUT.json
+LOAD_CASES="1:16,16:96" picks other closed-loop cases (requests in flight:total); LOAD_BURST=0 skips the burst."""
+import os
 import asyncio, json, random, sys, time
 import httpx
 
@@ -55,8 +57,10 @@ async def main():
     out = []
     async with httpx.AsyncClient(timeout=600, limits=httpx.Limits(max_connections=256)) as c:
         await one(c, "hello", 8)   # warm
-        for conc, total in ((1, 16), (8, 64), (16, 96), (32, 128), (64, 192)):
+        cases = os.environ.get("LOAD_CASES", "1:16,8:64,16:96,32:128,64:192")
+        for conc, total in (map(int, x.split(":")) for x in cases.split(",")):
             out.append(await closed(c, conc, total))
-        out.append(await burst(c, 64))
+        if os.environ.get("LOAD_BURST", "1") != "0":
+            out.append(await burst(c, 64))
     json.dump(out, open(OUT, "w"), indent=1)
 asyncio.run(main())

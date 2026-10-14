@@ -754,10 +754,11 @@ impl Gpu {
     ) -> Result<()> {
         // On AMD, decoding's 1 to 4 rows stream the weights in skinny_bf16_r*.
         #[cfg(feature = "rocm")]
-        if (1..=4).contains(&rows) && inp.is_multiple_of(32) {
+        if (1..=4).contains(&rows) && inp.is_multiple_of(8) {
+            // Four waves of two rows each per block.
             return self.launch(
                 self.skinny[rows - 1],
-                (out.div_ceil(4) as u32, 1, 1),
+                (out.div_ceil(8) as u32, 1, 1),
                 256,
                 0,
                 &[

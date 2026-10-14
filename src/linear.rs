@@ -146,21 +146,36 @@ pub struct Quants {
     pub int8_rows: usize,
     /// The activation quantizer and its int8 copy and scales.
     act8: Option<(Kernel, Buf)>,
+    /// Most rows for int8 activations, and for the quantized tensor-core
+    /// kernels before dequantizing to bf16 for cuBLAS.
+    int8_max: usize,
+    dense_rows: usize,
 }
 
 /// Widest input the int8 activation buffer holds.
 const ACT8_COLS: usize = 20_480;
-fn int8_max_rows() -> usize {
-    env_usize("POCKET_INT8_MAX_ROWS", 4096).next_multiple_of(64)
+/// Datacenter GPUs (H100, H200, B200) run bf16 at full tensor-core rate
+/// while int8 mma.sync is only twice that, so int8 pays off only for small
+/// batches there and cuBLAS takes over sooner. RTX GPUs run bf16 with f32
+/// sums at half rate, so int8 wins at every batch size.
+fn datacenter(arch: u32) -> bool {
+    matches!(arch, 90 | 100 | 103)
 }
 
 /// Rows above which a quantized matrix is dequantized to bf16 and handed to
-/// cuBLAS: decoding once then amortizes over many rows.
+/// cuBLAS: decoding once then amortizes over many rows (112 on datacenter
+/// GPUs, whose cuBLAS is faster).
 const DENSE_ROWS: usize = 160;
 /// Largest dequantized slice, in weights (bf16).
 const SCRATCH_WEIGHTS: usize = 192 << 20;
 
 impl Quants {
+    fn tune(&mut self, arch: u32) {
+        let dc = datacenter(arch);
+        self.int8_max = env_usize("POCKET_INT8_MAX_ROWS", if dc { 48 } else { 4096 });
+        self.dense_rows = env_usize("POCKET_DENSE_ROWS", if dc { 112 } else { DENSE_ROWS });
+    }
+
     pub fn get(&mut self, gpu: &Gpu, ty: GgmlType) -> Result<QuantKernels> {
         if let Some(k) = self.kernels.get(&ty) {
             return Ok(k.clone());
@@ -184,6 +199,7 @@ impl Quants {
             self.workspace = Some(gpu.alloc(SPLIT_WORKSPACE)?);
             self.finish = Some(gpu.kernel("qmma_finish")?);
             self.sms = gpu.sms;
+            self.tune(gpu.arch);
         }
         let tiled = match ty.tile_chunk() {
             Some(_) => {
@@ -237,6 +253,7 @@ impl Quants {
             self.workspace = Some(gpu.alloc(SPLIT_WORKSPACE)?);
             self.finish = Some(gpu.kernel("qmma_finish")?);
             self.sms = gpu.sms;
+            self.tune(gpu.arch);
         }
         Ok(())
     }
@@ -252,7 +269,7 @@ impl Quants {
             .values()
             .any(|k| k.tiled.as_ref().is_some_and(|t| t.mma8.is_some()));
         if self.int8_rows > 0 && int8 && self.act8.is_none() {
-            let rows = int8_max_rows();
+            let rows = self.int8_max.next_multiple_of(64);
             let bytes = rows * ACT8_COLS + ACT8_COLS / 32 * rows * 8;
             self.act8 = Some((gpu.kernel("quant_act8")?, gpu.alloc(bytes)?));
         }
@@ -306,7 +323,7 @@ impl Linear {
         let int8 = self.int8
             && q.act8.is_some()
             && rows >= q.int8_rows
-            && rows <= int8_max_rows()
+            && rows <= q.int8_max
             && self.cols <= ACT8_COLS;
         let mma8_of = |p: &Part| match p.kind {
             Kind::Tiled(ty) if int8 => q
@@ -321,7 +338,7 @@ impl Linear {
             Some((quant, buf)) if self.parts.iter().any(|p| mma8_of(p).is_some()) => {
                 let ti = MMA_TILES.iter().position(|&t| rows <= t).unwrap_or(3);
                 let mp = rows.next_multiple_of(MMA_TILES[ti]);
-                let xs = buf.ptr + (int8_max_rows() * ACT8_COLS) as u64;
+                let xs = buf.ptr + (q.int8_max.next_multiple_of(64) * ACT8_COLS) as u64;
                 let n = rows * self.cols / 8;
                 gpu.launch(
                     *quant,
@@ -519,7 +536,7 @@ impl Linear {
                         ]);
                         v
                     };
-                    if rows > DENSE_ROWS
+                    if rows > q.dense_rows
                         && mma8.is_none()
                         && let Some(sc) = &q.scratch
                     {

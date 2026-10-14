@@ -904,7 +904,7 @@ __device__ __forceinline__ uint32_t less32(uint32_t q) {
     return ((q | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
 }
 
-// qtile's loop with int8 activations. For Q4_0 and Q4_K a row's weight at
+// qtile's loop with int8 activations. For Q4_0, Q4_K and Q5_K a row's weight at
 // step s is q * sc - mn (Q4_0: sc = d, mn = 8d), so its dot product with
 // token x is sc * dx * sum(q * xq) - mn * sum(x). Q6_K's weights are
 // (q - 32) * d * sc with a scale per 16 inputs, so each step takes two

@@ -40,10 +40,21 @@ fn split_ranges(t: usize, hkv: usize, sms: usize) -> usize {
 /// take larger key tiles, and two query tiles for groups of 6 (bench-attn on
 /// an H100: groups of 4 from 123 to 158 TFLOPS, of 6 from 97 to 168).
 pub fn fa_shape(g: usize, arch: u32, fp8: bool) -> FaShape {
-    let shape = |tiles, keys, qreg| FaShape { tiles, keys, qreg };
+    let shape = |tiles, keys, qreg| FaShape {
+        tiles,
+        keys,
+        qreg,
+        mfma: false,
+    };
     match (arch, g, fp8) {
-        // AMD gfx942 (compute capability 9.4 under HIP): 64 KB per block.
-        (94, 4 | 6, false) => shape(1, 16, true),
+        // AMD gfx942 (compute capability 9.4 under HIP): attn_mfma, two
+        // query tiles and 32-key tiles.
+        (94, 4 | 6, false) => FaShape {
+            tiles: 2,
+            keys: 32,
+            qreg: true,
+            mfma: true,
+        },
         (90 | 100 | 103, 4, _) => shape(2, 64, false),
         (90 | 100 | 103, 6, _) => shape(2, 32, false),
         (_, 4, false) => shape(2, 32, true),
@@ -60,6 +71,8 @@ pub struct FaShape {
     pub keys: usize,
     /// Queries in registers (attn_groupr_; bf16 caches only).
     pub qreg: bool,
+    /// AMD's matrix cores (attn_mfma_g<G>_t<NT>: 64-lane waves, 32-key tiles).
+    pub mfma: bool,
 }
 
 impl FaShape {
@@ -72,11 +85,19 @@ impl FaShape {
             Some("r") => true,
             Some(_) => return None,
         };
-        it.next().is_none().then_some(Self { tiles, keys, qreg })
+        it.next().is_none().then_some(Self {
+            tiles,
+            keys,
+            qreg,
+            mfma: false,
+        })
     }
     /// The kernel: attn_group_g<G>_t<NT>_k<BN>, attn_group8_ for an E4M3
     /// cache, attn_groupr_ with the queries in registers.
     pub fn kernel(&self, g: usize, fp8: bool) -> String {
+        if self.mfma {
+            return format!("attn_mfma_g{g}_t{}", self.tiles);
+        }
         let f = if fp8 {
             "8"
         } else if self.qreg {
@@ -86,10 +107,19 @@ impl FaShape {
         };
         format!("attn_group{f}_g{g}_t{}_k{}", self.tiles, self.keys)
     }
+    /// Threads per block: a warp (or on AMD a 64-lane wave) per query head
+    /// and query tile.
+    pub fn threads(&self, g: usize) -> usize {
+        (if self.mfma { 64 } else { 32 }) * g * self.tiles
+    }
     /// Its dynamic shared memory: the tiles' queries for each of G heads and
     /// two buffers of BN keys and values, or, with the queries in registers,
     /// the larger of the two (the buffers reuse the queries' space).
     pub fn smem(&self, g: usize) -> usize {
+        if self.mfma {
+            // A tile of keys and one of values, transposed (attn_mfma).
+            return (self.keys * (HEAD_DIM + 8) + HEAD_DIM * (self.keys + 8)) * 2;
+        }
         let (q, kv) = (g * 16 * self.tiles, 4 * self.keys);
         (if self.qreg { q.max(kv) } else { q + kv }) * (HEAD_DIM + 8) * 2
     }
@@ -108,6 +138,13 @@ pub fn fa_wgmma(g: usize, arch: u32, kv_fp8: bool) -> bool {
 /// (GDN_PREP_SMEM and GDN_SCAN_SMEM(NS) in qwen35.cu).
 pub const GDN_PREP_SMEM: usize = 3 * 32 * 136 * 2 + 32 * 36 * 4 + 6 * 32 * 4;
 pub fn gdn_scan_smem(ns: usize) -> usize {
+    if cfg!(feature = "rocm") {
+        // gdn_mfma_smem<NS>: W, q; k transposed; U; P; D and Dk transposed;
+        // the state's columns transposed; G and the norms.
+        let vw = 128 / ns;
+        return (2 * 32 * 136 + 128 * 40 + 32 * (vw + 8) + 32 * 40 + 2 * vw * 40 + vw * 136) * 2
+            + 3 * 32 * 4;
+    }
     let vs = 128 / ns + 8;
     // AMD's 64 KB of LDS per block leaves no room for a second buffer.
     let buffers = if ns > 1 && !cfg!(feature = "rocm") {
@@ -1981,7 +2018,7 @@ impl Model {
                                     k.attn_flash
                                 },
                                 ((t.div_ceil(16 * sh.tiles) + s) as u32, c.hkv as u32, 1),
-                                (32 * group * sh.tiles) as u32,
+                                sh.threads(group) as u32,
                                 sh.smem(group),
                             ),
                         };

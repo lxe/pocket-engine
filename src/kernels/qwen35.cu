@@ -785,6 +785,27 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
         Nko[at] = sN[GC + tid];
     }
     // K K^T (warps 0-3) into A and Q K^T (warps 4-7) into P, a 16 x 16 tile each.
+#ifdef __HIP_PLATFORM_AMD__
+    {
+        // On MFMA: wave w takes tile (16 (w & 1), 16 (w >> 1)) of both.
+        const int wv = tid >> 6, ml = tid & 15, mq = (tid >> 4) & 3;
+        const int m0 = (wv & 1) * 16, n0 = (wv >> 1) * 16;
+        pe_f4 ak = {0.f, 0.f, 0.f, 0.f}, aq = ak;
+#pragma unroll
+        for (int k0 = 0; k0 < GDN_DIM; k0 += 16) {
+            const pe_s4 b = frag4(sK, GSTR, n0 + ml, k0 + 4 * mq);
+            ak = mfma16(frag4(sK, GSTR, m0 + ml, k0 + 4 * mq), b, ak);
+            aq = mfma16(frag4(sQ, GSTR, m0 + ml, k0 + 4 * mq), b, aq);
+        }
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int i = m0 + 4 * mq + e, j = n0 + ml;
+            const float gam = j <= i ? expf(sG[i] - sG[j]) : 0.f;
+            sA[i * GAS + j] = j < i ? sB[i] * gam * ak[e] : 0.f;
+            if (i < n) Po[((size_t)(c0 + i) * Hv + h) * GC + j] = f2b(qscale * gam * aq[e]);
+        }
+    }
+#else
     {
         const int m0 = (warp & 1) * 16, n0 = ((warp >> 1) & 1) * 16;
         const bf16* X = warp < 4 ? sK : sQ;
@@ -807,6 +828,7 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
                 else if (i < n) Po[((size_t)(c0 + i) * Hv + h) * GC + j] = f2b(qscale * gam * acc[nt][e]);
             }
     }
+#endif
     __syncthreads();
     // (I + A) [U | W] = [beta v | beta exp(G) k], by forward substitution: a
     // thread per column, reading A four entries at a time.
@@ -1061,6 +1083,180 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
     }
     store_state(slots[s]);
 }
+#ifdef __HIP_PLATFORM_AMD__
+// gdn_scan on AMD's matrix cores (MFMA 16x16x16 bf16, 64-lane waves): the
+// same products as gdn_scan_cols, tiled per wave. A lane holds A[m][k..k+3]
+// (m = lane % 16, k = 4 (lane / 16)), B[k..k+3][n] and C[m..m+3][n], so both
+// operands want k contiguous: K, D, Dk and the state's bf16 copy sit
+// transposed in shared memory. Wave w keeps state rows 32w .. 32w + 31 of
+// the block's columns in registers.
+#define GKT (GC + 8)  // bf16 stride of token-contiguous rows
+template <int NS>
+__host__ __device__ constexpr int gdn_mfma_smem() {
+    return (2 * GC * GSTR + GDN_DIM * GKT + GC * (GDN_DIM / NS + 8) + GC * GPSTR + 2 * (GDN_DIM / NS) * GKT +
+            (GDN_DIM / NS) * GSTR) * 2 + 3 * GC * 4;
+}
+template <int NS>
+__device__ __forceinline__ void gdn_scan_mfma(GDN_ARGS, const bf16* __restrict__ Ui, const bf16* __restrict__ Wi,
+                                              const float* __restrict__ Nqi, const float* __restrict__ Nki,
+                                              const bf16* __restrict__ Pi, const float* __restrict__ Gi,
+                                              const int* __restrict__ snaps) {
+    constexpr int VW = GDN_DIM / NS, CT = VW / 16, CW = CT / 2, VS = VW + 8;
+    static_assert(CT >= 2, "two waves share a row tile's columns");
+    extern __shared__ __align__(16) unsigned char ssm[];
+    bf16* sW = (bf16*)ssm;                // [GC][GSTR] W
+    bf16* sQ = sW + GC * GSTR;            // [GC][GSTR] q (unnormalized)
+    bf16* sKt = sQ + GC * GSTR;           // [GDN_DIM][GKT] k, transposed
+    bf16* sU = sKt + GDN_DIM * GKT;       // [GC][VS] U, this block's columns
+    bf16* sP = sU + GC * VS;              // [GC][GPSTR] P
+    bf16* sDt = sP + GC * GPSTR;          // [VW][GKT] D, transposed
+    bf16* sDkt = sDt + VW * GKT;          // [VW][GKT] D rows times exp(G_last - G_i) |k_i|^-1, transposed
+    bf16* sSt = sDkt + VW * GKT;          // [VW][GSTR] the state's columns, transposed, bf16
+    float* sG = (float*)(sSt + VW * GSTR);  // [GC] G, then Nq, Nk
+    float* sNq = sG + GC;
+    float* sNk = sNq + GC;
+    const int s = gridDim.x - 1 - blockIdx.x, h = blockIdx.y, vz = blockIdx.z, tid = threadIdx.x;
+    const int wave = tid >> 6, lane = tid & 63, lr = lane & 15, lq = lane >> 4;
+    const int t0 = cu[s], t1 = cu[s + 1];
+    if (t0 == t1) return;
+    if (t1 - t0 == 1 || is_spec(outs, spec, s)) {
+        if (vz == 0) gdn_one(s, h, GDN_PASS);
+        return;
+    }
+    const int v0 = vz * VW, kh = tiled ? h % Hk : h / (Hv / Hk);
+    const size_t base = ((size_t)slots[s] * Hv + h) * GDN_DIM * GDN_DIM;
+    const bool is_fresh = fresh[s] != 0;
+    const float qscale = rsqrtf((float)GDN_DIM);
+    // State tile (rt, ct): rows 32 wave + 16 rt + 4 lq + j, columns 16 ct + lr.
+    pe_f4 st[2][CT];
+#pragma unroll
+    for (int rt = 0; rt < 2; rt++)
+#pragma unroll
+        for (int ct = 0; ct < CT; ct++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const size_t at = base + (size_t)(32 * wave + 16 * rt + 4 * lq + j) * GDN_DIM + v0 + 16 * ct + lr;
+                st[rt][ct][j] = is_fresh ? 0.f : state_bf16 ? b2f(((const bf16*)state)[at]) : ((const float*)state)[at];
+            }
+    auto store_state_smem = [&]() {
+#pragma unroll
+        for (int rt = 0; rt < 2; rt++)
+#pragma unroll
+            for (int ct = 0; ct < CT; ct++)
+                *reinterpret_cast<uint2*>(sSt + (16 * ct + lr) * GSTR + 32 * wave + 16 * rt + 4 * lq) =
+                    pack4(st[rt][ct][0], st[rt][ct][1], st[rt][ct][2], st[rt][ct][3]);
+    };
+    auto store_state = [&](int slot) {
+        const size_t b = ((size_t)slot * Hv + h) * GDN_DIM * GDN_DIM;
+#pragma unroll
+        for (int rt = 0; rt < 2; rt++)
+#pragma unroll
+            for (int ct = 0; ct < CT; ct++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const size_t at = b + (size_t)(32 * wave + 16 * rt + 4 * lq + j) * GDN_DIM + v0 + 16 * ct + lr;
+                    if (state_bf16) ((bf16*)state)[at] = f2b(st[rt][ct][j]);
+                    else ((float*)state)[at] = st[rt][ct][j];
+                }
+    };
+    store_state_smem();
+    bool zero_state = is_fresh;
+    // This wave's output tiles: token rows 16 (wave & 1) .., columns CW tiles from (wave >> 1) CW.
+    const int om0 = 16 * (wave & 1), oc0 = (wave >> 1) * CW;
+    for (int c0 = t0; c0 < t1; c0 += GC) {
+        const int n = min(GC, t1 - c0);
+        for (int e = tid; e < GC * (GDN_DIM / 8); e += 2 * GDN_DIM) {
+            const int i = e / (GDN_DIM / 8), c = (e % (GDN_DIM / 8)) * 8, r = c0 + min(i, n - 1);
+            const bool ok = i < n;
+            const size_t at = ((size_t)r * Hv + h) * GDN_DIM + c;
+            const bf16* row = conv + (size_t)r * C + kh * GDN_DIM + c;
+            const uint4 z = make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(sW + i * GSTR + c) = ok ? *reinterpret_cast<const uint4*>(Wi + at) : z;
+            *reinterpret_cast<uint4*>(sQ + i * GSTR + c) = ok ? *reinterpret_cast<const uint4*>(row) : z;
+            const uint4 kv = ok ? *reinterpret_cast<const uint4*>(row + Hk * GDN_DIM) : z;
+            const bf16* kb = reinterpret_cast<const bf16*>(&kv);
+#pragma unroll
+            for (int d = 0; d < 8; d++) sKt[(c + d) * GKT + i] = kb[d];
+            if (c < VW) *reinterpret_cast<uint4*>(sU + i * VS + c) = ok ? *reinterpret_cast<const uint4*>(Ui + at + v0) : z;
+        }
+        for (int e = tid; e < GC * (GC / 8); e += 2 * GDN_DIM) {
+            const int i = e / (GC / 8), c = (e % (GC / 8)) * 8;
+            *reinterpret_cast<uint4*>(sP + i * GPSTR + c) =
+                i < n ? *reinterpret_cast<const uint4*>(Pi + ((size_t)(c0 + i) * Hv + h) * GC + c) : make_uint4(0, 0, 0, 0);
+        }
+        if (tid < GC) {
+            const size_t at = (size_t)(c0 + min(tid, n - 1)) * Hv + h;
+            sG[tid] = Gi[at];
+            sNq[tid] = Nqi[at];
+            sNk[tid] = Nki[at];
+        }
+        __syncthreads();
+        const float glast = sG[GC - 1];
+        // D = U - W S0 and Q S0 for this wave's tiles.
+        pe_f4 accq[CW];
+#pragma unroll
+        for (int cw = 0; cw < CW; cw++) {
+            const int ct = oc0 + cw;
+            pe_f4 acc = {0.f, 0.f, 0.f, 0.f};
+            accq[cw] = acc;
+            if (!zero_state) {
+#pragma unroll
+                for (int k0 = 0; k0 < GDN_DIM; k0 += 16) {
+                    const pe_s4 b = frag4(sSt, GSTR, 16 * ct + lr, k0 + 4 * lq);
+                    acc = mfma16(frag4(sW, GSTR, om0 + lr, k0 + 4 * lq), b, acc);
+                    accq[cw] = mfma16(frag4(sQ, GSTR, om0 + lr, k0 + 4 * lq), b, accq[cw]);
+                }
+            }
+            const int c = 16 * ct + lr, i0 = om0 + 4 * lq;
+            float d[4], dk[4];
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int i = i0 + j;
+                d[j] = b2f(sU[i * VS + c]) - acc[j];
+                dk[j] = d[j] * expf(glast - sG[i]) * sNk[i];
+                accq[cw][j] *= qscale * expf(sG[i]) * sNq[i];
+            }
+            *reinterpret_cast<uint2*>(sDt + c * GKT + i0) = pack4(d[0], d[1], d[2], d[3]);
+            *reinterpret_cast<uint2*>(sDkt + c * GKT + i0) = pack4(dk[0], dk[1], dk[2], dk[3]);
+        }
+        __syncthreads();
+        // O = exp(G) qscale Q S0 + P D, written unnormalized.
+#pragma unroll
+        for (int cw = 0; cw < CW; cw++) {
+            const int ct = oc0 + cw;
+#pragma unroll
+            for (int k0 = 0; k0 < GC; k0 += 16)
+                accq[cw] = mfma16(frag4(sP, GPSTR, om0 + lr, k0 + 4 * lq), frag4(sDt, GKT, 16 * ct + lr, k0 + 4 * lq),
+                                  accq[cw]);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int i = om0 + 4 * lq + j;
+                if (i < n) out[(size_t)(c0 + i) * Hv * GDN_DIM + h * GDN_DIM + v0 + 16 * ct + lr] = f2b(accq[cw][j]);
+            }
+        }
+        // S = exp(G_last) S0 + K^T Dk.
+        const float decay = expf(glast);
+#pragma unroll
+        for (int rt = 0; rt < 2; rt++)
+#pragma unroll
+            for (int ct = 0; ct < CT; ct++) {
+                st[rt][ct] *= decay;
+#pragma unroll
+                for (int k0 = 0; k0 < GC; k0 += 16)
+                    st[rt][ct] = mfma16(frag4(sKt, GKT, 32 * wave + 16 * rt + lr, k0 + 4 * lq),
+                                        frag4(sDkt, GKT, 16 * ct + lr, k0 + 4 * lq), st[rt][ct]);
+            }
+        if (snaps)
+            for (int j = 0; j < 2; j++)
+                if (snaps[4 * s + 2 * j] == c0 + n - t0) store_state(snaps[4 * s + 2 * j + 1]);
+        __syncthreads();
+        store_state_smem();
+        zero_state = false;
+        __syncthreads();
+    }
+    store_state(slots[s]);
+}
+#endif
 #define GDN_SCAN_ARGS                                                                                   \
     GDN_ARGS, const bf16 *__restrict__ Ui, const bf16 *__restrict__ Wi, const float *__restrict__ Nqi, \
         const float *__restrict__ Nki, const bf16 *__restrict__ Pi, const float *__restrict__ Gi,        \
@@ -1069,10 +1265,18 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan1(GDN_SCAN_ARG
     gdn_scan_cols<1>(GDN_PASS, Ui, Wi, Nqi, Nki, Pi, Gi, snaps);
 }
 extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan2(GDN_SCAN_ARGS) {
+#ifdef __HIP_PLATFORM_AMD__
+    gdn_scan_mfma<2>(GDN_PASS, Ui, Wi, Nqi, Nki, Pi, Gi, snaps);
+#else
     gdn_scan_cols<2>(GDN_PASS, Ui, Wi, Nqi, Nki, Pi, Gi, snaps);
+#endif
 }
 extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan4(GDN_SCAN_ARGS) {
+#ifdef __HIP_PLATFORM_AMD__
+    gdn_scan_mfma<4>(GDN_PASS, Ui, Wi, Nqi, Nki, Pi, Gi, snaps);
+#else
     gdn_scan_cols<4>(GDN_PASS, Ui, Wi, Nqi, Nki, Pi, Gi, snaps);
+#endif
 }
 
 // The gated RMSNorm of one (token, head): lane l < 16 holds outputs 8l ..
@@ -1675,6 +1879,147 @@ __device__ __forceinline__ void attn_flash_group(
         }
     }
 }
+#ifdef __HIP_PLATFORM_AMD__
+// Flash attention for prompts on AMD's matrix cores (MFMA 16x16x16 bf16,
+// 64-lane waves): wave w takes 16 queries of query head w % G, tile w / G,
+// and computes scores transposed, S^T = K Q^T, so a lane's accumulators
+// (keys 4 (lane / 16) .. + 3 of query lane % 16) are already the B operand
+// of O^T += V^T P^T and each lane rescales only its own query. Queries stay
+// in registers; keys and values (transposed) are staged per tile of AM_BN.
+#define AM_BN 32
+#define AM_VS (AM_BN + 8)
+template <int G, int NT>
+__device__ __forceinline__ void attn_mfma(ATTN_FLASH_ARGS) {
+    extern __shared__ __align__(16) unsigned char fsm[];
+    bf16* sK = (bf16*)fsm;            // [AM_BN][FA_STR]
+    bf16* sVt = sK + AM_BN * FA_STR;  // [HEAD_DIM][AM_VS]
+    constexpr int BT = 16 * NT, T = NT * G * 64;
+    const int tid = threadIdx.x, wave = tid >> 6, lane = tid & 63, lr = lane & 15, lq = lane >> 4;
+    const int kvh = blockIdx.y, h = kvh * G + wave % G, qt = wave / G;
+    int s = -1, tile = blockIdx.x;
+    for (int i = 0; i < seqs; i++) {
+        const int n = cu[i + 1] - cu[i];
+        if (n <= 1 || is_spec(outs, spec, i)) continue;
+        const int tiles = (n + BT - 1) / BT;
+        if (tile < tiles) {
+            s = i;
+            break;
+        }
+        tile -= tiles;
+    }
+    if (s < 0) return;
+    const int tb = cu[s] + tile * BT, nb = min(BT, cu[s + 1] - tb);
+    const int L = pos[tb] + nb;
+    const int t0 = tb + qt * 16, n = max(0, min(16, nb - qt * 16)), p0 = pos[tb] + qt * 16;
+    const int* bt = block_table + (size_t)s * max_blocks;
+    // Query lr's dimensions 16 kd + 4 lq .. + 3, scaled into log2 units.
+    pe_s4 qb[HEAD_DIM / 16];
+    {
+        const bool ok = lr < n;
+        const bf16* qrow = q + ((size_t)(t0 + (ok ? lr : 0)) * Hq + h) * HEAD_DIM;
+#pragma unroll
+        for (int kd = 0; kd < HEAD_DIM / 16; kd++) {
+            const uint2 raw = ok ? *reinterpret_cast<const uint2*>(qrow + 16 * kd + 4 * lq) : make_uint2(0, 0);
+            const float f = scale * LOG2E;
+            const uint2 v = pack4(__uint_as_float(raw.x << 16) * f, __uint_as_float(raw.x & 0xffff0000u) * f,
+                                  __uint_as_float(raw.y << 16) * f, __uint_as_float(raw.y & 0xffff0000u) * f);
+            qb[kd] = *reinterpret_cast<const pe_s4*>(&v);
+        }
+    }
+    pe_f4 o[HEAD_DIM / 16];
+#pragma unroll
+    for (int dt = 0; dt < HEAD_DIM / 16; dt++) o[dt] = pe_f4{0.f, 0.f, 0.f, 0.f};
+    float m = -INFINITY, l = 0.f;
+    const int last = p0 + n - 1;
+    for (int k0 = 0; k0 < L; k0 += AM_BN) {
+        __syncthreads();  // the previous tile is consumed
+        for (int e = tid; e < AM_BN * (HEAD_DIM / 8); e += T) {
+            const int j = e / (HEAD_DIM / 8), c = (e % (HEAD_DIM / 8)) * 8, kp = k0 + j;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
+            if (kp < L) {
+                const size_t slot = (size_t)bt[kp / block_size] * block_size + kp % block_size;
+                const size_t at = (slot * Hkv + kvh) * HEAD_DIM + c;
+                kv = *reinterpret_cast<const uint4*>((const bf16*)kcache + at);
+                vv = *reinterpret_cast<const uint4*>((const bf16*)vcache + at);
+            }
+            *reinterpret_cast<uint4*>(sK + j * FA_STR + c) = kv;
+            const bf16* vb = reinterpret_cast<const bf16*>(&vv);
+#pragma unroll
+            for (int d = 0; d < 8; d++) sVt[(c + d) * AM_VS + j] = vb[d];
+        }
+        __syncthreads();
+        if (k0 > last) continue;  // keys past all of this wave's queries add nothing
+        pe_f4 sc[AM_BN / 16];
+#pragma unroll
+        for (int kt = 0; kt < AM_BN / 16; kt++) {
+            sc[kt] = pe_f4{0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int kd = 0; kd < HEAD_DIM / 16; kd++)
+                sc[kt] = mfma16(frag4(sK, FA_STR, 16 * kt + lr, 16 * kd + 4 * lq), qb[kd], sc[kt]);
+        }
+        if (k0 + AM_BN - 1 > p0 || k0 + AM_BN > L) {
+#pragma unroll
+            for (int kt = 0; kt < AM_BN / 16; kt++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const int kp = k0 + 16 * kt + 4 * lq + j;
+                    if (kp > p0 + lr || kp >= L) sc[kt][j] = -INFINITY;
+                }
+        }
+        float mx = m;
+#pragma unroll
+        for (int kt = 0; kt < AM_BN / 16; kt++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) mx = fmaxf(mx, sc[kt][j]);
+        mx = fmaxf(mx, __shfl_xor(mx, 16, 64));
+        mx = fmaxf(mx, __shfl_xor(mx, 32, 64));
+        // A query with no key yet keeps -inf; it subtracts 0 so exp2 gives 0.
+        const float b = mx == -INFINITY ? 0.f : mx, c = fast_exp2(m - b);
+        float sum = 0.f;
+#pragma unroll
+        for (int kt = 0; kt < AM_BN / 16; kt++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                sc[kt][j] = fast_exp2(sc[kt][j] - b);
+                sum += sc[kt][j];
+            }
+        sum += __shfl_xor(sum, 16, 64);
+        sum += __shfl_xor(sum, 32, 64);
+        l = l * c + sum;
+        m = mx;
+#pragma unroll
+        for (int dt = 0; dt < HEAD_DIM / 16; dt++) o[dt] *= c;
+#pragma unroll
+        for (int kt = 0; kt < AM_BN / 16; kt++) {
+            const uint2 pv = pack4(sc[kt][0], sc[kt][1], sc[kt][2], sc[kt][3]);
+            const pe_s4 pb = *reinterpret_cast<const pe_s4*>(&pv);
+#pragma unroll
+            for (int dt = 0; dt < HEAD_DIM / 16; dt++)
+                o[dt] = mfma16(frag4(sVt, AM_VS, 16 * dt + lr, 16 * kt + 4 * lq), pb, o[dt]);
+        }
+    }
+    if (lr >= n) return;
+    const float inv = l > 0.f ? 1.f / l : 0.f;
+    const size_t t = (size_t)t0 + lr;
+#pragma unroll
+    for (int dt = 0; dt < HEAD_DIM / 16; dt++) {
+        const int d = 16 * dt + 4 * lq;
+        const uint2 graw = *reinterpret_cast<const uint2*>(qkv + t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d);
+        const float gate[4] = {__uint_as_float(graw.x << 16), __uint_as_float(graw.x & 0xffff0000u),
+                               __uint_as_float(graw.y << 16), __uint_as_float(graw.y & 0xffff0000u)};
+        float y[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) y[j] = rbf(o[dt][j] * inv) / (1.f + expf(-gate[j]));
+        *reinterpret_cast<uint2*>(out + (t * Hq + h) * HEAD_DIM + d) = pack4(y[0], y[1], y[2], y[3]);
+    }
+}
+#define ATTN_MFMA(G, NT)                                                                                       \
+    extern "C" __global__ void __launch_bounds__(G * 64 * NT) attn_mfma_g##G##_t##NT(ATTN_FLASH_ARGS) {         \
+        attn_mfma<G, NT>(ATTN_FLASH_PASS);                                                                     \
+    }
+ATTN_MFMA(4, 2)
+ATTN_MFMA(6, 2)
+#endif
 // attn_group_g<G>_t<NT>_k<BN>: groups of G, NT query tiles, key tiles of BN;
 // attn_group8_... reads an E4M3 cache; attn_groupr_... keeps the queries in
 // registers. The host picks the variant whose shared memory the device

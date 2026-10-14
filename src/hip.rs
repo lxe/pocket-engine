@@ -398,7 +398,15 @@ pub mod cb {
         ) -> cublasStatus_t;
     }
 
+    /// hipBLAS runs on rocBLAS, whose own kernels pick poor tiles for the
+    /// skinny products of decoding (an LM head at 64 rows took 871 us on an
+    /// MI325X against hipBLASLt's 483): route them to hipBLASLt unless the
+    /// environment says otherwise.
     pub unsafe fn cublasCreate_v2(h: *mut cublasHandle_t) -> cublasStatus_t {
+        if std::env::var_os("ROCBLAS_USE_HIPBLASLT").is_none() {
+            // SAFETY: called once while creating the GPU, before rocBLAS reads it.
+            unsafe { std::env::set_var("ROCBLAS_USE_HIPBLASLT", "1") };
+        }
         unsafe { hipblasCreate(h) }
     }
     pub unsafe fn cublasSetStream_v2(h: cublasHandle_t, s: *mut c_void) -> cublasStatus_t {

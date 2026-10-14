@@ -69,6 +69,23 @@ __device__ __forceinline__ bool __any_sync(unsigned m, int p) { return __ballot_
 __device__ __forceinline__ bool __all_sync(unsigned m, int p) { return __ballot_sync(m, !p) == 0; }
 __device__ __forceinline__ void __syncwarp(unsigned = 0xffffffffu) { __builtin_amdgcn_wave_barrier(); }
 
+// Native MFMA (gfx942): 16x16x16 bf16 with f32 accumulators. A lane holds
+// A[m][k..k+3] and B[k..k+3][n] (m, n = lane % 16, k = 4 (lane / 16)) and
+// C[m..m+3][n] (m = 4 (lane / 16)); both operands are loaded k-contiguous.
+typedef short pe_s4 __attribute__((ext_vector_type(4)));
+typedef float pe_f4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ pe_f4 mfma16(pe_s4 a, pe_s4 b, pe_f4 c) {
+    return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
+}
+// Four bf16 at row r, column k of a row-major matrix with `stride` elements per row.
+__device__ __forceinline__ pe_s4 frag4(const __hip_bfloat16* X, int stride, int r, int k) {
+    return *reinterpret_cast<const pe_s4*>(X + (size_t)r * stride + k);
+}
+__device__ __forceinline__ uint2 pack4(float a, float b, float c, float d) {
+    __hip_bfloat162 lo = __floats2bfloat162_rn(a, b), hi = __floats2bfloat162_rn(c, d);
+    return make_uint2(*reinterpret_cast<uint32_t*>(&lo), *reinterpret_cast<uint32_t*>(&hi));
+}
+
 namespace pe {
 
 __device__ __forceinline__ float bf_lo(uint32_t v) { return __uint_as_float(v << 16); }

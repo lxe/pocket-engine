@@ -797,7 +797,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (
                     sh.kernel(group, false),
                     ((t.div_ceil(16 * tiles) + seqs) as u32, hkv as u32, 1),
-                    (32 * group * tiles) as u32,
+                    sh.threads(group) as u32,
                     smem,
                 )
             };

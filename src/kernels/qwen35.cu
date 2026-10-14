@@ -663,6 +663,27 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
         const bf16* X = tid < GDN_DIM ? sV : sK;
         const float* fac = tid < GDN_DIM ? sB : sE;
         const int col = tid % GDN_DIM;
+#ifdef __HIP_PLATFORM_AMD__
+        // On gfx942 the unrolled solve below took 512 registers and still
+        // spilled; each thread keeps its column of the solution in shared
+        // memory instead (sD, [GC][256] f32 past GDN_PREP_SMEM), rows in turn.
+        float* sD = reinterpret_cast<float*>(psm + GDN_PREP_SMEM) + tid;
+#pragma unroll 1
+        for (int i = 0; i < GC; i++) {
+            float a0 = fac[i] * b2f(X[i * GSTR + col]), a1 = 0.f;
+            for (int j = 0; j < (i & ~3); j += 4) {
+                const float4 a = *reinterpret_cast<const float4*>(sA + i * GAS + j);
+                a0 = fmaf(-a.x, sD[j * 2 * GDN_DIM], a0);
+                a1 = fmaf(-a.y, sD[(j + 1) * 2 * GDN_DIM], a1);
+                a0 = fmaf(-a.z, sD[(j + 2) * 2 * GDN_DIM], a0);
+                a1 = fmaf(-a.w, sD[(j + 3) * 2 * GDN_DIM], a1);
+            }
+            for (int j = i & ~3; j < i; j++) a0 = fmaf(-sA[i * GAS + j], sD[j * 2 * GDN_DIM], a0);
+            sD[i * 2 * GDN_DIM] = a0 + a1;
+        }
+        bf16* dst = tid < GDN_DIM ? Uo : Wo;
+        for (int i = 0; i < n; i++) dst[((size_t)(c0 + i) * Hv + h) * GDN_DIM + col] = f2b(sD[i * 2 * GDN_DIM]);
+#else
         float d[GC];
 #pragma unroll
         for (int i = 0; i < GC; i++) {
@@ -683,6 +704,7 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
 #pragma unroll
         for (int i = 0; i < GC; i++)
             if (i < n) dst[((size_t)(c0 + i) * Hv + h) * GDN_DIM + col] = f2b(d[i]);
+#endif
     }
 }
 

@@ -196,7 +196,15 @@ pub fn gdn_decode_shape(state_bf16: bool, smem_per_sm: usize) -> Option<(usize, 
 
 /// Dynamic shared memory of the two-pass chunked gated delta rule
 /// (GDN_PREP_SMEM and GDN_SCAN_SMEM(NS) in qwen35.cu).
-pub const GDN_PREP_SMEM: usize = 3 * 32 * 136 * 2 + 32 * 36 * 4 + 6 * 32 * 4;
+/// On AMD also each thread's column of the solution, 32 x 256 f32.
+pub const GDN_PREP_SMEM: usize = 3 * 32 * 136 * 2
+    + 32 * 36 * 4
+    + 6 * 32 * 4
+    + if cfg!(feature = "rocm") {
+        32 * 256 * 4
+    } else {
+        0
+    };
 pub fn gdn_scan_smem(ns: usize) -> usize {
     if cfg!(feature = "rocm") {
         // gdn_mfma_smem<NS>: W, q; k transposed; U; P; D and Dk transposed;

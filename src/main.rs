@@ -67,9 +67,9 @@ struct EngineArgs {
     /// omitted).
     #[arg(long, num_args = 0..=1, default_missing_value = "2")]
     mtp: Option<usize>,
-    /// int8 activations for 4- to 6-bit GGUF matrices in batches of 16 or more.
+    /// bf16 activations for GGUF weights, instead of int8 in batches.
     #[arg(long)]
-    int8: bool,
+    no_int8: bool,
 }
 
 impl EngineArgs {
@@ -91,7 +91,7 @@ impl EngineArgs {
             state_bf16: !self.state_f32,
             prefix_cache: self.prefix_cache,
             mtp: self.mtp.unwrap_or(0),
-            int8: self.int8,
+            int8: !self.no_int8,
             ..EngineConfig::new(self.model.clone())
         }
     }

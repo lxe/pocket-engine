@@ -36,7 +36,7 @@ fn config(model: PathBuf) -> EngineConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
-        int8: std::env::var("POCKET_ENGINE_INT8").is_ok_and(|v| v == "1"),
+        int8: !std::env::var("POCKET_ENGINE_NO_INT8").is_ok_and(|v| v == "1"),
         ..EngineConfig::new(model)
     }
 }

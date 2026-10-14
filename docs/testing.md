@@ -36,7 +36,7 @@ Add one of these to the command above to run the same checks with that option on
 | `POCKET_ENGINE_KV_FP8=1` | `--kv-fp8` |
 | `POCKET_ENGINE_STATE_F32=1` | `--state-f32` |
 | `POCKET_ENGINE_MTP=3` | `--mtp 3` |
-| `POCKET_ENGINE_INT8=1` | `--int8` |
+| `POCKET_ENGINE_NO_INT8=1` | `--no-int8` |
 
 Quantized runs allow slightly larger differences from Transformers.
 

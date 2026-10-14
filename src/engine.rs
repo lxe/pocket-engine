@@ -48,7 +48,7 @@ pub struct EngineConfig {
     /// Drafts per step from the multi-token-prediction layer; 0 turns
     /// speculative decoding off.
     pub mtp: usize,
-    /// Quantize activations to int8 for 4-bit GGUF matrices in batches.
+    /// Quantize activations to int8 for 4- to 6-bit GGUF matrices in batches.
     pub int8: bool,
 }
 
@@ -72,7 +72,7 @@ impl EngineConfig {
             state_bf16: true,
             prefix_cache: None,
             mtp: 0,
-            int8: false,
+            int8: true,
         }
     }
 }

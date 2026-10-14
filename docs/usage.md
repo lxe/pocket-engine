@@ -23,6 +23,8 @@ Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Mixture-of-experts mo
 
 `--mtp` needs a checkpoint or GGUF file that includes the draft layer; among GGUF files, Unsloth's Qwen3.8-27B UD quantizations do. Use it for a few streams at a time: it speeds up each one (64 to 112 tok/s on 27B on an RTX 5090) and costs a few percent at high load.
 
+GGUF weights in 4- to 6-bit formats run batches against int8 activations, which serves about 20% more tokens/s under load on RTX GPUs and a few percent more on H100, with the same agreement with Transformers. `--no-int8` keeps activations in bf16.
+
 `--kv-fp8` stores the KV cache in FP8, which fits about twice the tokens. How each format runs is in [the design notes](design.md#quantized-weights).
 
 Images can be JPEG, PNG, WebP, GIF or BMP, as `data:` or `http(s)` URLs.
@@ -64,7 +66,7 @@ Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `sto
 | `--fp4` | off | Quantize a bf16 checkpoint to FP4 (RTX 50-series) |
 | `--kv-fp8` | off | FP8 KV cache |
 | `--state-f32` | off | f32 linear-attention state (twice the memory) |
-| `--int8` | off | int8 activations for 4- to 6-bit GGUF weights in batches; about 20% more throughput under load on RTX GPUs, a few percent on H100 |
+| `--no-int8` | off | bf16 activations for GGUF weights (see below) |
 | `--no-vision` | off | Text only |
 | `--max-image-pixels N` | 4194304 | Largest image after resizing |
 | `--image-pool N` | 16384 | Image embeddings waiting at once |

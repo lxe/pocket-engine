@@ -1,7 +1,7 @@
 {
  "gpu": "AMD Instinct MI325X (gfx942, 256 GB HBM3E), DigitalOcean gpu-mi325x1-256gb, ROCm 7.14",
  "date": "2026-10-13 and 2026-10-14 (PDT)",
- "workload": "scripts/load.py: chat prompts of ~60-200 tokens, 16-64 output tokens, temperature 0; closed loops at 1/8/16/32/64 in flight and a burst of 64; load_hi.py runs 128 and 256 in flight and a burst of 256",
+ "workload": "scripts/load.py: chat prompts of ~60-200 tokens, 16-64 output tokens, temperature 0; closed loops at 1/8/16/32/64 in flight and a burst of 64; load_hi.py runs 128 and 256 in flight and a burst of 256. *-thinking runs send \"chat_template_kwargs\": {\"enable_thinking\": true} (vLLM's template default), so both engines answer to max_tokens, ~40 tokens per request",
  "pocket_engine": {
   "branch": "rocm",
   "flags": "defaults (bf16 weights, bf16 KV cache, HIP graphs)"
@@ -35,6 +35,32 @@
     "ttft_p95": 1.705,
     "lat_p50": 2.39,
     "lat_p95": 3.12,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-27b-128-thinking": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 7.41,
+    "out_tok_s": 1401.6,
+    "ttft_p50": 0.407,
+    "ttft_p95": 2.018,
+    "lat_p50": 2.998,
+    "lat_p95": 6.076,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 4.06,
+    "out_tok_s": 1254.2,
+    "ttft_p50": 1.232,
+    "ttft_p95": 2.108,
+    "lat_p50": 3.233,
+    "lat_p95": 3.932,
     "first_error": null
    }
   ],
@@ -87,6 +113,32 @@
     "ttft_p95": 5.684,
     "lat_p50": 6.248,
     "lat_p95": 7.169,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-27b-256-thinking": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 13.89,
+    "out_tok_s": 1492.0,
+    "ttft_p50": 0.489,
+    "ttft_p95": 3.906,
+    "lat_p50": 5.784,
+    "lat_p95": 12.16,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 9.01,
+    "out_tok_s": 1152.9,
+    "ttft_p50": 4.124,
+    "ttft_p95": 6.139,
+    "lat_p50": 7.427,
+    "lat_p95": 8.424,
     "first_error": null
    }
   ],
@@ -180,6 +232,32 @@
     "first_error": null
    }
   ],
+  "load-fresh-pe-9b-128-thinking": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 2.16,
+    "out_tok_s": 4807.9,
+    "ttft_p50": 0.124,
+    "ttft_p95": 0.476,
+    "lat_p50": 0.895,
+    "lat_p95": 1.694,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.95,
+    "out_tok_s": 2605.2,
+    "ttft_p50": 0.878,
+    "ttft_p95": 1.346,
+    "lat_p50": 1.413,
+    "lat_p95": 1.784,
+    "first_error": null
+   }
+  ],
   "load-fresh-pe-9b-256-r2": [
    {
     "case": "closed c=256",
@@ -203,6 +281,32 @@
     "ttft_p95": 4.994,
     "lat_p50": 4.772,
     "lat_p95": 5.659,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-9b-256-thinking": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 3.89,
+    "out_tok_s": 5322.8,
+    "ttft_p50": 0.15,
+    "ttft_p95": 0.905,
+    "lat_p50": 1.649,
+    "lat_p95": 3.214,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 6.04,
+    "out_tok_s": 1718.4,
+    "ttft_p50": 4.091,
+    "ttft_p95": 4.918,
+    "lat_p50": 4.852,
+    "lat_p95": 5.619,
     "first_error": null
    }
   ],
@@ -844,6 +948,80 @@
     "first_error": null
    }
   ],
+  "load-pe-27b-thinking": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 9.35,
+    "out_tok_s": 71.9,
+    "ttft_p50": 0.031,
+    "ttft_p95": 0.038,
+    "lat_p50": 0.451,
+    "lat_p95": 0.886,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 7.04,
+    "out_tok_s": 363.6,
+    "ttft_p50": 0.061,
+    "ttft_p95": 0.089,
+    "lat_p50": 0.708,
+    "lat_p95": 1.392,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 6.11,
+    "out_tok_s": 649.5,
+    "ttft_p50": 0.064,
+    "ttft_p95": 0.117,
+    "lat_p50": 0.927,
+    "lat_p95": 1.538,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.73,
+    "out_tok_s": 887.3,
+    "ttft_p50": 0.18,
+    "ttft_p95": 0.437,
+    "lat_p50": 1.257,
+    "lat_p95": 2.202,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 6.54,
+    "out_tok_s": 1151.7,
+    "ttft_p50": 0.275,
+    "ttft_p95": 1.001,
+    "lat_p50": 1.697,
+    "lat_p95": 3.426,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.41,
+    "out_tok_s": 1063.7,
+    "ttft_p50": 0.61,
+    "ttft_p95": 1.012,
+    "lat_p50": 1.757,
+    "lat_p95": 2.383,
+    "first_error": null
+   }
+  ],
   "load-pe-27b": [
    {
     "case": "closed c=1",
@@ -1288,6 +1466,80 @@
     "first_error": null
    }
   ],
+  "load-pe-9b-thinking": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 3.12,
+    "out_tok_s": 215.4,
+    "ttft_p50": 0.011,
+    "ttft_p95": 0.013,
+    "lat_p50": 0.151,
+    "lat_p95": 0.295,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.4,
+    "out_tok_s": 1067.0,
+    "ttft_p50": 0.021,
+    "ttft_p95": 0.027,
+    "lat_p50": 0.239,
+    "lat_p95": 0.469,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 2.07,
+    "out_tok_s": 1919.0,
+    "ttft_p50": 0.022,
+    "ttft_p95": 0.036,
+    "lat_p50": 0.318,
+    "lat_p95": 0.505,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.9,
+    "out_tok_s": 2682.3,
+    "ttft_p50": 0.047,
+    "ttft_p95": 0.121,
+    "lat_p50": 0.397,
+    "lat_p95": 0.711,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 2.06,
+    "out_tok_s": 3659.6,
+    "ttft_p50": 0.079,
+    "ttft_p95": 0.263,
+    "lat_p50": 0.554,
+    "lat_p95": 1.047,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 0.8,
+    "out_tok_s": 3193.8,
+    "ttft_p50": 0.174,
+    "ttft_p95": 0.278,
+    "lat_p50": 0.543,
+    "lat_p95": 0.776,
+    "first_error": null
+   }
+  ],
   "load-pe-9b": [
    {
     "case": "closed c=1",
@@ -1591,10 +1843,11 @@
   "load-hi-*": "earlier 128-then-256 runs in one client process (see notes); superseded by load-fresh-*",
   "load-pe-9b, load-pe-27b": "rocm before the merge (8633ec1)",
   "load-pe-9b-q4km-merged": "GGUF dequantized to bf16 for every batch, the shipped default; load-pe-9b-q4km: int8 below 16 rows (0684cec); load-pe-9b-q4km-emulated: before native AMD kernels",
-  "*-r2": "rocm at 0fe012a (MFMA decode attention, gdn_prep shared-memory solve, 64-key split ranges): docs/benchmarks.md pocket-engine columns; vLLM columns unchanged from 2026-10-13"
+  "*-r2": "rocm at 0fe012a with thinking off (~26 tokens per request on 27B, ~35 on 9B, against vLLM's ~40); superseded by *-thinking",
+  "*-thinking": "rocm at 1a90d4d with thinking on: docs/benchmarks.md pocket-engine columns; vLLM columns unchanged from 2026-10-13"
  },
  "notes": [
-  "Startup, launch to serving: pocket-engine 1.6-3.9 s (9B, 27B); vLLM 260 s (9B) and 316 s (27B) on first start, including AITER JIT builds and graph compilation. Round 2 (*-r2): 5.5-7.7 s, not yet explained.",
+  "Startup, launch to serving: pocket-engine 1.6-3.9 s (9B, 27B); vLLM 260 s (9B) and 316 s (27B) on first start, including AITER JIT builds and graph compilation.",
   "Accuracy on this GPU (teacher-forced against Transformers bf16, tests/fixtures): 9B bf16 218-219 of 220 picks, misses within one bf16 step, median |dlogprob| 0.0003, p95 0.034; 9B Q4_K_M 213 of 220.",
   "tests/gpu.rs on the merged build: 9B bf16, 27B bf16 and 9B Q4_K_M pass all 15. LoRA's shrink overlapped with the layer's matrix multiply on a second stream changed outputs on AMD (a zero adapter moved 144 of 220 picks); AMD runs it in stream order, which matches the base model exactly.",
   "HIP graphs on ROCm 7.14: greedy 256-token generations of four prompts are identical with and without graphs; base scoring is bitwise identical across runs in one process.",
@@ -1605,6 +1858,69 @@
   "Round 2 at 0fe012a: 9B bf16 218 of 220, 27B 212 of 213; tests/gpu.rs passes all 15 on 9B bf16 and 9B Q4_K_M. NVIDIA SASS identical to the previous head for all 413 functions (sm_90a, sm_120a).",
   "Round 2 kernel times (rocprofv3, 27B at 64 in flight): decode attention 79 -> 21 us a call on MFMA; gdn_prep 512 registers with spills -> 59 without (4,951 -> 4,658 us for 256 tokens x 130 sequences). End to end +2-5% at 1-64 in flight; 128 and 256 within noise of round 1.",
   "Tried and dropped in round 2: an MFMA GEMM for 5-64 rows (1.0-2.3 TB/s against hipBLASLt's 2.0-3.3) and a scan with one wave per value group (4,822 vs 3,975 us).",
-  "Open on AMD (27B at 64 in flight): gdn_recurrent is latency-bound (186 registers, 18% occupancy, VALU busy 20%); gdn_prep runs one block per CU (63.5 KB shared memory); gdn_scan2 uses 217 registers and decode attention 230-259; hipBLASLt GEMMs are the largest remaining share."
- ]
+  "Output length: vLLM renders Qwen's chat template with thinking on and answers ran to max_tokens (39-42 tokens per request); pocket-engine's default is thinking off and its answers ended sooner (27B ~26, 9B ~35). In a closed loop that means more prompts and first tokens per output token, so the r2 rows understate pocket-engine; the *-thinking rows match vLLM's workload.",
+  "Startup (27B, warm page cache): 2.9 s to listening at 1a90d4d, from 4.1-4.4 s; the structured-output tables (~1 s over 248k tokens) now build while the weights load. A server started within ~5 s of the previous one's exit waits 4.7-5.1 s in GPU init while the driver frees the old process's ~250 GB (same after SIGINT, SIGKILL or with core dumps off); round 2's 5.5-7.7 s were back-to-back restarts. Before e95b38c, Ctrl-C crashed in HIP's teardown (SIGSEGV); now exit 0 in 0.3-0.5 s."
+ ],
+ "profiles": {
+  "method": "27B; rocprofv3 --kernel-trace for pocket-engine, vLLM's torch profiler (rocprofv3 lost vLLM's engine process at shutdown); per output token over one fixed-concurrency load.py run, prompts included. Kernel time per output token in us by category, with GPU busy share",
+  "pe-c1-thinking": {
+   "tok_s": 71.3,
+   "busy": 0.95,
+   "total": 13948,
+   "gemm": 11072,
+   "gated_delta": 1234,
+   "norm": 887,
+   "attention": 380,
+   "other": 287,
+   "sampling": 88
+  },
+  "vllm-c1": {
+   "tok_s": 67.3,
+   "busy": 0.89,
+   "total": 13809,
+   "gemm": 11088,
+   "gated_delta": 612,
+   "norm": 531,
+   "attention": 401,
+   "other": 1149,
+   "sampling": 25
+  },
+  "pe-c64-thinking": {
+   "tok_s": 1282.5,
+   "busy": 0.9,
+   "total": 773,
+   "gemm": 533,
+   "gated_delta": 184,
+   "norm": 21,
+   "attention": 20,
+   "other": 13,
+   "rows_per_step": 50.9
+  },
+  "vllm-c64": {
+   "tok_s": 1085.4,
+   "busy": 0.86,
+   "total": 819,
+   "gemm": 589,
+   "gated_delta": 120,
+   "norm": 18,
+   "attention": 15,
+   "other": 76,
+   "rows_per_step": 50.2
+  },
+  "pe-c256-thinking (closed 256 then a burst of 256)": {
+   "tok_s": 1529.1,
+   "busy": 0.91,
+   "total": 1033,
+   "gemm": 666,
+   "gated_delta": 299,
+   "attention": 31,
+   "norm": 20,
+   "other": 16
+  },
+  "findings": [
+   "One stream: matrix-vector products match vLLM's wvSplitK (42.0 vs 40.1 us a call, 4.8-5.4 TB/s on the large shapes). The gap is the batch-1 delta-rule recurrence (18.7 us a call against vLLM's 6.7, which splits each head's 128 value columns four ways; ours runs one 256-thread block per head, 48 blocks on 304 CUs) and RMSNorm (6.6 vs 4.0 us, 131 a token): ~1 ms of 13.9 per token.",
+   "64 in flight: pocket-engine spends less GPU time per output token than vLLM (773 vs 819 us) with the same rows per step; the delta-rule recurrence is 96 us a call against vLLM's 79.",
+   "256 in flight: decode steps carry 240-256 rows once the first prompts are in; the recurrence is 14% of GPU time (223 us a call). pocket-engine admits prompts sooner (median first token 0.49 s against 1.20) at some decode throughput (median latency 5.78 s against 5.25); bursts of 256 take ~4.1 s to first token on both."
+  ]
+ }
 }

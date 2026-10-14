@@ -45,19 +45,19 @@ These pods capped each container at 20 CPUs on a busy host. That slows vLLM's sc
 
 ## AMD MI325X
 
-One MI325X (ROCm 7.14) against vLLM 0.31.0's ROCm image with AITER attention. Output tokens/s from `scripts/load.py`, plus 128 and 256 in flight with the same prompts. pocket-engine measured 2026-10-14, vLLM 2026-10-13. Receipts: [mi325x.json](receipts/mi325x.json).
+One MI325X (ROCm 7.14) against vLLM 0.31.0's ROCm image with AITER attention. Output tokens/s from `scripts/load.py`, plus 128 and 256 in flight with the same prompts. vLLM renders Qwen's template with thinking on, so its answers run to `max_tokens`; pocket-engine ran with `"chat_template_kwargs": {"enable_thinking": true}` to match (about 40 tokens per request on both). pocket-engine measured 2026-10-14, vLLM 2026-10-13. Receipts: [mi325x.json](receipts/mi325x.json).
 
 | In flight | 9B pocket-engine | 9B vLLM | 27B pocket-engine | 27B vLLM |
 |---:|---:|---:|---:|---:|
-| 1 | **213** | 207 | 70 | **76** |
-| 8 | **1,024** | 772 | 326 | **349** |
-| 16 | **1,796** | 1,263 | **601** | 587 |
-| 32 | **2,526** | 2,046 | 777 | **873** |
-| 64 | **3,307** | 3,273 | 1,007 | **1,166** |
-| 128 | 4,214 | **4,580** | 1,189 | **1,485** |
-| 256 | 4,745 | **5,445** | 1,317 | **1,669** |
+| 1 | **215** | 207 | 72 | **76** |
+| 8 | **1,067** | 772 | **364** | 349 |
+| 16 | **1,919** | 1,263 | **650** | 587 |
+| 32 | **2,682** | 2,046 | **887** | 873 |
+| 64 | **3,660** | 3,273 | 1,152 | **1,166** |
+| 128 | **4,808** | 4,580 | 1,402 | **1,485** |
+| 256 | 5,323 | **5,445** | 1,492 | **1,669** |
 
-Startup takes 2 to 8 s against vLLM's 260 to 316 s, and the median first token at 64 in flight is 62 ms against 135 (9B) and 153 against 353 (27B). Qwen3.5-9B Q4_K_M serves 81, 879 and 2,146 tokens/s at 1, 16 and 64 in flight.
+Startup takes 2 to 3 s against vLLM's 260 to 316 s (plus up to 5 s while the driver frees a previous process's memory), and the median first token at 64 in flight is 79 ms against 135 (9B) and 275 against 353 (27B). Qwen3.5-9B Q4_K_M serves 81, 879 and 2,146 tokens/s at 1, 16 and 64 in flight (thinking off).
 
 ## First token by prompt length, H100
 

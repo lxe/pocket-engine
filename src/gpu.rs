@@ -848,6 +848,7 @@ impl Gpu {
         r
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gemm_ld_inner(
         &self,
         x: u64,
@@ -915,6 +916,7 @@ impl Gpu {
         r
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gemm_batched_inner(
         &self,
         m: usize,
@@ -1009,6 +1011,7 @@ impl Gpu {
         r
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fp8_matmul_inner(
         &self,
         mode: Fp8Mode,

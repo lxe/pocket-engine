@@ -110,6 +110,15 @@ The `rocm` feature builds the same kernels with hipcc for gfx942 and runs them t
 - An adapter's x Aᵀ runs in stream order rather than on a second stream, which changed outputs on AMD.
 - A server started right after another exits waits up to 5 seconds in GPU setup while the driver frees the old process's memory.
 
+What costs time on an MI325X, measured, and how the AMD kernels respond:
+
+| Cost | Measured | Response |
+|---|---|---|
+| A kernel inside a graph, even empty | 1.5 µs | Fewer, fused kernels; about 600 run per token at batch 1 |
+| A load behind a branch before its use | the compiler waits for it, one memory round trip (~0.3 µs) each | The recurrence and RMSNorm issue all their loads first (in the short convolution and the attention prefetch, doing so measured slower) |
+| An agent-scope fence (`__threadfence`) | writes back and invalidates the XCD's L2: 83 µs for 1,216 blocks | No hand-offs between blocks; a second kernel where needed |
+| A 256-thread block reduction | about 0.45 µs | Wave64 sums and one barrier where possible |
+
 ## Loading
 
 Weights are read from the file with parallel `pread` calls into pinned buffers, while the GPU copies the previous buffer. Nothing goes through memory-mapped pages, which is about five times slower. The tokenizer and the structured-output tables load on another thread meanwhile. A 9B model is ready to serve in under 2 seconds from the page cache.

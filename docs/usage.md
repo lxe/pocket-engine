@@ -64,7 +64,7 @@ Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `sto
 | `--fp4` | off | Quantize a bf16 checkpoint to FP4 (RTX 50-series) |
 | `--kv-fp8` | off | FP8 KV cache |
 | `--state-f32` | off | f32 linear-attention state (twice the memory) |
-| `--int8` | off | int8 activations for 4-bit GGUF weights in batches of 16 or more |
+| `--int8` | off | int8 activations for Q4_0, Q4_K and Q6_K GGUF weights in batches of 16 or more |
 | `--no-vision` | off | Text only |
 | `--max-image-pixels N` | 4194304 | Largest image after resizing |
 | `--image-pool N` | 16384 | Image embeddings waiting at once |

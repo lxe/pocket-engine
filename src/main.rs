@@ -67,7 +67,7 @@ struct EngineArgs {
     /// omitted).
     #[arg(long, num_args = 0..=1, default_missing_value = "2")]
     mtp: Option<usize>,
-    /// int8 activations for Q4_0 and Q4_K matrices in batches of 16 or more.
+    /// int8 activations for Q4_0, Q4_K and Q6_K matrices in batches of 16 or more.
     #[arg(long)]
     int8: bool,
 }

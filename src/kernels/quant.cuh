@@ -854,10 +854,24 @@ __device__ __forceinline__ void mma_s8(int* c, const uint32_t* a, uint32_t b0, u
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
 }
 
-// qtile's loop with int8 activations. A row's weight at step s is q * sc - mn
-// (Q4_0: sc = d, mn = 8d), so its dot product with token x is
-// sc * dx * sum(q * xq) - mn * sum(x). The block's four warps share each
-// chunk's activations, staged in shared memory a chunk ahead with cp.async.
+// Q6_K's two high bits of a word's 8 inputs (input i at bit 2i) moved to bit
+// 4 of each byte, in the byte order of w & 0x0F0F0F0F (inputs 0 4 1 5); hi >> 4
+// gives the other word's (2 6 3 7).
+__device__ __forceinline__ uint32_t hi2_bytes(uint32_t h) {
+    return ((h & 0x0303u) | ((h & 0x0C0Cu) << 14)) << 4;
+}
+// q - 32 in each byte of q (0 to 63), as signed bytes.
+__device__ __forceinline__ uint32_t less32(uint32_t q) {
+    return ((q | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+}
+
+// qtile's loop with int8 activations. For Q4_0 and Q4_K a row's weight at
+// step s is q * sc - mn (Q4_0: sc = d, mn = 8d), so its dot product with
+// token x is sc * dx * sum(q * xq) - mn * sum(x). Q6_K's weights are
+// (q - 32) * d * sc with a scale per 16 inputs, so each step takes two
+// products, one per half (lanes t < 2 hold the first half's inputs), summed
+// in integers with the scales. The block's four warps share each chunk's
+// activations, staged in shared memory a chunk ahead with cp.async.
 #define Q8_XSTR 288  // byte stride of an activation row: 256 plus 32 against bank conflicts
 template <int MT>
 struct Q8Stage {
@@ -868,8 +882,8 @@ template <int T, int MT>
 __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t* __restrict__ Xq,
                        const float2* __restrict__ Xs, int Mp, int M, void* __restrict__ Y, int ldy, int off,
                        int f32_out, float* __restrict__ acc_ws, int ksplit) {
-    static_assert(T == T_Q4_0 || T == T_Q4_K, "4-bit tiled formats only");
     constexpr int CH = Tiled<T>::CHUNK;
+    constexpr bool Q6 = T == T_Q6_K;
     __shared__ __align__(16) Q8Stage<MT> st[2];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int tile = blockIdx.x * 4 + warp, n0 = tile * 16;
@@ -897,6 +911,7 @@ __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t
     };
     struct Chunk {
         uint4 q[4];
+        uint4 h[Q6 ? 2 : 1];
         TileRow ra, rb;
     };
     auto fetch = [&](int kb, Chunk& ch) {
@@ -904,6 +919,10 @@ __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t
         const uint8_t* c = base + (size_t)kb * CH;
 #pragma unroll
         for (int i = 0; i < 4; i++) ch.q[i] = ld_stream(c + 512 * i + 16 * lane);
+        if constexpr (Q6) {
+#pragma unroll
+            for (int i = 0; i < 2; i++) ch.h[i] = ld_stream(c + 2048 + 512 * i + 16 * lane);
+        }
         ch.ra = tile_row<T>(c, g);
         ch.rb = tile_row<T>(c, g + 8);
     };
@@ -918,12 +937,39 @@ __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t
                 xv[j] = *reinterpret_cast<const uint2*>(sb.x + (8 * j + g) * Q8_XSTR + 32 * s + 8 * t);
                 ds[j] = *reinterpret_cast<const float4*>(sb.d + s * MT + 8 * j + 2 * t);
             }
+            const uint32_t wa = word_of(ch.q[s >> 1], 2 * (s & 1)), wb = word_of(ch.q[s >> 1], 2 * (s & 1) + 1);
+            uint32_t a[4] = {wa & 0x0F0F0F0Fu, wb & 0x0F0F0F0Fu, (wa >> 4) & 0x0F0F0F0Fu, (wb >> 4) & 0x0F0F0F0Fu};
+            if constexpr (Q6) {
+                const uint32_t hw = word_of(ch.h[s >> 2], s & 3), ha = hw & 0xFFFFu, hb = hw >> 16;
+                a[0] = less32(a[0] | hi2_bytes(ha));
+                a[1] = less32(a[1] | hi2_bytes(hb));
+                a[2] = less32(a[2] | hi2_bytes(ha >> 4));
+                a[3] = less32(a[3] | hi2_bytes(hb >> 4));
+                // The step's two int8 scales per row, and d.
+                const int sa0 = (int8_t)(word_of(ch.ra.a, s >> 1) >> (16 * (s & 1)));
+                const int sa1 = (int8_t)(word_of(ch.ra.a, s >> 1) >> (16 * (s & 1) + 8));
+                const int sb0 = (int8_t)(word_of(ch.rb.a, s >> 1) >> (16 * (s & 1)));
+                const int sb1 = (int8_t)(word_of(ch.rb.a, s >> 1) >> (16 * (s & 1) + 8));
+                const float da = __half2float(__ushort_as_half((unsigned short)ch.ra.b));
+                const float db = __half2float(__ushort_as_half((unsigned short)ch.rb.b));
+                const bool first = t < 2;
+                const uint32_t lo[4] = {first ? a[0] : 0u, first ? a[1] : 0u, first ? a[2] : 0u, first ? a[3] : 0u};
+                const uint32_t hi[4] = {first ? 0u : a[0], first ? 0u : a[1], first ? 0u : a[2], first ? 0u : a[3]};
+#pragma unroll
+                for (int j = 0; j < MT / 8; j++) {
+                    int c0[4], c1[4];
+                    mma_s8(c0, lo, xv[j].x, xv[j].y);
+                    mma_s8(c1, hi, xv[j].x, xv[j].y);
+                    acc[j][0] = fmaf((float)(c0[0] * sa0 + c1[0] * sa1), da * ds[j].x, acc[j][0]);
+                    acc[j][1] = fmaf((float)(c0[1] * sa0 + c1[1] * sa1), da * ds[j].z, acc[j][1]);
+                    acc[j][2] = fmaf((float)(c0[2] * sb0 + c1[2] * sb1), db * ds[j].x, acc[j][2]);
+                    acc[j][3] = fmaf((float)(c0[3] * sb0 + c1[3] * sb1), db * ds[j].z, acc[j][3]);
+                }
+                continue;
+            }
             float sa, ma, sb_, mb;
             tile_scale<T>(ch.ra, s, t, sa, ma);
             tile_scale<T>(ch.rb, s, t, sb_, mb);
-            const uint32_t wa = word_of(ch.q[s >> 1], 2 * (s & 1)), wb = word_of(ch.q[s >> 1], 2 * (s & 1) + 1);
-            const uint32_t a[4] = {wa & 0x0F0F0F0Fu, wb & 0x0F0F0F0Fu, (wa >> 4) & 0x0F0F0F0Fu,
-                                   (wb >> 4) & 0x0F0F0F0Fu};
 #pragma unroll
             for (int j = 0; j < MT / 8; j++) {
                 int c[4];
@@ -983,6 +1029,7 @@ __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t
     }
 QTILE8(T_Q4_0, q4_0, 8) QTILE8(T_Q4_0, q4_0, 16) QTILE8(T_Q4_0, q4_0, 32) QTILE8(T_Q4_0, q4_0, 64)
 QTILE8(T_Q4_K, q4_k, 8) QTILE8(T_Q4_K, q4_k, 16) QTILE8(T_Q4_K, q4_k, 32) QTILE8(T_Q4_K, q4_k, 64)
+QTILE8(T_Q6_K, q6_k, 8) QTILE8(T_Q6_K, q6_k, 16) QTILE8(T_Q6_K, q6_k, 32) QTILE8(T_Q6_K, q6_k, 64)
 
 #define QTILE(T, name, MT)                                                                             \
     extern "C" __global__ void __launch_bounds__(128) qtile_##name##_##MT(                             \

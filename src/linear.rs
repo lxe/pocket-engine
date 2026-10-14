@@ -86,8 +86,9 @@ pub struct TiledKernels {
     pub tile: Kernel,
     pub dequant: Kernel,
     pub mma: [Kernel; 4],
-    /// The same tiles against int8 activations (Q4_0 and Q4_K).
-    pub mma8: Option<[Kernel; 4]>,
+    /// The same tiles against int8 activations, and the most rows they beat
+    /// the bf16 paths at.
+    pub mma8: Option<([Kernel; 4], usize)>,
 }
 
 const MMA_TILES: [usize; 4] = [8, 16, 32, 64];
@@ -193,12 +194,15 @@ impl Quants {
                     dequant: gpu.kernel(&format!("dequant_tiled_{name}"))?,
                     mma: mma.try_into().unwrap_or_else(|_| unreachable!()),
                     mma8: match name {
-                        "q4_0" | "q4_k" => {
+                        // Q6_K takes two products a step, so dequantizing
+                        // to bf16 wins sooner.
+                        "q4_0" | "q4_k" | "q6_k" => {
                             let mut k = Vec::with_capacity(4);
                             for t in MMA_TILES {
                                 k.push(gpu.kernel(&format!("qtile8_{name}_{t}"))?);
                             }
-                            Some(k.try_into().unwrap_or_else(|_| unreachable!()))
+                            let most = if name == "q6_k" { 640 } else { usize::MAX };
+                            Some((k.try_into().unwrap_or_else(|_| unreachable!()), most))
                         }
                         _ => None,
                     },
@@ -297,19 +301,21 @@ impl Linear {
         let x = input.bf16;
         let elem = if f32_out { 4 } else { 2 };
         // int8 activations, quantized once for all of this layer's parts.
+        let int8 = q.act8.is_some()
+            && rows >= q.int8_rows
+            && rows <= int8_max_rows()
+            && self.cols <= ACT8_COLS;
+        let mma8_of = |p: &Part| match p.kind {
+            Kind::Tiled(ty) if int8 => q
+                .loaded(ty)
+                .and_then(|k| k.tiled.as_ref())
+                .and_then(|t| t.mma8.as_ref())
+                .filter(|(_, most)| rows <= *most)
+                .map(|(k, _)| k),
+            _ => None,
+        };
         let act8 = match &q.act8 {
-            Some((quant, buf))
-                if rows >= q.int8_rows
-                    && rows <= int8_max_rows()
-                    && self.cols <= ACT8_COLS
-                    && self.parts.iter().any(|p| match p.kind {
-                        Kind::Tiled(ty) => q
-                            .loaded(ty)
-                            .and_then(|k| k.tiled.as_ref())
-                            .is_some_and(|t| t.mma8.is_some()),
-                        _ => false,
-                    }) =>
-            {
+            Some((quant, buf)) if self.parts.iter().any(|p| mma8_of(p).is_some()) => {
                 let ti = MMA_TILES.iter().position(|&t| rows <= t).unwrap_or(3);
                 let mp = rows.next_multiple_of(MMA_TILES[ti]);
                 let xs = buf.ptr + (int8_max_rows() * ACT8_COLS) as u64;
@@ -492,7 +498,7 @@ impl Linear {
                         Some(tk) => (tk.dequant, &tk.mma, 256),
                         None => (k.dequant, &k.mma, 32),
                     };
-                    let mma8 = act8.zip(tiled.and_then(|tk| tk.mma8.as_ref()));
+                    let mma8 = act8.zip(mma8_of(p));
                     let args = |extra: &[Arg]| -> Vec<Arg> {
                         let mut v = vec![
                             P(p.buf.ptr),

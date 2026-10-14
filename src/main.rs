@@ -606,10 +606,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Kernels by name: "chunk" (prep, scan, norm), "decode" (gdn_decode)
             // or "recurrent" (gdn_recurrent). Phases: 1 the prep, 2 the scan or
             // recurrence, 4 the norm.
-            let (nbuf, per_sm) = pocket_engine::model::gdn_decode_shape(true, gpu.smem_per_sm)
-                .ok_or("no room for gdn_decode")?;
-            let kdecode = gpu.kernel("gdn_decode")?;
-            gpu.set_smem(kdecode, nbuf * 2 * d * d)?;
+            // Where gdn_decode's buffers do not fit (AMD's 64 KB), "decode"
+            // runs gdn_recurrent, as the engine does.
+            let dshape = pocket_engine::model::gdn_decode_shape(true, gpu.smem_per_sm);
+            let (nbuf, per_sm) = dshape.unwrap_or((0, 0));
+            let kdecode = match dshape {
+                Some(_) => {
+                    let k = gpu.kernel("gdn_decode")?;
+                    gpu.set_smem(k, nbuf * 2 * d * d)?;
+                    Some(k)
+                }
+                None => None,
+            };
             let launch = |name: &str, fresh_ptr: u64, phases: u8| -> pocket_engine::Result<()> {
                 if name == "chunk" && phases & 1 != 0 {
                     gpu.launch(
@@ -656,8 +664,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Arg::P(0),
                             ],
                         ),
-                        "decode" => (
-                            kdecode,
+                        "decode" if kdecode.is_some() => (
+                            kdecode.expect("checked"),
                             (nbuf * 2 * d * d) as u32,
                             ((seqs * hv).min(gpu.sms * per_sm) as u32, 1, 1),
                             vec![Arg::I(seqs as i32), Arg::I(nbuf as i32)],
@@ -669,7 +677,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             vec![],
                         ),
                     };
-                    let threads = if name == "decode" { 256 } else { 2 * d as u32 };
+                    let threads = if name == "decode" && kdecode.is_some() {
+                        256
+                    } else {
+                        2 * d as u32
+                    };
                     gpu.launch(
                         kern,
                         grid,

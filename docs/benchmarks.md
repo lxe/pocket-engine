@@ -32,14 +32,14 @@ The B200 rows predate its own prompt attention and decode kernels: see [B200 ker
 
 ## B200 kernels
 
-On a B200, prompt attention now runs on tcgen05 tensor cores with tensor memory, as FlashAttention 4 does. The heads that share keys and values form one cluster that loads each tile once. The linear-attention decode keeps the next heads' states loading while one computes. Measured on two pods of the same kind ([receipt](receipts/b200-kernels.json)):
+On a B200, prompt attention runs on tcgen05 tensor cores with tensor memory, as FlashAttention 4 does. The two heads of a pair run as one 256-row matrix multiply across two SMs, each staging half of every key and value tile; the heads that share keys and values form one cluster that loads each tile once. The linear-attention decode keeps the next heads' states and inputs loading while one computes. Measured on pods of the same kind ([receipt](receipts/b200-kernels.json)):
 
 | | Before | Now | vLLM, same pod |
 |---|---:|---:|---:|
-| Qwen3.5-9B, first token for a 64k-token prompt | 2.50 s | 1.48 s | 1.32–1.38 s |
-| Prompt attention at 64k tokens (`bench-attn`) | 251 TFLOPS | 1,000 TFLOPS | |
-| Linear-attention decode, 64 sequences of 27B (`bench-gdn`) | 115 µs | 78 µs | |
-| Qwen3.8-27B, 64 requests in flight | 1,583 tok/s | 1,672 tok/s | 1,236 tok/s |
+| Qwen3.5-9B, first token for a 64k-token prompt | 2.50 s | 1.44 s | 1.32–1.38 s |
+| Prompt attention at 64k tokens (`bench-attn`) | 251 TFLOPS | 1,050 TFLOPS | |
+| Linear-attention decode, 64 sequences of 27B (`bench-gdn`) | 115 µs | 69 µs | |
+| Qwen3.8-27B, 64 requests in flight | 1,583 tok/s | 1,655 tok/s | 1,236 tok/s |
 
 These pods capped each container at 20 CPUs on a busy host. That slows vLLM's scheduler: its one-stream rates there were 20–30% under its own in the table above, so its last number here understates it. Against that table's 1,803 tok/s, 27B at 64 in flight is close but not yet matched.
 

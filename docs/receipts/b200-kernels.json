@@ -481,5 +481,165 @@
   "attn_tc_g4: 1 x 65536 tokens after 0, 16 heads: 34.87 ms, 1009.0 TFLOPS",
   "flash against paged: |diff| median 7.63e-6, p99 1.22e-4, max 3.91e-3 (outputs up to 0.719)",
   "attn_tc_g6: 1 x 65536 tokens after 0, 24 heads: 52.87 ms, 998.2 TFLOPS"
- ]
+ ],
+ "pod4": {
+  "ce1a3ff (2-CTA attention, staged gdn_decode, wider conv and norm)": {
+   "9b": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 2.65,
+     "out_tok_s": 218.4,
+     "ttft_p50": 0.014,
+     "ttft_p95": 0.035,
+     "lat_p50": 0.138,
+     "lat_p95": 0.273,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.63,
+     "out_tok_s": 1382.3,
+     "ttft_p50": 0.024,
+     "ttft_p95": 0.057,
+     "lat_p50": 0.175,
+     "lat_p95": 0.326,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 1.46,
+     "out_tok_s": 2393.2,
+     "ttft_p50": 0.03,
+     "ttft_p95": 0.073,
+     "lat_p50": 0.198,
+     "lat_p95": 0.368,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 1.35,
+     "out_tok_s": 3329.1,
+     "ttft_p50": 0.052,
+     "ttft_p95": 0.176,
+     "lat_p50": 0.277,
+     "lat_p95": 0.528,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 2.15,
+     "out_tok_s": 3068.6,
+     "ttft_p50": 0.218,
+     "ttft_p95": 1.209,
+     "lat_p50": 0.47,
+     "lat_p95": 1.392,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 0.98,
+     "out_tok_s": 2301.6,
+     "ttft_p50": 0.406,
+     "ttft_p95": 0.637,
+     "lat_p50": 0.634,
+     "lat_p95": 0.846,
+     "first_error": null
+    }
+   ],
+   "27b": [
+    {
+     "case": "closed c=1",
+     "ok": 16,
+     "errors": 0,
+     "wall_s": 4.62,
+     "out_tok_s": 84.3,
+     "ttft_p50": 0.026,
+     "ttft_p95": 0.037,
+     "lat_p50": 0.226,
+     "lat_p95": 0.377,
+     "first_error": null
+    },
+    {
+     "case": "closed c=8",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 3.35,
+     "out_tok_s": 501.7,
+     "ttft_p50": 0.032,
+     "ttft_p95": 0.063,
+     "lat_p50": 0.324,
+     "lat_p95": 0.678,
+     "first_error": null
+    },
+    {
+     "case": "closed c=16",
+     "ok": 96,
+     "errors": 0,
+     "wall_s": 2.93,
+     "out_tok_s": 906.1,
+     "ttft_p50": 0.041,
+     "ttft_p95": 0.112,
+     "lat_p50": 0.368,
+     "lat_p95": 0.876,
+     "first_error": null
+    },
+    {
+     "case": "closed c=32",
+     "ok": 128,
+     "errors": 0,
+     "wall_s": 2.72,
+     "out_tok_s": 1258.8,
+     "ttft_p50": 0.07,
+     "ttft_p95": 0.248,
+     "lat_p50": 0.501,
+     "lat_p95": 1.113,
+     "first_error": null
+    },
+    {
+     "case": "closed c=64",
+     "ok": 192,
+     "errors": 0,
+     "wall_s": 3.02,
+     "out_tok_s": 1655.1,
+     "ttft_p50": 0.135,
+     "ttft_p95": 0.476,
+     "lat_p50": 0.749,
+     "lat_p95": 1.635,
+     "first_error": null
+    },
+    {
+     "case": "burst n=64",
+     "ok": 64,
+     "errors": 0,
+     "wall_s": 1.44,
+     "out_tok_s": 1174.9,
+     "ttft_p50": 0.398,
+     "ttft_p95": 0.641,
+     "lat_p50": 0.883,
+     "lat_p95": 1.256,
+     "first_error": null
+    }
+   ],
+   "9b_64k_first_token_s": [
+    1.436,
+    1.454
+   ],
+   "kernels": [
+    "attn_tc_g4 64k: 1038.6 TFLOPS; attn_tc_g6 64k: 1049.9 TFLOPS",
+    "gdn_decode 64 x 48 heads: 68.9 us (pod 3, 2681ca0)"
+   ]
+  }
+ }
 }

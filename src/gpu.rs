@@ -261,6 +261,9 @@ pub struct Gpu {
     _workspace: Buf,
     staging: RefCell<Option<Staging>>,
     pub name: String,
+    /// AMD: matrix-vector kernels for products of 1 to 4 rows (skinny_bf16_r*).
+    #[cfg(feature = "rocm")]
+    skinny: [Kernel; 4],
 }
 
 const KERNEL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qwen35.fatbin"));
@@ -351,6 +354,19 @@ impl Gpu {
                 cu::cuModuleLoadData(&mut module, image.as_ptr().cast()),
                 "cuModuleLoadData",
             )?;
+            #[cfg(feature = "rocm")]
+            let skinny = {
+                let mut ks = [Kernel(std::ptr::null_mut()); 4];
+                for (r, k) in ks.iter_mut().enumerate() {
+                    let name =
+                        CString::new(format!("skinny_bf16_r{}", r + 1)).expect("kernel name");
+                    check(
+                        cu::cuModuleGetFunction(&mut k.0, module, name.as_ptr()),
+                        "cuModuleGetFunction",
+                    )?;
+                }
+                ks
+            };
             let mut blas = std::ptr::null_mut();
             check_blas(cb::cublasCreate_v2(&mut blas), "cublasCreate")?;
             check_blas(
@@ -393,6 +409,8 @@ impl Gpu {
                 _workspace: workspace,
                 staging: RefCell::new(None),
                 name,
+                #[cfg(feature = "rocm")]
+                skinny,
             })
         }
     }
@@ -734,6 +752,25 @@ impl Gpu {
         ldy: usize,
         f32_out: bool,
     ) -> Result<()> {
+        // On AMD, decoding's 1 to 4 rows stream the weights in skinny_bf16_r*.
+        #[cfg(feature = "rocm")]
+        if (1..=4).contains(&rows) && inp.is_multiple_of(32) {
+            return self.launch(
+                self.skinny[rows - 1],
+                (out.div_ceil(4) as u32, 1, 1),
+                256,
+                0,
+                &[
+                    Arg::P(w),
+                    Arg::P(x),
+                    Arg::P(y),
+                    Arg::I(inp as i32),
+                    Arg::I(out as i32),
+                    Arg::I(ldy as i32),
+                    Arg::I(f32_out as i32),
+                ],
+            );
+        }
         let (alpha, beta) = (1f32, 0f32);
         let c_type = if f32_out {
             cb::cudaDataType_t::CUDA_R_32F

@@ -31,11 +31,14 @@ Against the same bf16 references, so these show each format's own error.
 | Qwen3.8-27B-FP8 checkpoint | 209 of 213 | 0.0009, 0.088 |
 | Qwen3.5-27B-FP8 checkpoint | 215 of 217 | 0.0003, 0.066 |
 | Qwen3.5-9B, `--fp8` | 213 of 220 | 0.0011, 0.16 |
-| Qwen3.8-27B Q4_K_M (GGUF) | 207 of 213 | 0.0019, 0.17 |
-| Qwen3.8-27B UD-Q4_K_XL (GGUF) | 210 of 213 | 0.0011, 0.16 |
+| Qwen3.8-27B Q4_K_M (GGUF) | 207 of 213 | 0.0018, 0.18 |
+| Qwen3.8-27B UD-Q4_K_XL (GGUF) | 210 of 213 | 0.0010, 0.15 |
+| Qwen3.5-9B Q4_K_M (GGUF) | 208 of 220 | 0.0017, 0.30 |
 | Qwen3.8-27B NVFP4 checkpoint, as MXFP4 | 197 of 213 | 0.0053, 0.42 |
-| Qwen3.5-0.8B Q8_0 (GGUF) | 217 of 222 | 0.0035, 0.051 |
-| Qwen3.5-0.8B Q4_K_M (GGUF) | 199 of 222 | 0.044, 0.57 |
+| Qwen3.5-0.8B Q8_0 (GGUF) | 215 of 222 | 0.0042, 0.058 |
+| Qwen3.5-0.8B Q4_K_M (GGUF) | 199 of 222 | 0.039, 0.58 |
+
+GGUF rows use int8 activations, the default. With `--no-int8` they differ only by noise (9B Q4_K_M: 208 of 220, 0.0014, 0.34).
 
 FP8 receipts: [fp8.json](receipts/fp8.json).
 

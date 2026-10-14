@@ -278,6 +278,50 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
 #include "amd/gdn_decode.cuh"
 #endif
 
+// Which prompt sequence holds unit `target` when the step's prompt
+// sequences (more than one token, not verifying drafts) are cut into units
+// of `unit` tokens and numbered in order; -1 past the last. The block's
+// threads each count a slice of the sequences and a prefix sum finds the
+// slice, so a step of many short prompts costs a few loads per thread
+// rather than one thread walking every sequence. Every thread must call it.
+__device__ __forceinline__ void block_find_unit(const int* __restrict__ cu, int seqs, const int* __restrict__ outs,
+                                                int spec, int unit, int target, int& s_out, int& local_out) {
+    __shared__ int warp_sum[32], found[2];
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, T = blockDim.x;
+    const int per = (seqs + T - 1) / T, i0 = min(seqs, tid * per), i1 = min(seqs, i0 + per);
+    auto units = [&](int i) {
+        const int n = cu[i + 1] - cu[i];
+        return n <= 1 || is_spec(outs, spec, i) ? 0 : (n + unit - 1) / unit;
+    };
+    int mine = 0;
+    for (int i = i0; i < i1; i++) mine += units(i);
+    int incl = mine;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, incl, o);
+        if (lane >= o) incl += y;
+    }
+    if (lane == 31) warp_sum[w] = incl;
+    if (tid == 0) found[0] = -1;
+    __syncthreads();
+    for (int k = 0; k < w; k++) incl += warp_sum[k];
+    if (target >= incl - mine && target < incl) {
+        int left = target - (incl - mine);
+        for (int i = i0; i < i1; i++) {
+            const int u = units(i);
+            if (left < u) {
+                found[0] = i;
+                found[1] = left;
+                break;
+            }
+            left -= u;
+        }
+    }
+    __syncthreads();
+    s_out = found[0];
+    local_out = found[1];
+}
+
 // Gated delta rule, one block of 256 threads per (sequence, value head). The
 // head's [k, v] state lives in registers: threads 2j and 2j+1 hold rows 0..63
 // and 64..127 of column j. Per token:
@@ -486,17 +530,8 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
     float* sE = sg + GC;                        // [GC] beta exp(G)
     float* sN = sE + GC;                        // [2][GC] q's and k's inverse norms
     const int h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
-    int s = -1, chunk = blockIdx.x;
-    for (int i = 0; i < seqs; i++) {
-        const int n = cu[i + 1] - cu[i];
-        if (n <= 1 || is_spec(outs, spec, i)) continue;
-        const int chunks = (n + GC - 1) / GC;
-        if (chunk < chunks) {
-            s = i;
-            break;
-        }
-        chunk -= chunks;
-    }
+    int s, chunk;
+    block_find_unit(cu, seqs, outs, spec, GC, blockIdx.x, s, chunk);
     if (s < 0) return;
     const int c0 = cu[s] + chunk * GC, n = min(GC, cu[s + 1] - c0);
     const int kh = tiled ? h % Hk : h / (Hv / Hk);

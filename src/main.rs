@@ -980,6 +980,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect())
                 };
                 let (a, b) = (fetch(reference.ptr)?, fetch(out.ptr)?);
+                if std::env::var_os("POCKET_CHECK_HEADS").is_some() {
+                    // The largest difference by head, and the first token where it occurs.
+                    for hh in 0..hq {
+                        let (mut worst, mut at) = (0f32, 0);
+                        for tt in 0..t {
+                            for d in 0..D {
+                                let i = (tt * hq + hh) * D + d;
+                                let e = (a[i] - b[i]).abs();
+                                if e > worst {
+                                    (worst, at) = (e, tt);
+                                }
+                            }
+                        }
+                        println!("head {hh}: max |diff| {worst:.2e} at token {at}");
+                        if worst > 5e-3 {
+                            let bad: Vec<usize> = (0..t)
+                                .filter(|&tt| {
+                                    (0..D).any(|d| {
+                                        (a[(tt * hq + hh) * D + d] - b[(tt * hq + hh) * D + d])
+                                            .abs()
+                                            > 5e-3
+                                    })
+                                })
+                                .collect();
+                            let cols: Vec<usize> = (0..D)
+                                .filter(|&d| {
+                                    (0..t).any(|tt| {
+                                        (a[(tt * hq + hh) * D + d] - b[(tt * hq + hh) * D + d])
+                                            .abs()
+                                            > 5e-3
+                                    })
+                                })
+                                .collect();
+                            println!("  tokens {bad:?}\n  columns {cols:?}");
+                        }
+                    }
+                }
                 let mut diffs: Vec<f32> = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).collect();
                 diffs.sort_by(f32::total_cmp);
                 let amax = a.iter().fold(0f32, |m, x| m.max(x.abs()));

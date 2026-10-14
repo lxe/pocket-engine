@@ -1,19 +1,44 @@
 """Accuracy check against Transformers.
 
-  python scripts/accuracy.py reference MODEL_DIR OUT [N]   # greedy continuations + teacher-forced top-5
+  python scripts/accuracy.py reference MODEL_DIR OUT [N] [--adapter LORA_DIR]   # greedy + teacher-forced top-5
   python scripts/accuracy.py long MODEL_DIR OUT            # the same over ~3,300-token prompts (docs/)
   pocket-engine score --model MODEL_DIR OUT.pairs.json OUT.ours.json
   python scripts/accuracy.py compare OUT.ref.json OUT.ours.json
 
-`reference` needs torch and transformers (see docs/testing.md); `compare` needs only Python."""
+`reference` needs torch and transformers (see docs/testing.md); `compare` needs only Python. With --adapter,
+the PEFT adapter is merged into the weights (W += scale * B A in f32), the model a merged checkpoint would be."""
 import json, sys
 
 
-def reference(M, OUT, N=48, prompts=None):
+def merge_adapter(model, path):
+    import torch, re
+    from safetensors.torch import load_file
+    cfg = json.load(open(path + "/adapter_config.json"))
+    sd = load_file(path + "/adapter_model.safetensors")
+    mods = dict(model.named_modules())
+    n = 0
+    for k, a in sd.items():
+        if not k.endswith(".lora_A.weight"):
+            continue
+        stem = k[: -len(".lora_A.weight")]
+        layer, module = re.search(r"layers\.(\d+)\.(.+)$", stem).groups()
+        b = sd[stem + ".lora_B.weight"]
+        r = a.shape[0]
+        scale = cfg["lora_alpha"] / (r ** 0.5 if cfg.get("use_rslora") else r)
+        w = mods[f"model.layers.{layer}.{module}"].weight
+        with torch.no_grad():
+            w.copy_((w.float() + scale * (b.float().to(w.device) @ a.float().to(w.device))).to(w.dtype))
+        n += 1
+    print(f"merged {n} LoRA modules from {path}")
+
+
+def reference(M, OUT, N=48, prompts=None, adapter=None):
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
     tok = AutoTokenizer.from_pretrained(M)
     model = AutoModelForCausalLM.from_pretrained(M, dtype=torch.bfloat16, device_map="cuda").eval()
+    if adapter:
+        merge_adapter(model, adapter)
     if callable(prompts):
         prompts = prompts(tok)
     prompts = prompts or [
@@ -73,9 +98,14 @@ def compare(ref_path, ours_path):
 
 
 if __name__ == "__main__":
+    adapter = None
+    if "--adapter" in sys.argv:
+        i = sys.argv.index("--adapter")
+        adapter = sys.argv[i + 1]
+        del sys.argv[i:i + 2]
     if sys.argv[1] == "long":
-        reference(sys.argv[2], sys.argv[3], 96, long_prompts)
+        reference(sys.argv[2], sys.argv[3], 96, long_prompts, adapter)
     elif sys.argv[1] == "reference":
-        reference(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 48)
+        reference(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 48, adapter=adapter)
     else:
         compare(sys.argv[2], sys.argv[3])

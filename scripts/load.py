@@ -1,6 +1,7 @@
 """Closed-loop and burst load against an OpenAI-style /v1/chat/completions endpoint (streamed): output tok/s, TTFT and
 latency percentiles. Usage: load.py URL MODEL OUT.json
-LOAD_CASES="1:16,16:96" picks other closed-loop cases (requests in flight:total); LOAD_BURST=0 skips the burst."""
+LOAD_CASES="1:16,16:96" picks other closed-loop cases (requests in flight:total); LOAD_BURST=0 skips the burst;
+LOAD_MODELS="a,b" sends requests to those model names in turn (LoRA adapters) instead of MODEL."""
 import os
 import asyncio, json, random, sys, time
 import httpx
@@ -13,9 +14,13 @@ def prompt():
     return "Summarize briefly: " + " ".join(rng.choice(WORDS) for _ in range(n))
 REQS = [(prompt(), rng.choice([16, 32, 48, 64])) for _ in range(512)]
 
+MODELS = os.environ.get("LOAD_MODELS", "").split(",") if os.environ.get("LOAD_MODELS") else [MODEL]
+SENT = [0]
+
 async def one(c, p, mt):
     t0 = time.perf_counter(); ttft = None; toks = 0
-    async with c.stream("POST", URL + "/v1/chat/completions", json={"model": MODEL, "messages": [{"role": "user", "content": p}],
+    model = MODELS[SENT[0] % len(MODELS)]; SENT[0] += 1
+    async with c.stream("POST", URL + "/v1/chat/completions", json={"model": model, "messages": [{"role": "user", "content": p}],
             "max_tokens": mt, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}) as r:
         if r.status_code != 200:
             return {"err": r.status_code, "body": (await r.aread())[:200].decode(errors="replace")}

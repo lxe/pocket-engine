@@ -106,9 +106,9 @@ enum Cmd {
         /// Listen address.
         #[arg(long, default_value = "127.0.0.1:8190")]
         bind: String,
-        /// Model name in the API.
-        #[arg(long, default_value = "qwen3.5")]
-        name: String,
+        /// Model name in the API [default: the model's file or directory name].
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Dump dequantized rows of a GGUF tensor.
     ///
@@ -239,6 +239,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind,
             name,
         } => {
+            let name = name.unwrap_or_else(|| {
+                let p = &args.model;
+                let stem = if p.is_dir() {
+                    p.file_name()
+                } else {
+                    p.file_stem()
+                };
+                stem.map_or("qwen".into(), |s| s.to_string_lossy().into_owned())
+            });
             let (tx, info, health) = engine::spawn(args.config())?;
             let tok = ChatTokenizer::load(&args.model)?;
             let spec = if info.vision {

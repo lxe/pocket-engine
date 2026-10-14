@@ -27,7 +27,7 @@ git clone https://github.com/lxe/pocket-engine && cd pocket-engine
 CUDA_COMPUTE_CAP=90a cargo build --release --features cuda   # 100a for B200, 120a for RTX 50-series
 
 hf download Qwen/Qwen3.5-2B --local-dir models/qwen3.5-2b
-target/release/pocket-engine serve --model models/qwen3.5-2b --name qwen3.5-2b --bind 0.0.0.0:8000
+target/release/pocket-engine serve --model models/qwen3.5-2b --bind 0.0.0.0:8000
 ```
 
 ```sh

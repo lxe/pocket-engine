@@ -35,7 +35,7 @@ A model directory needs `config.json`, the safetensors files, `tokenizer.json` a
 
 ```sh
 hf download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-Q4_K_M.gguf --local-dir models
-pocket-engine serve --model models/Qwen3.5-9B-Q4_K_M.gguf --name qwen3.5-9b --bind 0.0.0.0:8000
+pocket-engine serve --model models/Qwen3.5-9B-Q4_K_M.gguf --bind 0.0.0.0:8000
 ```
 
 ## API
@@ -53,7 +53,7 @@ Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `sto
 | Option | Default | |
 |---|---|---|
 | `--model PATH` | required | Model directory or GGUF file |
-| `--name NAME` | `qwen3.5` | Model name in the API |
+| `--name NAME` | file or directory name | Model name in the API |
 | `--bind ADDR` | `127.0.0.1:8190` | Listen address |
 | `--device N` | 0 | GPU index |
 | `--max-context N` | 4096 | Longest prompt plus output |

@@ -7,7 +7,9 @@
 // Activations are row-major bf16 [tokens, width]. Reductions run in f32, and
 // values are rounded to bf16 where the reference model rounds them.
 
+#ifndef __HIP_PLATFORM_AMD__
 #include <cuda_bf16.h>
+#endif
 #include <stdint.h>
 
 typedef __nv_bfloat16 bf16;
@@ -82,7 +84,9 @@ __device__ __forceinline__ uint4 pack8(const float* f) {
     return u;
 }
 
+#ifndef __HIP_PLATFORM_AMD__
 #include <cuda.h>
+#endif
 #include <type_traits>
 #include "fp8.cuh"
 
@@ -418,35 +422,67 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_recurrent(GDN_ARGS
 #define GPSTR 40  // bf16 row stride of the 32-wide P tile
 // cp.async of 16 (or 4) bytes that zero-fills when !valid (src is not read).
 __device__ __forceinline__ void cp16z(void* dst, const void* src, bool valid) {
+#ifdef __HIP_PLATFORM_AMD__
+    *reinterpret_cast<uint4*>(dst) = valid ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
+#else
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"((uint32_t)__cvta_generic_to_shared(dst)),
                  "l"(src), "r"(valid ? 16 : 0)
                  : "memory");
+#endif
 }
 __device__ __forceinline__ void cp4(void* dst, const void* src) {
+#ifdef __HIP_PLATFORM_AMD__
+    *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(src);
+#else
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((uint32_t)__cvta_generic_to_shared(dst)), "l"(src)
                  : "memory");
+#endif
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_commit() {
+#ifdef __HIP_PLATFORM_AMD__
+    // cp.async copies are synchronous on AMD.
+#else
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+#endif
+}
 template <int N>
-__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
+__device__ __forceinline__ void cp_wait() {
+#ifdef __HIP_PLATFORM_AMD__
+    // cp.async copies are synchronous on AMD.
+#else
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+#endif
+}
 __device__ __forceinline__ void ldsm_x4(uint32_t* r, const void* p) {
+#ifdef __HIP_PLATFORM_AMD__
+    pe::ldsm_x4(r, p, false);
+#else
     const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(a));
+#endif
 }
 __device__ __forceinline__ void ldsm_x4_t(uint32_t* r, const void* p) {
+#ifdef __HIP_PLATFORM_AMD__
+    pe::ldsm_x4(r, p, true);
+#else
     const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(a));
+#endif
 }
 __device__ __forceinline__ void gmma(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#ifdef __HIP_PLATFORM_AMD__
+    pe::mma_16816_bf16(d, a, b0, b1);
+#else
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
         "{%0,%1,%2,%3};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
 }
 // Fragment loads (lane l: q = l / 8, r = l % 8). A tile 16 x 16 at (m0, k0)
 // from row-major X[m][k], or from X[k][m] (transposed); B as two 8-column
@@ -651,7 +687,11 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
 // norms), D, and the state's columns. NS > 1 double-buffers the inputs so the next chunk loads while
 // this one computes; NS == 1 would not fit an RTX 5090 that way.
 #define GDN_VS(NS) (GDN_DIM / (NS) + 8)
+#ifdef __HIP_PLATFORM_AMD__
+#define GDN_NB(NS) 1  // 64 KB of LDS per block on gfx942: no double buffering
+#else
 #define GDN_NB(NS) ((NS) > 1 ? 2 : 1)
+#endif
 #define GDN_BUF(NS) (3 * GC * GSTR * 2 + GC * GDN_VS(NS) * 2 + GC * GPSTR * 2 + 3 * GC * 4)
 #define GDN_SCAN_SMEM(NS) (GDN_NB(NS) * GDN_BUF(NS) + 2 * GC * GDN_VS(NS) * 2 + GDN_DIM * GDN_VS(NS) * 2)
 template <int NS>
@@ -1204,9 +1244,13 @@ ATTN_KERNEL(8, 4)
 #define FA_STR (HEAD_DIM + 8)
 #define LOG2E 1.4426950408889634f
 __device__ __forceinline__ float fast_exp2(float x) {
+#ifdef __HIP_PLATFORM_AMD__
+    return exp2f(x);
+#else
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
+#endif
 }
 __device__ __forceinline__ uint32_t fa_bf2(float lo, float hi) {
     __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
@@ -1225,12 +1269,34 @@ __device__ __forceinline__ uint32_t fa_bf2(float lo, float hi) {
 template <int G, int NT, int BN>
 __host__ __device__ constexpr int fg_smem() { return (G * 16 * NT + 4 * BN) * FA_STR * 2; }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
+#ifdef __HIP_PLATFORM_AMD__
+    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+#else
     const uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
+#endif
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cp_async_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
-__device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_group 0;\n" ::); }
+__device__ __forceinline__ void cp_async_commit() {
+#ifdef __HIP_PLATFORM_AMD__
+    // cp.async copies are synchronous on AMD.
+#else
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+__device__ __forceinline__ void cp_async_wait1() {
+#ifdef __HIP_PLATFORM_AMD__
+    // cp.async copies are synchronous on AMD.
+#else
+    asm volatile("cp.async.wait_group 1;\n" ::);
+#endif
+}
+__device__ __forceinline__ void cp_async_wait0() {
+#ifdef __HIP_PLATFORM_AMD__
+    // cp.async copies are synchronous on AMD.
+#else
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
 
 template <int G, bool F8, int NT, int BN, bool QR>
 __device__ __forceinline__ void attn_flash_group(
@@ -1485,6 +1551,9 @@ ATTN_GROUP_R(4, 2, 32)
 ATTN_GROUP_R(6, 1, 32)
 ATTN_GROUP_R(4, 2, 64)
 ATTN_GROUP_R(6, 1, 64)
+// AMD's 64 KB of LDS per block.
+ATTN_GROUP_R(4, 1, 16)
+ATTN_GROUP_R(6, 1, 16)
 
 // ---------------------------------------------------------------------------
 // Flash attention for prompts on Hopper's wgmma (sm_90a). A block takes 64

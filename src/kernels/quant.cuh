@@ -426,11 +426,15 @@ __device__ __forceinline__ uint32_t bf2(float lo, float hi) {
     return *reinterpret_cast<uint32_t*>(&v);
 }
 __device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#ifdef __HIP_PLATFORM_AMD__
+    pe::mma_16816_bf16(d, a, b0, b1);
+#else
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
         "{%0,%1,%2,%3};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
 }
 
 template <int T, int MT>
@@ -765,11 +769,15 @@ __device__ void tile_dequant(const uint8_t* __restrict__ W, int r0, int rows, in
 }
 
 __device__ __forceinline__ uint4 ld_stream(const uint8_t* p) {
+#ifdef __HIP_PLATFORM_AMD__
+    return *reinterpret_cast<const uint4*>(p);
+#else
     uint4 v;
     asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                  : "l"(p));
     return v;
+#endif
 }
 
 // Y[m][off + n] = X[m] . W[n] from the tiled layout, on tensor cores: qmma's
@@ -920,10 +928,14 @@ extern "C" __global__ void quant_act8(const bf16* __restrict__ X, int ldx, int M
 }
 
 __device__ __forceinline__ void mma_s8(int* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#ifdef __HIP_PLATFORM_AMD__
+    pe::mma_16832_s8(c, a, b0, b1);
+#else
     asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%10,%10,%10,%10};"
                  : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+#endif
 }
 
 // Q6_K's two high bits of a word's 8 inputs (input i at bit 2i) moved to bit

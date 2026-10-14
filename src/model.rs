@@ -42,6 +42,8 @@ fn split_ranges(t: usize, hkv: usize, sms: usize) -> usize {
 pub fn fa_shape(g: usize, arch: u32, fp8: bool) -> FaShape {
     let shape = |tiles, keys, qreg| FaShape { tiles, keys, qreg };
     match (arch, g, fp8) {
+        // AMD gfx942 (compute capability 9.4 under HIP): 64 KB per block.
+        (94, 4 | 6, false) => shape(1, 16, true),
         (90 | 100 | 103, 4, _) => shape(2, 64, false),
         (90 | 100 | 103, 6, _) => shape(2, 32, false),
         (_, 4, false) => shape(2, 32, true),
@@ -107,7 +109,12 @@ pub fn fa_wgmma(g: usize, arch: u32, kv_fp8: bool) -> bool {
 pub const GDN_PREP_SMEM: usize = 3 * 32 * 136 * 2 + 32 * 36 * 4 + 6 * 32 * 4;
 pub fn gdn_scan_smem(ns: usize) -> usize {
     let vs = 128 / ns + 8;
-    let buffers = if ns > 1 { 2 } else { 1 };
+    // AMD's 64 KB of LDS per block leaves no room for a second buffer.
+    let buffers = if ns > 1 && !cfg!(feature = "rocm") {
+        2
+    } else {
+        1
+    };
     buffers * (3 * 32 * 136 * 2 + 32 * vs * 2 + 32 * 40 * 2 + 3 * 32 * 4)
         + 2 * 32 * vs * 2
         + 128 * vs * 2
@@ -119,7 +126,8 @@ pub fn gdn_split(s: usize, hv: usize, gpu: &Gpu) -> usize {
     [4, 2]
         .into_iter()
         .find(|&ns| s * hv * ns <= resident(ns))
-        .unwrap_or(1)
+        // A whole state's columns (gdn_scan1) need more than AMD's 64 KB.
+        .unwrap_or(if cfg!(feature = "rocm") { 2 } else { 1 })
 }
 
 #[derive(Debug, Clone)]

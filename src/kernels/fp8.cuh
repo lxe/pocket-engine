@@ -8,7 +8,9 @@
 // Activations are quantized where they are produced (RMSNorm, SiLU, the
 // gated delta rule's output norm, attention's output gate), from registers.
 
+#ifndef __HIP_PLATFORM_AMD__
 #include <cuda_fp8.h>
+#endif
 
 __device__ __forceinline__ uint8_t to_e4m3(float x) { return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3); }
 __device__ __forceinline__ float from_e4m3(uint8_t v) {

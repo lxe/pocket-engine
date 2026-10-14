@@ -1,6 +1,6 @@
 # pocket-engine
 
-An inference server for Qwen3.5 models, written from scratch in Rust and CUDA, with an OpenAI-compatible chat API.
+An inference server for Qwen3.5 and Qwen3.8 models, written from scratch in Rust and CUDA, with an OpenAI-compatible chat API.
 
 - **Starts in seconds.** Serving 3 seconds after launch, where vLLM takes 1.5 to 3 minutes.
 - **Fast first tokens.** 13.5 ms for a short prompt against vLLM's 57.5 ms.

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
-description = "Qwen3.5 inference server on hand-written CUDA kernels with continuous batching"
+description = "Qwen3.5 and Qwen3.8 inference server on hand-written CUDA kernels with continuous batching"
 repository = "https://github.com/lxe/pocket-engine"
 publish = false
 

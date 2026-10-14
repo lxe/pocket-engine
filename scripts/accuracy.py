@@ -6,8 +6,33 @@
   python scripts/accuracy.py compare OUT.ref.json OUT.ours.json
 
 `reference` needs torch and transformers (see docs/testing.md); `compare` needs only Python. With --adapter,
-the PEFT adapter is merged into the weights (W += scale * B A in f32), the model a merged checkpoint would be."""
-import json, sys
+the PEFT adapter runs unmerged, as PEFT and vLLM run it: y += scale * (x A^T) B^T in f32. ADAPTER_MERGED=1
+merges it into the bf16 weights instead, which rounds every weight it touches again. REF_PAIRS=FILE scores the
+continuations of an earlier pairs file instead of generating new ones."""
+import json, os, sys
+
+
+def hook_adapter(model, path):
+    """Applies a PEFT adapter unmerged, as PEFT runs it: y += scale * (x A^T) B^T, in f32."""
+    import torch, re
+    from safetensors.torch import load_file
+    cfg = json.load(open(path + "/adapter_config.json"))
+    sd = load_file(path + "/adapter_model.safetensors")
+    mods = dict(model.named_modules())
+    n = 0
+    for k, a in sd.items():
+        if not k.endswith(".lora_A.weight"):
+            continue
+        stem = k[: -len(".lora_A.weight")]
+        layer, module = re.search(r"layers\.(\d+)\.(.+)$", stem).groups()
+        b = sd[stem + ".lora_B.weight"]
+        r = a.shape[0]
+        scale = cfg["lora_alpha"] / (r ** 0.5 if cfg.get("use_rslora") else r)
+        m = mods[f"model.layers.{layer}.{module}"]
+        A, B = a.float().to(m.weight.device), (b.float() * scale).to(m.weight.device)
+        m.register_forward_hook(lambda mod, inp, out, A=A, B=B: (out.float() + (inp[0].float() @ A.T) @ B.T).to(out.dtype))
+        n += 1
+    print(f"hooked {n} LoRA modules from {path}")
 
 
 def merge_adapter(model, path):
@@ -37,8 +62,10 @@ def reference(M, OUT, N=48, prompts=None, adapter=None):
     from transformers import AutoTokenizer, AutoModelForCausalLM
     tok = AutoTokenizer.from_pretrained(M)
     model = AutoModelForCausalLM.from_pretrained(M, dtype=torch.bfloat16, device_map="cuda").eval()
-    if adapter:
+    if adapter and os.environ.get("ADAPTER_MERGED"):
         merge_adapter(model, adapter)
+    elif adapter:
+        hook_adapter(model, adapter)
     if callable(prompts):
         prompts = prompts(tok)
     prompts = prompts or [
@@ -49,12 +76,18 @@ def reference(M, OUT, N=48, prompts=None, adapter=None):
         "What is 17 * 23? Show your work step by step.",
     ]
     pairs, ref = [], []
-    for p in prompts:
-        text = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False, tokenize=False)
-        ids = tok(text, add_special_tokens=False)["input_ids"]
+    # REF_PAIRS scores the continuations of an earlier pairs file instead of generating.
+    given = json.load(open(os.environ["REF_PAIRS"])) if os.environ.get("REF_PAIRS") else None
+    for i, p in enumerate(given or prompts):
+        if given:
+            ids, g = p["prompt"], p["forced"]
+        else:
+            text = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False, tokenize=False)
+            ids = tok(text, add_special_tokens=False)["input_ids"]
         x = torch.tensor([ids], device="cuda")
         with torch.no_grad():
-            g = model.generate(x, max_new_tokens=N, do_sample=False, temperature=None, top_p=None, top_k=None)[0, len(ids):].tolist()
+            if not given:
+                g = model.generate(x, max_new_tokens=N, do_sample=False, temperature=None, top_p=None, top_k=None)[0, len(ids):].tolist()
             full = torch.tensor([ids + g], device="cuda")
             lp = torch.log_softmax(model(full).logits[0, len(ids) - 1:-1].float(), -1)
         top = lp.topk(5, -1)

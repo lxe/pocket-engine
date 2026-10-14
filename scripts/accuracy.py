@@ -41,15 +41,17 @@ def reference(M, OUT, N=48, prompts=None):
 
 
 def long_prompts(tok):
-    """Three questions about this repository's design notes and README, each after a different
-    3,300-token slice of them: long enough that most of the context is in the KV cache."""
-    import os
+    """Three questions about this repository's documentation, each after a different 3,300-token
+    slice of it: long enough that most of the context is in the KV cache."""
+    import glob, os
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-    text = "".join(open(os.path.join(root, f)).read() + "\n\n" for f in ("docs/design.md", "README.md"))
+    files = ["README.md"] + sorted(os.path.relpath(f, root) for f in glob.glob(os.path.join(root, "docs", "*.md")))
+    text = "".join(open(os.path.join(root, f)).read() + "\n\n" for f in files)
     ids = tok(text, add_special_tokens=False)["input_ids"]
     qs = ["Summarize the document above in detail, section by section.",
           "Using the document above, explain how a quantized matrix multiply picks its path, and why.",
           "List every number the document above reports for the RTX 5090, with what each measures."]
+    assert len(ids) >= 2 * 200 + 3300, "the documentation is too short for three 3,300-token slices"
     return [tok.decode(ids[k * 200: k * 200 + 3300]) + "\n\n" + q for k, q in enumerate(qs)]
 
 

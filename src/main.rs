@@ -67,7 +67,7 @@ struct EngineArgs {
     /// omitted).
     #[arg(long, num_args = 0..=1, default_missing_value = "2")]
     mtp: Option<usize>,
-    /// int8 activations for Q4_0, Q4_K and Q6_K matrices in batches of 16 or more.
+    /// int8 activations for 4- to 6-bit GGUF matrices in batches of 16 or more.
     #[arg(long)]
     int8: bool,
 }
@@ -369,6 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     off: 0,
                 }],
                 cols: k,
+                int8: true,
             };
             let mut quant = Vec::new();
             for _ in 0..copies(data.len()) {

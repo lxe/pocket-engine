@@ -36,6 +36,8 @@ pub struct Linear {
     pub parts: Vec<Part>,
     /// Input features.
     pub cols: usize,
+    /// May take int8 activations (`--int8`).
+    pub int8: bool,
 }
 
 /// Rows an FP8 matmul runs: Hopper's block-scaled FP8 needs a multiple of 4.
@@ -196,7 +198,7 @@ impl Quants {
                     mma8: match name {
                         // Q6_K takes two products a step, so dequantizing
                         // to bf16 wins sooner.
-                        "q4_0" | "q4_k" | "q6_k" => {
+                        "q4_0" | "q4_k" | "q5_k" | "q6_k" => {
                             let mut k = Vec::with_capacity(4);
                             for t in MMA_TILES {
                                 k.push(gpu.kernel(&format!("qtile8_{name}_{t}"))?);
@@ -301,7 +303,8 @@ impl Linear {
         let x = input.bf16;
         let elem = if f32_out { 4 } else { 2 };
         // int8 activations, quantized once for all of this layer's parts.
-        let int8 = q.act8.is_some()
+        let int8 = self.int8
+            && q.act8.is_some()
             && rows >= q.int8_rows
             && rows <= int8_max_rows()
             && self.cols <= ACT8_COLS;

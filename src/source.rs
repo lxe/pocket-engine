@@ -779,7 +779,11 @@ impl Source {
                 gpu, p.target, p.kind, &p.bytes, p.scales, p.rows, p.off, cols, load,
             )?);
         }
-        Ok(Linear { parts: out, cols })
+        Ok(Linear {
+            parts: out,
+            cols,
+            int8: true,
+        })
     }
 
     /// Uploads a part, converting FP8 to this device's layout. Everything is

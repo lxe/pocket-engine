@@ -71,7 +71,9 @@ The checkpoints carry one extra layer trained to predict the token after next. W
 | 5 to 160 | tensor cores, decoding weights straight into registers |
 | more than 160 | dequantize to bf16, then cuBLAS |
 
-Q4_0, Q4_K and Q6_K are rewritten at load into the exact order the tensor-core loop reads them, which roughly doubles their speed at 8 to 32 rows.
+Q4_0, Q4_K, Q5_K and Q6_K are rewritten at load into the exact order the tensor-core loop reads them, which roughly doubles their speed at 8 to 32 rows.
+
+With `--int8`, those formats run on int8 tensor cores from 16 rows up, against activations quantized to int8 per 32 inputs (llama.cpp's scheme). This skips decoding weights to bf16 and replaces dequantize-then-cuBLAS for prompts. The linear-attention output projection stays in bf16, since its input loses too much precision in int8.
 
 **FP8** weights and activations run on cuBLASLt, with 128×128 block scales on Hopper and MXFP8 on Blackwell. Kernels that produce activations write the FP8 copy directly.
 

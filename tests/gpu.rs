@@ -175,9 +175,11 @@ fn agree(reference: &[Vec<Reference>], got: &[Vec<pocket_engine::sched::Scored>]
             let tied = r.top[0].1 - r.top[1].1 <= TIE_GAP;
             assert!(
                 tied || r.argmax == g.argmax,
-                "pick {} vs reference {}",
+                "pick {} vs reference {} (reference top {:?}, ours {:?})",
                 g.argmax,
-                r.argmax
+                r.argmax,
+                &r.top[..2],
+                &g.top[..2]
             );
             let lp = g
                 .top
@@ -485,9 +487,13 @@ fn prefix_cache_reuses_without_changing_output() {
     assert!(cached.sched.counters.cached_tokens >= pocket_engine::sched::CACHE_UNIT as u64);
     // Both runs are this engine; the chunked recurrence's bf16 roundings
     // fall on different chunk boundaries in each, so the bar is looser than
-    // the one against Transformers.
+    // the one against Transformers. GGUF matmuls also take different kernels
+    // for the two splits (tensor-core tiles or dequantize and cuBLAS), so
+    // near ties may flip.
     if fp8() || fp4() || kv_fp8() {
         close_enough(&reference, &got, 90, 0.03);
+    } else if quantized(&dir) {
+        close_enough(&reference, &got, 90, 0.02);
     } else {
         assert!(agree(&reference, &got) < 0.02);
     }

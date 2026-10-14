@@ -582,13 +582,17 @@ impl Model {
                     dt_bias: up(&src.vec_f32(&format!("{a}dt_bias"), hv)?)?,
                     // The gated norm uses its weight directly.
                     norm_w: up(&src.vec_f32(&format!("{a}norm.weight"), GDN_DIM)?)?,
-                    w_out: src.linear(
-                        gpu,
-                        &mut quants,
-                        &[(&format!("{a}out_proj.weight"), h)],
-                        hv * GDN_DIM,
-                        load,
-                    )?,
+                    w_out: Linear {
+                        // Its gated, normed input loses too much to int8.
+                        int8: false,
+                        ..src.linear(
+                            gpu,
+                            &mut quants,
+                            &[(&format!("{a}out_proj.weight"), h)],
+                            hv * GDN_DIM,
+                            load,
+                        )?
+                    },
                     state: n_state,
                 };
                 n_state += 1;
@@ -642,6 +646,7 @@ impl Model {
                     off: 0,
                 }],
                 cols: h,
+                int8: true,
             }
         };
         let mtp = match mtp {
@@ -664,6 +669,7 @@ impl Model {
                         })
                         .collect(),
                     cols: lm_head.cols,
+                    int8: lm_head.int8,
                 };
                 Some(Mtp {
                     fc,

@@ -151,8 +151,10 @@ impl FaWs {
 }
 
 /// gdn_decode's static shared memory: q, k, delta and outputs, the column
-/// sums of 8 warps, block_sum's slots and the buffers' barriers.
-const GDN_DECODE_STATIC: usize = 4 * GDN_DIM * 4 + 2 * 8 * GDN_DIM * 4 + 32 * 4 + 3 * 8;
+/// sums of 8 warps, the reductions' slots, and per buffer its staged inputs
+/// and barrier.
+const GDN_DECODE_STATIC: usize =
+    4 * GDN_DIM * 4 + 2 * 8 * GDN_DIM * 4 + (32 + 24) * 4 + 3 * (4 * GDN_DIM * 2 + 8 + 8);
 /// How gdn_decode runs: state buffers per block and blocks per SM, or None
 /// where two buffers do not fit (an f32 state on RTX 50-series), which
 /// leaves gdn_recurrent.

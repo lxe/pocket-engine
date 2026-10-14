@@ -1,12 +1,8 @@
 # Benchmarks
 
-Every comparison here runs pocket-engine and vLLM 0.31.0 on the same GPU, one after the other. Throughput with requests in flight comes from [`scripts/load.py`](../scripts/load.py): streamed chat, prompts of 60 to 200 tokens, 16 to 64 output tokens. Startup is the time from launch to serving; vLLM's counts from its first log line, after Python's imports. On the H100, the weights were in the page cache.
-
-Separate runs on separate machines differ by a few percent, so compare engines within a table rather than across tables.
+pocket-engine against vLLM 0.31.0, both in bf16 on the same rented GPU. Startup is launch to serving. First tokens are for a 60-to-200-token prompt (median) and a 64k-token prompt. Throughput is output tokens per second from [`scripts/load.py`](../scripts/load.py). Receipts: [H100](receipts/h100-mtp-ttft.json), [H200](receipts/h200-gauntlet.json), [B200](receipts/b200-gauntlet.json), [RTX 5090](receipts/rtx5090-gauntlet.json).
 
 ## Across GPUs
-
-Both engines in bf16 on the same rented GPU. First tokens are the median for a 60-to-200-token prompt, and one 64k-token prompt. Decoding is output tokens per second for one stream, for 64 requests in flight, and for one stream drafting two tokens a step. Receipts: [H100](receipts/h100-mtp-ttft.json), [H200](receipts/h200-gauntlet.json), [B200](receipts/b200-gauntlet.json), [RTX 5090](receipts/rtx5090-gauntlet.json).
 
 Qwen3.5-9B:
 
@@ -21,7 +17,7 @@ Qwen3.5-9B:
 | RTX 5090 | pocket-engine | **1.9–2.9** | **19.1** | **6.53** | **97** | **2,030** | **185** |
 | | vLLM | 62–178 | 56.7 | 6.57 | 95 | 1,872 | 153 |
 
-Qwen3.8-27B (it does not fit an RTX 5090 in bf16):
+Qwen3.8-27B (too large for an RTX 5090 in bf16):
 
 | GPU | Engine | Startup (s) | First token, short (ms) | First token, 64k (s) | One stream (tok/s) | 64 in flight (tok/s) | One stream, 2 drafts (tok/s) |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -32,11 +28,11 @@ Qwen3.8-27B (it does not fit an RTX 5090 in bf16):
 | B200 | pocket-engine | **3.3–8.7** | **18.7** | 7.94 | **93** | 1,698 | **197** |
 | | vLLM | 68–174 | 26.9 | **3.54** | 92 | **1,803** | 178 |
 
-On a B200, prompts run on the engine's generic tensor-core kernels; it has no Blackwell-specific attention or recurrence yet, which is why long prompts take about 2.5 times vLLM's time there.
+On a B200 the engine has no Blackwell-specific prompt kernels yet, so long prompts lag vLLM there.
 
 ## First token by prompt length, H100
 
-One request at a time, bf16 ([receipt](receipts/h100-mtp-ttft.json)). Prompts run on a FlashAttention-3-style warp-specialized flash kernel and a two-pass chunked linear-attention recurrence, both written for this engine ([long contexts](design.md#long-contexts)).
+One request at a time ([receipt](receipts/h100-mtp-ttft.json)).
 
 | Model | Engine | Launch to serving | 60 to 200 tokens (median) | 8k tokens | 32k tokens | 64k tokens |
 |---|---|---:|---:|---:|---:|---:|
@@ -47,9 +43,7 @@ One request at a time, bf16 ([receipt](receipts/h100-mtp-ttft.json)). Prompts ru
 
 ## Throughput by model and format, H100
 
-Output tokens per second with 64 requests in flight on one H100. vLLM 0.31.0 runs with its prefix cache off, and llama.cpp with its prompt cache off; [the H100 comparison](h100-comparison.md) has both settings, every load from 1 to 64, startup times and the method.
-
-The rows come from three runs, named in the last column. The [h100-retest](h100-comparison.md#27b-multi-token-prediction-and-shared-prefixes) run had vLLM at `--max-num-seqs 256`. In the drafting rows both engines draft two tokens a step with their multi-token prediction (pocket-engine `--mtp 2`, vLLM's `mtp` method with 2 speculative tokens); [all loads and draft counts](design.md#multi-token-prediction). llama.cpp ran only in the h100-engines run, which is where every llama.cpp number comes from.
+Output tokens per second with 64 requests in flight, prefix caches off. Drafting rows use two drafts a step in both engines. [The H100 comparison](h100-comparison.md) has every load from 1 to 64.
 
 | Model | Format | pocket-engine | vLLM | llama.cpp | Run |
 |---|---|---:|---:|---:|---|

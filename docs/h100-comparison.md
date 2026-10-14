@@ -132,4 +132,4 @@ Both engines draft two tokens a step with the checkpoint's MTP layer: pocket-eng
 - **27B.** In FP8, pocket-engine matches vLLM at 64 in flight (1,314 against 1,302) and leads from 8 to 32; vLLM keeps the burst (1,075 against 889). In bf16 the two are within 7% up to 32 in flight, and vLLM leads at 64 (1,088 against 978).
 - **Multi-token prediction.** pocket-engine leads at every steady load on both models: a single 9B request decodes at 252 tok/s against vLLM's 200, and 27B reaches 1,092 at 64 in flight against vLLM's 989. The 9B burst goes to vLLM (2,797 against 2,609). With drafting, 27B in bf16 matches vLLM's best without it.
 - **Shared prefixes.** First tokens come 1.9 to 3.5 times sooner. Throughput leads on a shared system prompt and is level on multi-turn 27B.
-- **Long prompts.** The design notes have [time to first token](design.md#long-contexts) for 8k to 64k prompts and each prefill kernel against vLLM's.
+- **Long prompts.** [Benchmarks](benchmarks.md#first-token-by-prompt-length-h100) has first tokens for 8k to 64k prompts against vLLM.

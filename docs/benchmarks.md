@@ -58,3 +58,61 @@ Output tokens per second with 64 requests in flight, prefix caches off. Drafting
 | Qwen3.8-27B | bf16, 2 drafts | **1,124** | 897 | — | [h100-mtp-ttft](receipts/h100-mtp-ttft.json) |
 | Qwen3.5-9B | Q4_K_M | **2,315** | does not load | 395 | [h100-engines](receipts/h100-engines.json) |
 | Qwen3.8-27B | Q4_K_M | **675** | does not load | 156 | [h100-engines](receipts/h100-engines.json) |
+
+## Speculative decoding, H100
+
+Output tokens per second: one stream of four 512-token answers, then `scripts/load.py` by requests in flight. vLLM uses its own MTP drafting (`--speculative-config '{"method":"mtp","num_speculative_tokens":N}'`). [Receipt](receipts/h100-mtp-ttft.json).
+
+| Qwen3.5-9B | One stream | 1 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| pocket-engine, plain | 150 | 145 | 952 | 1,673 | 2,606 | 3,534 |
+| vLLM, plain | 143 | 124 | 636 | 1,052 | 1,821 | 2,567 |
+| pocket-engine, 2 drafts | 293 | 258 | 1,488 | 2,444 | 3,470 | 4,155 |
+| vLLM, 2 drafts | 253 | 192 | 894 | 1,509 | 2,281 | 2,882 |
+| pocket-engine, 3 drafts | 296 | 256 | 1,461 | 2,445 | 3,420 | 3,987 |
+| vLLM, 3 drafts | 248 | 192 | 985 | 1,522 | 2,479 | 3,165 |
+
+| Qwen3.8-27B | One stream | 1 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| pocket-engine, plain | 49 | 47 | 292 | 531 | 812 | 1,037 |
+| vLLM, plain | 48 | 43 | 246 | 446 | 712 | 1,029 |
+| pocket-engine, 2 drafts | 111 | 89 | 510 | 854 | 1,112 | 1,124 |
+| vLLM, 2 drafts | 100 | 72 | 380 | 616 | 830 | 897 |
+
+Both engines accept about the same share of drafts: 62% with two drafts on 9B, 63% on 27B.
+
+## Prefix cache, RTX 5090
+
+Qwen3.5-9B, bf16, `scripts/workloads.py`. Output tokens per second and median time to first token:
+
+| Workload | Cache off | Cache on |
+|---|---|---|
+| 2,000-token system prompt, 128 short questions, 16 at a time | 174 tok/s, 0.49 s | 992 tok/s, 0.059 s |
+| 16 conversations of 8 turns, each resending its history | 606 tok/s, 0.49 s | 955 tok/s, 0.28 s |
+
+## Long prompts, RTX 5090
+
+Qwen3.5-9B, bf16, one request at a time (`scripts/workloads.py long`):
+
+| Prompt | First token | Decode afterwards |
+|---:|---:|---:|
+| 8k | 0.66 s | 85 tok/s |
+| 32k | 2.97 s | 81 tok/s |
+| 64k | 7.04 s | 77 tok/s |
+
+## Quantized weights, RTX 5090
+
+Qwen3.5-9B Q4_K_M, output tokens per second by requests in flight:
+
+| | 1 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|
+| GGUF blocks as stored | 166 | 573 | 863 | 1,232 | 1,566 |
+| Q4_K and Q6_K in the tiled layout (default) | 170 | 782 | 1,087 | 1,444 | 1,666 |
+
+Qwen3.8-27B, 4-bit, by requests in flight:
+
+| | 1 | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|---:|
+| NVFP4 checkpoint (as MXFP4) | 56 | 304 | 455 | 571 | 551 |
+| Q4_K_M (GGUF) | 52 | 182 | 250 | 321 | 335 |
+

@@ -45,8 +45,9 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 
 - [Usage](docs/usage.md): API, sampling, server options, weight formats
 - [Benchmarks](docs/benchmarks.md): every GPU, model and format, against vLLM
-- [Design](docs/design.md): scheduler, kernels, speculative decoding, accuracy
-- [Testing](docs/testing.md): test suite and accuracy tools
+- [Design](docs/design.md): how it works, from scheduling to kernels
+- [Accuracy](docs/accuracy.md): comparisons with Transformers
+- [Testing](docs/testing.md): running the test suite
 
 ## License
 

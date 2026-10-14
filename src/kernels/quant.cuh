@@ -1050,72 +1050,72 @@ __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t
             auto dd = [&](int j) { return *reinterpret_cast<const float4*>(sb.d + ((4 * j + t) * 4 + p) * 4); };
 #pragma unroll
             for (int h = 0; h < 2; h++) {
-            const int s = 2 * p + h;
-            const uint32_t wa = word_of(ch.q[s >> 1], 2 * (s & 1)), wb = word_of(ch.q[s >> 1], 2 * (s & 1) + 1);
-            uint32_t a[4] = {wa & 0x0F0F0F0Fu, wb & 0x0F0F0F0Fu, (wa >> 4) & 0x0F0F0F0Fu, (wb >> 4) & 0x0F0F0F0Fu};
-            if constexpr (Q6) {
-                const uint32_t hw = word_of(ch.h[s >> 2], s & 3), ha = hw & 0xFFFFu, hb = hw >> 16;
-                a[0] = less32(a[0] | hi2_bytes(ha));
-                a[1] = less32(a[1] | hi2_bytes(hb));
-                a[2] = less32(a[2] | hi2_bytes(ha >> 4));
-                a[3] = less32(a[3] | hi2_bytes(hb >> 4));
-                // The step's two int8 scales per row, and d.
-                const int sa0 = (int8_t)(word_of(ch.ra.a, s >> 1) >> (16 * (s & 1)));
-                const int sa1 = (int8_t)(word_of(ch.ra.a, s >> 1) >> (16 * (s & 1) + 8));
-                const int sb0 = (int8_t)(word_of(ch.rb.a, s >> 1) >> (16 * (s & 1)));
-                const int sb1 = (int8_t)(word_of(ch.rb.a, s >> 1) >> (16 * (s & 1) + 8));
-                const float da = __half2float(__ushort_as_half((unsigned short)ch.ra.b));
-                const float db = __half2float(__ushort_as_half((unsigned short)ch.rb.b));
-                const bool first = t < 2;
-                const uint32_t lo[4] = {first ? a[0] : 0u, first ? a[1] : 0u, first ? a[2] : 0u, first ? a[3] : 0u};
-                const uint32_t hi[4] = {first ? 0u : a[0], first ? 0u : a[1], first ? 0u : a[2], first ? 0u : a[3]};
+                const int s = 2 * p + h;
+                const uint32_t wa = word_of(ch.q[s >> 1], 2 * (s & 1)), wb = word_of(ch.q[s >> 1], 2 * (s & 1) + 1);
+                uint32_t a[4] = {wa & 0x0F0F0F0Fu, wb & 0x0F0F0F0Fu, (wa >> 4) & 0x0F0F0F0Fu, (wb >> 4) & 0x0F0F0F0Fu};
+                if constexpr (Q6) {
+                    const uint32_t hw = word_of(ch.h[s >> 2], s & 3), ha = hw & 0xFFFFu, hb = hw >> 16;
+                    a[0] = less32(a[0] | hi2_bytes(ha));
+                    a[1] = less32(a[1] | hi2_bytes(hb));
+                    a[2] = less32(a[2] | hi2_bytes(ha >> 4));
+                    a[3] = less32(a[3] | hi2_bytes(hb >> 4));
+                    // The step's two int8 scales per row, and d.
+                    const int sa0 = (int8_t)(word_of(ch.ra.a, s >> 1) >> (16 * (s & 1)));
+                    const int sa1 = (int8_t)(word_of(ch.ra.a, s >> 1) >> (16 * (s & 1) + 8));
+                    const int sb0 = (int8_t)(word_of(ch.rb.a, s >> 1) >> (16 * (s & 1)));
+                    const int sb1 = (int8_t)(word_of(ch.rb.a, s >> 1) >> (16 * (s & 1) + 8));
+                    const float da = __half2float(__ushort_as_half((unsigned short)ch.ra.b));
+                    const float db = __half2float(__ushort_as_half((unsigned short)ch.rb.b));
+                    const bool first = t < 2;
+                    const uint32_t lo[4] = {first ? a[0] : 0u, first ? a[1] : 0u, first ? a[2] : 0u, first ? a[3] : 0u};
+                    const uint32_t hi[4] = {first ? 0u : a[0], first ? 0u : a[1], first ? 0u : a[2], first ? 0u : a[3]};
+#pragma unroll
+                    for (int j = 0; j < MT / 8; j++) {
+                        const uint4 x = xv(j);
+                        const float4 dj = dd(j);
+                        const uint32_t b0 = h ? x.z : x.x, b1 = h ? x.w : x.y;
+                        const float d0 = h ? dj.z : dj.x, d1 = h ? dj.w : dj.y;
+                        int c0[4], c1[4];
+                        mma_s8(c0, lo, b0, b1);
+                        mma_s8(c1, hi, b0, b1);
+                        acc[j][0] = fmaf((float)(c0[0] * sa0 + c1[0] * sa1), da * d0, acc[j][0]);
+                        acc[j][1] = fmaf((float)(c0[1] * sa0 + c1[1] * sa1), da * d1, acc[j][1]);
+                        acc[j][2] = fmaf((float)(c0[2] * sb0 + c1[2] * sb1), db * d0, acc[j][2]);
+                        acc[j][3] = fmaf((float)(c0[3] * sb0 + c1[3] * sb1), db * d1, acc[j][3]);
+                    }
+                    continue;
+                }
+                if constexpr (IQ4<T>) {
+#pragma unroll
+                    for (int k = 0; k < 4; k++) a[k] = iq4_bytes(a[k]);
+                }
+                if constexpr (T == T_Q4_0) {
+#pragma unroll
+                    for (int k = 0; k < 4; k++) a[k] = less8(a[k]);
+                }
+                if constexpr (Q5) {
+                    const uint32_t hw = word_of(ch.h[0], s >> 1) >> (16 * (s & 1));
+                    a[0] |= hi1_bytes(hw);
+                    a[1] |= hi1_bytes(hw >> 8);
+                    a[2] |= hi1_bytes(hw >> 4);
+                    a[3] |= hi1_bytes(hw >> 12);
+                }
+                float sa, ma, sb_, mb;
+                tile_scale<T>(ch.ra, s, t, sa, ma);
+                tile_scale<T>(ch.rb, s, t, sb_, mb);
 #pragma unroll
                 for (int j = 0; j < MT / 8; j++) {
                     const uint4 x = xv(j);
                     const float4 dj = dd(j);
                     const uint32_t b0 = h ? x.z : x.x, b1 = h ? x.w : x.y;
                     const float d0 = h ? dj.z : dj.x, d1 = h ? dj.w : dj.y;
-                    int c0[4], c1[4];
-                    mma_s8(c0, lo, b0, b1);
-                    mma_s8(c1, hi, b0, b1);
-                    acc[j][0] = fmaf((float)(c0[0] * sa0 + c1[0] * sa1), da * d0, acc[j][0]);
-                    acc[j][1] = fmaf((float)(c0[1] * sa0 + c1[1] * sa1), da * d1, acc[j][1]);
-                    acc[j][2] = fmaf((float)(c0[2] * sb0 + c1[2] * sb1), db * d0, acc[j][2]);
-                    acc[j][3] = fmaf((float)(c0[3] * sb0 + c1[3] * sb1), db * d1, acc[j][3]);
+                    int c[4];
+                    mma_s8(c, a, b0, b1);
+                    acc[j][0] = fmaf((float)c[0], sa * d0, acc[j][0]);
+                    acc[j][1] = fmaf((float)c[1], sa * d1, acc[j][1]);
+                    acc[j][2] = fmaf((float)c[2], sb_ * d0, acc[j][2]);
+                    acc[j][3] = fmaf((float)c[3], sb_ * d1, acc[j][3]);
                 }
-                continue;
-            }
-            if constexpr (IQ4<T>) {
-#pragma unroll
-                for (int k = 0; k < 4; k++) a[k] = iq4_bytes(a[k]);
-            }
-            if constexpr (T == T_Q4_0) {
-#pragma unroll
-                for (int k = 0; k < 4; k++) a[k] = less8(a[k]);
-            }
-            if constexpr (Q5) {
-                const uint32_t hw = word_of(ch.h[0], s >> 1) >> (16 * (s & 1));
-                a[0] |= hi1_bytes(hw);
-                a[1] |= hi1_bytes(hw >> 8);
-                a[2] |= hi1_bytes(hw >> 4);
-                a[3] |= hi1_bytes(hw >> 12);
-            }
-            float sa, ma, sb_, mb;
-            tile_scale<T>(ch.ra, s, t, sa, ma);
-            tile_scale<T>(ch.rb, s, t, sb_, mb);
-#pragma unroll
-            for (int j = 0; j < MT / 8; j++) {
-                const uint4 x = xv(j);
-                const float4 dj = dd(j);
-                const uint32_t b0 = h ? x.z : x.x, b1 = h ? x.w : x.y;
-                const float d0 = h ? dj.z : dj.x, d1 = h ? dj.w : dj.y;
-                int c[4];
-                mma_s8(c, a, b0, b1);
-                acc[j][0] = fmaf((float)c[0], sa * d0, acc[j][0]);
-                acc[j][1] = fmaf((float)c[1], sa * d1, acc[j][1]);
-                acc[j][2] = fmaf((float)c[2], sb_ * d0, acc[j][2]);
-                acc[j][3] = fmaf((float)c[3], sb_ * d1, acc[j][3]);
-            }
             }
         }
         if constexpr (T == T_Q4_K || T == T_Q5_K) {

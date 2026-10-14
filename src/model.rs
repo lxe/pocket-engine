@@ -21,7 +21,19 @@ const LOGPROBS_ROW: usize = 1 + 2 * LOGPROBS_TOP;
 /// almost every accepted draft of the full 248,320 at a quarter of the cost.
 const DRAFT_VOCAB: usize = 65_536;
 /// Fewest keys per range of split decode attention.
-const SPLIT_MIN_KEYS: usize = 256;
+/// On AMD 64: its decode attention keeps few loads in flight per wave, so
+/// more, shorter ranges help (27B at 32 and 64 in flight, +2-3%).
+const SPLIT_MIN_KEYS: usize = if cfg!(feature = "rocm") { 64 } else { 256 };
+/// SPLIT_MIN_KEYS, or POCKET_SPLIT_MIN_KEYS.
+fn split_min_keys() -> usize {
+    static KEYS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEYS.get_or_init(|| {
+        std::env::var("POCKET_SPLIT_MIN_KEYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SPLIT_MIN_KEYS)
+    })
+}
 /// Most ranges one sequence's keys split into.
 const SPLIT_MAX: usize = 64;
 
@@ -2345,7 +2357,7 @@ impl Model {
                         .chain([
                             P(v.cu),
                             I((t > s) as i32),
-                            I(SPLIT_MIN_KEYS as i32),
+                            I(split_min_keys() as i32),
                             P(part),
                             outs[0],
                             outs[1],
@@ -2363,7 +2375,7 @@ impl Model {
                                 [
                                     P(part),
                                     I(ranges as i32),
-                                    I(SPLIT_MIN_KEYS as i32),
+                                    I(split_min_keys() as i32),
                                     P(a.proj.ptr),
                                     I(qs as i32),
                                     I(c.hq as i32),

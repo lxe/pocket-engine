@@ -112,6 +112,9 @@ extern "C" __global__ void embed(const int* __restrict__ ids, const bf16* __rest
     for (int i = threadIdx.x; i < hidden / 8; i += blockDim.x) dst[i] = src[i];
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+#include "amd/norm.cuh"
+#endif
 // RMSNorm with an f32 weight (zero-centred weights already offset by one).
 //   add == 0: out[r] = norm(res[src])
 //   add == 1: sum = x[src] + res[src]; out[r] = norm(sum); res[src] = bf16(sum)
@@ -123,6 +126,10 @@ extern "C" __global__ void rmsnorm(const bf16* __restrict__ x, bf16* __restrict_
                                    const float* __restrict__ w, bf16* __restrict__ out,
                                    const int* __restrict__ gather, int hidden, float eps, int add,
                                    int write_res, uint8_t* fq, void* fs, int fmode, int frows) {
+#ifdef __HIP_PLATFORM_AMD__
+    rmsnorm_amd(x, res, w, out, gather, hidden, eps, add, write_res, fq, fs, fmode, frows);
+    return;
+#endif
     __shared__ float sh[32];
     const int r = blockIdx.x;
     const size_t src = gather ? (size_t)gather[r] : (size_t)r;

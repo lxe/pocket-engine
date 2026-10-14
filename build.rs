@@ -17,6 +17,7 @@ fn main() {
         "amd/skinny.cuh",
         "amd/qtile8.cuh",
         "amd/attn_decode.cuh",
+        "amd/norm.cuh",
     ] {
         println!("cargo:rerun-if-changed=src/kernels/{f}");
     }

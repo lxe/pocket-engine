@@ -13,7 +13,7 @@ rng = random.Random(7)
 def prompt():
     n = rng.randint(40, 150)   # (~60-200 tokens with the chat template)
     return "Summarize briefly: " + " ".join(rng.choice(WORDS) for _ in range(n))
-REQS = [(prompt(), rng.choice([16, 32, 48, 64])) for _ in range(512)]
+REQS = [(prompt(), rng.choice([16, 32, 48, 64])) for _ in range(int(os.environ.get("LOAD_POOL", 512)))]
 
 MODELS = os.environ.get("LOAD_MODELS", "").split(",") if os.environ.get("LOAD_MODELS") else [MODEL]
 EXTRA = json.loads(os.environ.get("LOAD_EXTRA", "{}"))

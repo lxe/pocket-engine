@@ -141,6 +141,11 @@ const BUCKETS: [usize; 16] = [
 pub struct Stats {
     pub graph_steps: u64,
     pub step_seconds: f64,
+    /// Host time per step while the GPU has nothing queued: planning before
+    /// the launch, and handling the picks after it.
+    pub host_seconds: f64,
+    /// Time blocked waiting for the GPU to finish a step.
+    pub wait_seconds: f64,
 }
 
 pub struct Engine {
@@ -489,6 +494,7 @@ impl Engine {
 
     /// Runs one step if there is work. Returns sequences that finished.
     pub fn step(&mut self) -> Result<Vec<Seq>> {
+        let entered = Instant::now();
         let Some(step) = self.sched.plan() else {
             return Ok(Vec::new());
         };
@@ -527,6 +533,7 @@ impl Engine {
             None
         };
         let t0 = Instant::now();
+        self.stats.host_seconds += (t0 - entered).as_secs_f64();
         match bucket {
             Some(b) => {
                 self.sched.pad(self.act.staging.as_mut_slice(), s, b, n);
@@ -550,7 +557,10 @@ impl Engine {
             self.model.logprobs(&self.gpu, &mut self.act, &lp_rows)?;
         }
         self.act.download_ids(&self.gpu, r, s)?;
+        let launched = Instant::now();
         self.gpu.sync()?;
+        let synced = Instant::now();
+        self.stats.wait_seconds += (synced - launched).as_secs_f64();
         self.stats.step_seconds += t0.elapsed().as_secs_f64();
         let picked: Vec<u32> = self.act.ids_host.as_slice::<i32>()[..r]
             .iter()
@@ -569,7 +579,9 @@ impl Engine {
         }
         let mut lps = self.act.logprobs(&lp_rows, r);
         let drafts = self.act.drafts(s);
-        Ok(self.sched.finish(step, &picked, drafts, scored, &mut lps))
+        let done = self.sched.finish(step, &picked, drafts, scored, &mut lps);
+        self.stats.host_seconds += synced.elapsed().as_secs_f64();
+        Ok(done)
     }
 
     /// Runs the vision encoder for newly admitted requests, in batches the
@@ -749,13 +761,15 @@ pub fn spawn(cfg: EngineConfig) -> Result<Spawned> {
                         String::new()
                     };
                     eprintln!(
-                        "steps {} (graph {}), decode {} tok, prompt {} tok (+{} cached){drafts}, {:.1} ms/step, running {}, waiting {}",
+                        "steps {} (graph {}), decode {} tok, prompt {} tok (+{} cached){drafts}, {:.1} ms/step ({:.2} ms host, {:.1} ms waiting), running {}, waiting {}",
                         c.steps,
                         st.graph_steps,
                         c.decode_tokens,
                         c.prompt_tokens,
                         c.cached_tokens,
                         1e3 * st.step_seconds / c.steps.max(1) as f64,
+                        1e3 * st.host_seconds / c.steps.max(1) as f64,
+                        1e3 * st.wait_seconds / c.steps.max(1) as f64,
                         load.running,
                         load.waiting
                     );

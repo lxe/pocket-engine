@@ -885,16 +885,38 @@ impl Scheduler {
                 }
             }
         }
-        // Grammar masks for constrained rows whose pick is a token.
-        for &(ri, n) in &step.rows {
-            let s = &mut self.running[ri];
-            if s.fed + n < s.total() {
-                continue;
-            }
-            if let Some(m) = s.req.constraint.as_mut() {
-                // On a grammar error `fill` allows nothing and the token's
-                // check in `finish` reports the error.
-                s.mask = m.compute_mask().ok();
+        // Grammar masks for constrained rows whose pick is a token, on all
+        // cores (each takes tens of microseconds). On a grammar error `fill`
+        // allows nothing and the token's check in `finish` reports it.
+        let picks: HashSet<usize> = step
+            .rows
+            .iter()
+            .filter(|&&(ri, n)| {
+                let s = &self.running[ri];
+                s.req.constraint.is_some() && s.fed + n >= s.total()
+            })
+            .map(|&(ri, _)| ri)
+            .collect();
+        if !picks.is_empty() {
+            use rayon::prelude::*;
+            let mut todo: Vec<&mut Seq> = self
+                .running
+                .iter_mut()
+                .enumerate()
+                .filter(|(ri, _)| picks.contains(ri))
+                .map(|(_, s)| s)
+                .collect();
+            let mask = |s: &mut &mut Seq| {
+                s.mask = s
+                    .req
+                    .constraint
+                    .as_mut()
+                    .and_then(|m| m.compute_mask().ok());
+            };
+            if todo.len() > 2 {
+                todo.par_iter_mut().for_each(mask);
+            } else {
+                todo.iter_mut().for_each(mask);
             }
         }
         step.copies = std::mem::take(&mut self.pending_copies);

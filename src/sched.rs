@@ -367,7 +367,17 @@ struct Ngrams {
     /// Where the longest earlier occurrence of the current suffix ended.
     matched: Option<usize>,
     len: usize,
+    /// Running average of lookup drafts accepted per verification, and
+    /// steps since the last real guess: matches that keep failing (common
+    /// words in repetitive text) stop counting as guesses, with a retry
+    /// every few steps.
+    hit: f32,
+    idle: u32,
 }
+
+/// Accepted lookup drafts per step below which matches stop counting.
+const NGRAM_MIN_HIT: f32 = 0.5;
+const NGRAM_RETRY: u32 = 16;
 
 const NGRAM_MIN: usize = 2;
 const NGRAM_MAX: usize = 4;
@@ -772,7 +782,10 @@ impl Scheduler {
             }
             seq.admitted = Instant::now();
             if self.ngram && seq.forced.is_none() {
-                let mut g = Box::<Ngrams>::default();
+                let mut g = Box::new(Ngrams {
+                    hit: 1.0,
+                    ..Default::default()
+                });
                 for &t in &seq.req.prompt {
                     g.push(t);
                 }
@@ -901,10 +914,15 @@ impl Scheduler {
         // still bound by reading the weights: all of them, so the step can
         // replay a graph, or none.
         let drafting = self.running.iter().filter(|s| !s.drafts.is_empty()).count();
-        // Filler drafts only keep steps uniform; with no real guess anywhere,
-        // decode plainly.
+        // Filler drafts only keep steps uniform, and verifying saves a state
+        // per draft, so verify only when at least half the drafts are guesses.
+        let guessed = self
+            .running
+            .iter()
+            .filter(|s| s.guessed && !s.drafts.is_empty())
+            .count();
         let verify = drafting > 0
-            && self.running.iter().any(|s| s.guessed)
+            && 2 * guessed >= drafting
             && self.free_slots.len() >= drafting * (self.meta.spec - 1)
             && drafting * self.meta.spec <= self.verify_rows;
         let mut budget = self.meta.max_tokens;
@@ -1292,6 +1310,11 @@ impl Scheduler {
                     }
                 }
                 s.outs.clear();
+                if let Some(g) = s.ngrams.as_mut()
+                    && s.guessed
+                {
+                    g.hit = 0.7 * g.hit + 0.3 * j as f32;
+                }
                 (j + 1, picked[o0..=o0 + j].to_vec())
             } else {
                 (n, vec![picked[o0]])
@@ -1391,7 +1414,17 @@ impl Scheduler {
                 let k = self.meta.spec - 1;
                 let n = step.rows.len();
                 let mtp = drafts.map(|d| (0..k).map(|j| d[j * n + si] as u32).collect::<Vec<_>>());
-                let found = if self.ngram { s.lookup(k) } else { Vec::new() };
+                let mut found = if self.ngram { s.lookup(k) } else { Vec::new() };
+                if let Some(g) = s.ngrams.as_mut()
+                    && !found.is_empty()
+                {
+                    g.idle += 1;
+                    if g.hit < NGRAM_MIN_HIT && g.idle < NGRAM_RETRY {
+                        found.clear();
+                    } else {
+                        g.idle = 0;
+                    }
+                }
                 s.guessed = mtp.is_some() || !found.is_empty();
                 s.drafts = match mtp {
                     Some(m) if found.len() < k => m,

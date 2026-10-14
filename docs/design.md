@@ -110,14 +110,13 @@ Common formats are reordered at load to match the order the kernels read them, a
 - Decoding streams weights with a kernel modelled on vLLM's; larger products go to hipBLASLt.
 - Adapter updates run in order on one stream, since a second stream changed outputs on AMD.
 
-What costs time on an MI325X, measured, and how the AMD kernels respond:
+What costs time on an MI325X (details in the [receipt](receipts/mi325x.json)):
 
 | Cost | Measured | Response |
 |---|---|---|
-| A kernel inside a graph, even empty | 1.5 µs | Fewer, fused kernels; about 600 run per token at batch 1 |
-| A load behind a branch before its use | the compiler waits for it, one memory round trip (~0.3 µs) each | The recurrence and RMSNorm issue all their loads first (in the short convolution and the attention prefetch, doing so measured slower) |
-| An agent-scope fence (`__threadfence`) | writes back and invalidates the XCD's L2: 83 µs for 1,216 blocks | No hand-offs between blocks; a second kernel where needed |
-| A 256-thread block reduction | about 0.45 µs | Wave64 sums and one barrier where possible |
+| Each kernel launch | 1.5 µs | Fewer, fused kernels |
+| A load waiting on a branch | ~0.3 µs | Issue loads first |
+| A device-wide fence | 83 µs | No hand-offs between blocks |
 
 ## Loading
 

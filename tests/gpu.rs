@@ -725,7 +725,7 @@ fn penalties_reduce_repetition() {
 fn serves_chat_completions() {
     let Some(dir) = model() else { return };
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
-    let (tx, info, health, _) = engine::spawn(config(dir.clone())).unwrap();
+    let (tx, info, health, _, _) = engine::spawn(config(dir.clone())).unwrap();
     let tok = ChatTokenizer::load(&dir).unwrap();
     let grammars = server::grammars(&tok, &info.cfg).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1031,7 +1031,7 @@ fn serves_adapters() {
     let tmp = std::env::temp_dir().join(format!("pocket-lora-http-{}", std::process::id()));
     // Strong enough to change even a greeting's first tokens.
     synthetic_adapter(&dir, &tmp, 8, 0.2, 3);
-    let (tx, info, health, adapters) = engine::spawn(EngineConfig {
+    let (tx, info, health, adapters, _) = engine::spawn(EngineConfig {
         max_loras: 1,
         ..config(dir.clone())
     })
@@ -1169,7 +1169,7 @@ fn logprobs_match_scoring() {
 fn serves_structured_output() {
     let Some(dir) = model() else { return };
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
-    let (tx, info, health, _) = engine::spawn(config(dir.clone())).unwrap();
+    let (tx, info, health, _, _) = engine::spawn(config(dir.clone())).unwrap();
     let tok = ChatTokenizer::load(&dir).unwrap();
     let grammars = server::grammars(&tok, &info.cfg).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();

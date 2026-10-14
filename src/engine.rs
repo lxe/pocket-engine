@@ -698,15 +698,22 @@ fn score(argmax: u32, logits: &[f32]) -> Scored {
 /// Runs the engine on its own thread. Returns once the model is loaded, with
 /// the request channel and the shared health report.
 /// What `spawn` hands the server: the message channel, the model's
-/// description, the shared health report and the routable adapter names.
-pub type Spawned = (mpsc::Sender<Msg>, Info, Arc<Mutex<Health>>, Adapters);
+/// description, the shared health report, the routable adapter names and the
+/// engine thread, which ends once every sender is dropped.
+pub type Spawned = (
+    mpsc::Sender<Msg>,
+    Info,
+    Arc<Mutex<Health>>,
+    Adapters,
+    std::thread::JoinHandle<()>,
+);
 
 pub fn spawn(cfg: EngineConfig) -> Result<Spawned> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let (ready_tx, ready_rx) = mpsc::channel();
     let health = Arc::new(Mutex::new(Health::default()));
     let shared = health.clone();
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
             let mut engine = match Engine::new(cfg) {
@@ -736,8 +743,14 @@ pub fn spawn(cfg: EngineConfig) -> Result<Spawned> {
                         Err(_) => return,
                     }
                 }
-                while let Ok(m) = rx.try_recv() {
-                    engine.handle(m);
+                // Every sender gone: the server has shut down, so stop
+                // rather than finish sequences nobody reads.
+                loop {
+                    match rx.try_recv() {
+                        Ok(m) => engine.handle(m),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    }
                 }
                 if let Err(e) = engine.step() {
                     eprintln!("engine step failed: {e}");
@@ -792,5 +805,5 @@ pub fn spawn(cfg: EngineConfig) -> Result<Spawned> {
     let (info, adapters) = ready_rx
         .recv()
         .map_err(|_| Error::Config("engine thread exited".into()))??;
-    Ok((tx, info, health, adapters))
+    Ok((tx, info, health, adapters, thread))
 }

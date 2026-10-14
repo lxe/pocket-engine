@@ -299,7 +299,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok((tok, grammars))
                 })
             };
-            let (tx, info, health, adapters) = engine::spawn(cfg)?;
+            let (tx, info, health, adapters, engine_thread) = engine::spawn(cfg)?;
             let (tok, grammars) = prep.join().expect("tokenizer thread")?;
             let spec = if info.vision {
                 Some(Spec::load(&args.model, args.max_image_pixels)?)
@@ -310,20 +310,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{} on {}: {} KV blocks, up to {} sequences of {} tokens",
                 name, info.device, info.kv_blocks, info.max_seqs, info.max_context
             );
-            tokio::runtime::Builder::new_multi_thread()
+            let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .build()?
-                .block_on(server::serve(
-                    tok,
-                    grammars,
-                    spec,
-                    tx,
-                    info,
-                    health,
-                    lora_on.then_some(adapters),
-                    name,
-                    &bind,
-                ))?;
+                .build()?;
+            let served = rt.block_on(server::serve(
+                tok,
+                grammars,
+                spec,
+                tx,
+                info,
+                health,
+                lora_on.then_some(adapters),
+                name,
+                &bind,
+            ));
+            // Dropping the server's tasks closes the engine's channel; let the
+            // engine free the GPU before the process exits (on AMD, exiting
+            // under it crashed in HIP's teardown).
+            drop(rt);
+            let _ = engine_thread.join();
+            served?;
         }
         Cmd::Dequant {
             model,

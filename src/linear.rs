@@ -173,6 +173,15 @@ const SCRATCH_WEIGHTS: usize = 192 << 20;
 
 impl Quants {
     fn tune(&mut self, arch: u32) {
+        if arch == 94 {
+            // AMD gfx942 (bench-linear on an MI325X, 9B's Q4_K and Q6_K
+            // matrices): the int8 MFMA tiles lead below 16 rows; from 16 on,
+            // dequantizing to bf16 for hipBLASLt is faster (at 256 rows 109
+            // against 288 us), and the bf16 tiles emulate mma.sync.
+            self.int8_max = env_usize("POCKET_INT8_MAX_ROWS", 15);
+            self.dense_rows = env_usize("POCKET_DENSE_ROWS", 15);
+            return;
+        }
         let dc = datacenter(arch);
         self.int8_max = env_usize("POCKET_INT8_MAX_ROWS", if dc { 48 } else { 4096 });
         self.dense_rows = env_usize("POCKET_DENSE_ROWS", if dc { 112 } else { DENSE_ROWS });

@@ -61,7 +61,7 @@ pocket-engine serve --model models/Qwen3.5-9B-Q4_K_M.gguf --lora support=adapter
 
 Adapters are PEFT directories (`adapter_config.json` and `adapter_model.safetensors`) or llama.cpp GGUF adapters, over any base format. `--max-loras` adapters sit on the GPU at once; others wait on the host and swap in when a slot frees. On an RTX 5090, adapters cost 11% at one request on 9B Q4_K_M and 20 to 27% at 16 to 64 ([benchmarks](benchmarks.md#adapters-rtx-5090)). Requests for the base model cost nothing extra.
 
-Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`) plus vLLM's `top_k`, `min_p` and `repetition_penalty`. The default temperature is 1.0. Prompts that share a beginning reuse its cache.
+Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`) plus vLLM's `top_k`, `min_p` and `repetition_penalty`. The default temperature is 1.0. Prompts that share a beginning reuse its cache. Thinking is off unless a request sends vLLM's `"chat_template_kwargs": {"enable_thinking": true}` (vLLM's default is on).
 
 ### Structured output and log-probabilities
 

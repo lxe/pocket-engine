@@ -116,6 +116,11 @@ impl ChatTokenizer {
     /// tokenizes the result. Returns the token ids, with one image
     /// placeholder per image, and the images' URLs in order.
     pub fn chat(&self, messages: &[Value]) -> Result<(Vec<u32>, Vec<String>)> {
+        self.chat_with(messages, false)
+    }
+
+    /// `chat`, with the template's thinking switched on or off.
+    pub fn chat_with(&self, messages: &[Value], thinking: bool) -> Result<(Vec<u32>, Vec<String>)> {
         let mut norm = Vec::with_capacity(messages.len());
         let mut images = Vec::new();
         for m in messages {
@@ -169,7 +174,7 @@ impl ChatTokenizer {
             .get_template("chat")
             .map_err(|e| Error::Config(e.to_string()))?
             .render(minijinja::context! {
-                messages => norm, add_generation_prompt => true, enable_thinking => false,
+                messages => norm, add_generation_prompt => true, enable_thinking => thinking,
                 tools => false, add_vision_id => false
             })
             .map_err(|e| Error::Request(e.to_string()))?;
@@ -318,6 +323,9 @@ struct ChatRequest {
     guided_choice: Option<Vec<String>>,
     #[serde(default)]
     guided_grammar: Option<String>,
+    /// vLLM's template arguments; only `enable_thinking` (default false) is read.
+    #[serde(default)]
+    chat_template_kwargs: Option<serde_json::Map<String, Value>>,
 }
 
 impl ChatRequest {
@@ -549,7 +557,13 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         }
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
-    let (ids, urls) = match app.tok.chat(&req.messages) {
+    let thinking = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|k| k.get("enable_thinking"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (ids, urls) = match app.tok.chat_with(&req.messages, thinking) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };

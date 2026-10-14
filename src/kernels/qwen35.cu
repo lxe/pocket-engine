@@ -1496,9 +1496,6 @@ ATTN_GROUP_R(4, 2, 32)
 ATTN_GROUP_R(6, 1, 32)
 ATTN_GROUP_R(4, 2, 64)
 ATTN_GROUP_R(6, 1, 64)
-// AMD's 64 KB of LDS per block.
-ATTN_GROUP_R(4, 1, 16)
-ATTN_GROUP_R(6, 1, 16)
 
 // ---------------------------------------------------------------------------
 // Flash attention for prompts on Hopper's wgmma (sm_90a). A block takes 64

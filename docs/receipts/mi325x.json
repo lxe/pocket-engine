@@ -12,6 +12,264 @@
   "env": "VLLM_ROCM_USE_AITER=1 HIP_FORCE_DEV_KERNARG=1 SAFETENSORS_FAST_GPU=1 TORCH_BLAS_PREFER_HIPBLASLT=1"
  },
  "runs": {
+  "load-fresh-pe-27b-128": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.58,
+    "out_tok_s": 1198.6,
+    "ttft_p50": 0.296,
+    "ttft_p95": 1.478,
+    "lat_p50": 2.122,
+    "lat_p95": 4.545,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 3.37,
+    "out_tok_s": 1011.0,
+    "ttft_p50": 1.041,
+    "ttft_p95": 1.737,
+    "lat_p50": 2.401,
+    "lat_p95": 3.089,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-27b-256": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 9.77,
+    "out_tok_s": 1358.9,
+    "ttft_p50": 0.469,
+    "ttft_p95": 2.63,
+    "lat_p50": 4.107,
+    "lat_p95": 8.537,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 7.85,
+    "out_tok_s": 855.9,
+    "ttft_p50": 4.047,
+    "ttft_p95": 5.547,
+    "lat_p50": 6.174,
+    "lat_p95": 7.088,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-9b-128-first-phase": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 2.12,
+    "out_tok_s": 4276.8,
+    "ttft_p50": 0.105,
+    "ttft_p95": 0.494,
+    "lat_p50": 0.805,
+    "lat_p95": 1.723,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 6.82,
+    "out_tok_s": 2629.9,
+    "ttft_p50": 1.858,
+    "ttft_p95": 5.451,
+    "lat_p50": 2.532,
+    "lat_p95": 6.429,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.94,
+    "out_tok_s": 1524.2,
+    "ttft_p50": 4.032,
+    "ttft_p95": 4.912,
+    "lat_p50": 4.694,
+    "lat_p95": 5.472,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-9b-256": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 3.68,
+    "out_tok_s": 4857.3,
+    "ttft_p50": 0.149,
+    "ttft_p95": 0.906,
+    "lat_p50": 1.492,
+    "lat_p95": 3.124,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.98,
+    "out_tok_s": 1505.3,
+    "ttft_p50": 4.068,
+    "ttft_p95": 4.974,
+    "lat_p50": 4.796,
+    "lat_p95": 5.521,
+    "first_error": null
+   }
+  ],
+  "load-fresh-vllm-27b-128": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 6.99,
+    "out_tok_s": 1485.4,
+    "ttft_p50": 0.626,
+    "ttft_p95": 1.837,
+    "lat_p50": 2.911,
+    "lat_p95": 5.71,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 3.86,
+    "out_tok_s": 1317.6,
+    "ttft_p50": 1.366,
+    "ttft_p95": 2.097,
+    "lat_p50": 3.088,
+    "lat_p95": 3.76,
+    "first_error": null
+   }
+  ],
+  "load-fresh-vllm-27b-256": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 12.41,
+    "out_tok_s": 1669.3,
+    "ttft_p50": 1.197,
+    "ttft_p95": 3.634,
+    "lat_p50": 5.248,
+    "lat_p95": 10.41,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 8.68,
+    "out_tok_s": 1196.1,
+    "ttft_p50": 4.21,
+    "ttft_p95": 6.099,
+    "lat_p50": 7.212,
+    "lat_p95": 8.114,
+    "first_error": null
+   }
+  ],
+  "load-fresh-vllm-9b-128": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 2.27,
+    "out_tok_s": 4580.1,
+    "ttft_p50": 0.248,
+    "ttft_p95": 0.453,
+    "lat_p50": 0.965,
+    "lat_p95": 1.75,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.94,
+    "out_tok_s": 2620.2,
+    "ttft_p50": 0.889,
+    "ttft_p95": 1.294,
+    "lat_p50": 1.58,
+    "lat_p95": 1.812,
+    "first_error": null
+   }
+  ],
+  "load-fresh-vllm-9b-256": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 3.81,
+    "out_tok_s": 5445.3,
+    "ttft_p50": 0.335,
+    "ttft_p95": 0.847,
+    "lat_p50": 1.661,
+    "lat_p95": 3.083,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 6.09,
+    "out_tok_s": 1704.0,
+    "ttft_p50": 4.291,
+    "ttft_p95": 4.982,
+    "lat_p50": 5.023,
+    "lat_p95": 5.712,
+    "first_error": null
+   }
+  ],
+  "load-hi-pe-27b-final": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.55,
+    "out_tok_s": 1203.9,
+    "ttft_p50": 0.296,
+    "ttft_p95": 1.474,
+    "lat_p50": 2.112,
+    "lat_p95": 4.522,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 10.42,
+    "out_tok_s": 1279.4,
+    "ttft_p50": 0.497,
+    "ttft_p95": 3.345,
+    "lat_p50": 4.358,
+    "lat_p95": 9.073,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 7.83,
+    "out_tok_s": 853.9,
+    "ttft_p50": 4.035,
+    "ttft_p95": 5.431,
+    "lat_p50": 6.144,
+    "lat_p95": 7.058,
+    "first_error": null
+   }
+  ],
   "load-hi-pe-27b": [
    {
     "case": "closed c=128",
@@ -88,6 +346,70 @@
     "first_error": null
    }
   ],
+  "load-hi-pe-9b-256-fresh-client": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 3.68,
+    "out_tok_s": 4857.3,
+    "ttft_p50": 0.149,
+    "ttft_p95": 0.906,
+    "lat_p50": 1.492,
+    "lat_p95": 3.124,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.98,
+    "out_tok_s": 1505.3,
+    "ttft_p50": 4.068,
+    "ttft_p95": 4.974,
+    "lat_p50": 4.796,
+    "lat_p95": 5.521,
+    "first_error": null
+   }
+  ],
+  "load-hi-pe-9b-256-twice-one-client": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 3.68,
+    "out_tok_s": 4850.1,
+    "ttft_p50": 0.151,
+    "ttft_p95": 0.916,
+    "lat_p50": 1.48,
+    "lat_p95": 3.135,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 7.77,
+    "out_tok_s": 2300.1,
+    "ttft_p50": 2.184,
+    "ttft_p95": 5.407,
+    "lat_p50": 2.986,
+    "lat_p95": 6.884,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.93,
+    "out_tok_s": 1532.2,
+    "ttft_p50": 4.014,
+    "ttft_p95": 4.928,
+    "lat_p50": 4.691,
+    "lat_p95": 5.479,
+    "first_error": null
+   }
+  ],
   "load-hi-pe-9b-256-twice-same-server": [
    {
     "case": "closed c=256",
@@ -123,6 +445,44 @@
     "ttft_p95": 4.952,
     "lat_p50": 4.777,
     "lat_p95": 5.537,
+    "first_error": null
+   }
+  ],
+  "load-hi-pe-9b-final": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 2.12,
+    "out_tok_s": 4276.8,
+    "ttft_p50": 0.105,
+    "ttft_p95": 0.494,
+    "lat_p50": 0.805,
+    "lat_p95": 1.723,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 6.82,
+    "out_tok_s": 2629.9,
+    "ttft_p50": 1.858,
+    "ttft_p95": 5.451,
+    "lat_p50": 2.532,
+    "lat_p95": 6.429,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.94,
+    "out_tok_s": 1524.2,
+    "ttft_p50": 4.032,
+    "ttft_p95": 4.912,
+    "lat_p50": 4.694,
+    "lat_p95": 5.472,
     "first_error": null
    }
   ],
@@ -900,18 +1260,20 @@
   ]
  },
  "builds": {
-  "load-pe-*-merged": "rocm branch after merging main (029c77f): the numbers docs/benchmarks.md shows for 1 to 64 in flight",
-  "load-pe-9b, load-pe-27b, load-hi-pe-*": "rocm branch before the merge (8633ec1 / 110462b); load-hi-* are the 128 and 256 numbers in docs/benchmarks.md",
-  "load-pe-9b-q4km": "int8 below 16 rows, bf16 above (0684cec); load-pe-9b-q4km-merged: bf16 (dequantized) for every batch, the shipped default"
+  "load-pe-*-merged": "rocm after merging main (029c77f): docs/benchmarks.md's 1 to 64 in flight",
+  "load-fresh-*": "128 and 256 in flight with a fresh client process per level: docs/benchmarks.md's 128 and 256 rows (pocket-engine at 4fa77f8)",
+  "load-hi-*": "earlier 128-then-256 runs in one client process (see notes); superseded by load-fresh-*",
+  "load-pe-9b, load-pe-27b": "rocm before the merge (8633ec1)",
+  "load-pe-9b-q4km-merged": "GGUF dequantized to bf16 for every batch, the shipped default; load-pe-9b-q4km: int8 below 16 rows (0684cec); load-pe-9b-q4km-emulated: before native AMD kernels"
  },
  "notes": [
-  "Startup, launch to serving: pocket-engine 1.6-3.9 s (9B, 27B); vLLM 260 s (9B) and 316 s (27B), including AITER JIT builds and graph compilation.",
+  "Startup, launch to serving: pocket-engine 1.6-3.9 s (9B, 27B); vLLM 260 s (9B) and 316 s (27B) on first start, including AITER JIT builds and graph compilation.",
   "Accuracy on this GPU (teacher-forced against Transformers bf16, tests/fixtures): 9B bf16 218-219 of 220 picks, misses within one bf16 step, median |dlogprob| 0.0003, p95 0.034; 9B Q4_K_M 213 of 220.",
-  "tests/gpu.rs on the merged build: 9B bf16 and 9B Q4_K_M pass all 15. LoRA's shrink overlapped with the layer's matrix multiply on a second stream changed outputs on AMD (a zero adapter moved 144 of 220 picks); AMD now runs it in stream order, which matches the base model exactly.",
+  "tests/gpu.rs on the merged build: 9B bf16, 27B bf16 and 9B Q4_K_M pass all 15. LoRA's shrink overlapped with the layer's matrix multiply on a second stream changed outputs on AMD (a zero adapter moved 144 of 220 picks); AMD runs it in stream order, which matches the base model exactly.",
   "HIP graphs on ROCm 7.14: greedy 256-token generations of four prompts are identical with and without graphs; base scoring is bitwise identical across runs in one process.",
-  "load-hi-* runs 128 then 256 in flight on one server. pocket-engine's second high-load phase on the same server is slower than on a fresh one (load-hi-pe-9b-256-twice-same-server: 3,741 then 2,102 tok/s at 256, median first token 0.20 then 2.25 s) with no KV blocks or slots leaked; under investigation, likely host side and shared with NVIDIA.",
-  "vLLM 9B: the burst of 256 failed with a client connection reset (httpx.ReadError) on two attempts; its 128 and 256 closed-loop results stand.",
-  "load-pe-9b-q4km-emulated: GGUF before native AMD kernels (mma.sync emulated with shuffles). vLLM cannot load Qwen3.5 GGUF files.",
+  "A second high-load phase from the same client process (load-hi-*, load-hi-pe-9b-256-twice-one-client) is slow because the client stalls: /health shows 0 running and 0 waiting for ~2 s stretches (poll-256-twice-one-client.txt). Fresh client processes back to back against one warm server get 4,857 and 4,950 tok/s at 256 (9B), so the 128 and 256 rows use a fresh client per level for both engines. The stalls appear with pocket-engine's server and an httpx client that reuses connections across bursts; worth a look at HTTP keep-alive handling.",
+  "Bursts of 256 (all requests at once) take ~4 s to first token on both engines and are not in the docs table; vLLM 9B's burst after a 256 closed loop in one client failed with a connection reset (httpx.ReadError).",
+  "vLLM cannot load Qwen3.5 GGUF files, so Q4_K_M has no vLLM column.",
   "--max-batch-tokens 16384 (load-hi-pe-9b-16k-batch-tokens) does not change the 256-in-flight result."
  ]
 }

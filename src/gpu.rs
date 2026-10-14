@@ -741,6 +741,10 @@ impl Gpu {
     /// Lets the side stream start work ordered after everything issued on
     /// the main stream so far.
     pub fn fork(&self) -> Result<()> {
+        // On AMD the side stream's work runs on the main stream (see launch_side).
+        if cfg!(feature = "rocm") {
+            return Ok(());
+        }
         // SAFETY: the event and streams are owned by self.
         unsafe {
             check(
@@ -756,6 +760,9 @@ impl Gpu {
 
     /// Orders later main-stream work after everything issued on the side stream.
     pub fn join(&self) -> Result<()> {
+        if cfg!(feature = "rocm") {
+            return Ok(());
+        }
         // SAFETY: the event and streams are owned by self.
         unsafe {
             check(cu::cuEventRecord(self.join_ev, self.side), "cuEventRecord")?;
@@ -775,7 +782,16 @@ impl Gpu {
         smem: u32,
         args: &[Arg],
     ) -> Result<()> {
-        self.launch_in(self.side, k, grid, block, smem, args)
+        // On an MI325X (ROCm 7.14), LoRA's shrink overlapped with the layer's
+        // matrix multiply through these events changed outputs (a zero
+        // adapter moved 144 of 220 picks); in stream order it matches the
+        // base model exactly, so AMD gives up the overlap.
+        let stream = if cfg!(feature = "rocm") {
+            self.stream
+        } else {
+            self.side
+        };
+        self.launch_in(stream, k, grid, block, smem, args)
     }
 
     fn launch_in(

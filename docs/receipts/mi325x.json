@@ -907,7 +907,7 @@
  "notes": [
   "Startup, launch to serving: pocket-engine 1.6-3.9 s (9B, 27B); vLLM 260 s (9B) and 316 s (27B), including AITER JIT builds and graph compilation.",
   "Accuracy on this GPU (teacher-forced against Transformers bf16, tests/fixtures): 9B bf16 218-219 of 220 picks, misses within one bf16 step, median |dlogprob| 0.0003, p95 0.034; 9B Q4_K_M 213 of 220.",
-  "tests/gpu.rs on the merged build: 9B Q4_K_M 15 of 15; 9B bf16 14 of 15 (lora_zero_adapter_matches_base fails: a zero adapter changes 144 of 220 picks on AMD, while lora_matches_merged_reference passes; main's LoRA kernels need an AMD review). Before the merge, 9B and 27B bf16 passed all 8 tests of that version.",
+  "tests/gpu.rs on the merged build: 9B bf16 and 9B Q4_K_M pass all 15. LoRA's shrink overlapped with the layer's matrix multiply on a second stream changed outputs on AMD (a zero adapter moved 144 of 220 picks); AMD now runs it in stream order, which matches the base model exactly.",
   "HIP graphs on ROCm 7.14: greedy 256-token generations of four prompts are identical with and without graphs; base scoring is bitwise identical across runs in one process.",
   "load-hi-* runs 128 then 256 in flight on one server. pocket-engine's second high-load phase on the same server is slower than on a fresh one (load-hi-pe-9b-256-twice-same-server: 3,741 then 2,102 tok/s at 256, median first token 0.20 then 2.25 s) with no KV blocks or slots leaked; under investigation, likely host side and shared with NVIDIA.",
   "vLLM 9B: the burst of 256 failed with a client connection reset (httpx.ReadError) on two attempts; its 128 and 256 closed-loop results stand.",

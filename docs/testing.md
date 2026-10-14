@@ -17,7 +17,7 @@ hf download Qwen/Qwen3.5-2B --local-dir models/qwen3.5-2b
 POCKET_ENGINE_MODEL=models/qwen3.5-2b CUDA_COMPUTE_CAP=120a cargo test --release --features cuda
 ```
 
-Any supported model works, as a directory or a GGUF file. The run takes about a minute after the build. It checks that:
+On AMD, use `--features rocm` in place of `--features cuda` and drop `CUDA_COMPUTE_CAP`. Any supported model works, as a directory or a GGUF file. The run takes about a minute after the build. It checks that:
 
 - outputs match Transformers, for text and images;
 - batching and the prefix cache change outputs only by rounding;

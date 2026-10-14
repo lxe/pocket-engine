@@ -25,6 +25,7 @@ Requires an NVIDIA GPU with driver 580 or newer, the CUDA 13 toolkit and Rust 1.
 ```sh
 git clone https://github.com/lxe/pocket-engine && cd pocket-engine
 CUDA_COMPUTE_CAP=90a cargo build --release --features cuda   # 100a for B200, 120a for RTX 50-series
+# cargo build --release --features rocm                       # AMD MI325X (gfx942), ROCm 7
 
 hf download Qwen/Qwen3.5-2B --local-dir models/qwen3.5-2b
 target/release/pocket-engine serve --model models/qwen3.5-2b --bind 0.0.0.0:8000
@@ -38,7 +39,7 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 ## Supported
 
 - **Models:** Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Dense models only.
-- **GPUs:** H100, H200, B200 and RTX 50-series.
+- **GPUs:** H100, H200, B200 and RTX 50-series; AMD MI325X (ROCm).
 - **Weights:** bf16, FP8, FP4 (RTX 50-series) and GGUF.
 
 ## Documentation

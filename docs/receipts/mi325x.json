@@ -1,0 +1,689 @@
+{
+ "gpu": "AMD Instinct MI325X (gfx942, 256 GB HBM3E), DigitalOcean gpu-mi325x1-256gb, ROCm 7.14",
+ "date": "2026-10-13 (PDT)",
+ "workload": "scripts/load.py: chat prompts of ~60-200 tokens, 16-64 output tokens, temperature 0; closed loops at 1/8/16/32/64 in flight and a burst of 64; load_hi.py runs 128 and 256 in flight and a burst of 256",
+ "pocket_engine": {
+  "branch": "rocm",
+  "flags": "defaults (bf16 weights, bf16 KV cache, HIP graphs)"
+ },
+ "vllm": {
+  "image": "vllm/vllm-openai-rocm:v0.31.0",
+  "flags": "--attention-backend ROCM_AITER_FA --max-model-len 4096 --max-num-seqs 256 --no-enable-prefix-caching",
+  "env": "VLLM_ROCM_USE_AITER=1 HIP_FORCE_DEV_KERNARG=1 SAFETENSORS_FAST_GPU=1 TORCH_BLAS_PREFER_HIPBLASLT=1"
+ },
+ "runs": {
+  "load-hi-pe-27b": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 6.24,
+    "out_tok_s": 1071.6,
+    "ttft_p50": 0.352,
+    "ttft_p95": 1.57,
+    "lat_p50": 2.405,
+    "lat_p95": 5.211,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 13.62,
+    "out_tok_s": 981.0,
+    "ttft_p50": 0.679,
+    "ttft_p95": 3.697,
+    "lat_p50": 5.849,
+    "lat_p95": 12.256,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 8.03,
+    "out_tok_s": 835.4,
+    "ttft_p50": 4.103,
+    "ttft_p95": 5.67,
+    "lat_p50": 6.356,
+    "lat_p95": 7.256,
+    "first_error": null
+   }
+  ],
+  "load-hi-pe-9b-16k-batch-tokens": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 2.29,
+    "out_tok_s": 3951.7,
+    "ttft_p50": 0.157,
+    "ttft_p95": 0.462,
+    "lat_p50": 0.911,
+    "lat_p95": 1.89,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 6.84,
+    "out_tok_s": 2620.1,
+    "ttft_p50": 2.069,
+    "ttft_p95": 5.547,
+    "lat_p50": 2.61,
+    "lat_p95": 6.471,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.98,
+    "out_tok_s": 1505.5,
+    "ttft_p50": 4.015,
+    "ttft_p95": 5.001,
+    "lat_p50": 4.737,
+    "lat_p95": 5.534,
+    "first_error": null
+   }
+  ],
+  "load-hi-pe-9b-256-twice-same-server": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 4.78,
+    "out_tok_s": 3741.4,
+    "ttft_p50": 0.204,
+    "ttft_p95": 1.009,
+    "lat_p50": 1.967,
+    "lat_p95": 4.239,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 8.53,
+    "out_tok_s": 2101.5,
+    "ttft_p50": 2.252,
+    "ttft_p95": 5.503,
+    "lat_p50": 3.396,
+    "lat_p95": 7.607,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.99,
+    "out_tok_s": 1506.3,
+    "ttft_p50": 4.059,
+    "ttft_p95": 4.952,
+    "lat_p50": 4.777,
+    "lat_p95": 5.537,
+    "first_error": null
+   }
+  ],
+  "load-hi-pe-9b": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 2.37,
+    "out_tok_s": 3814.4,
+    "ttft_p50": 0.115,
+    "ttft_p95": 0.506,
+    "lat_p50": 0.932,
+    "lat_p95": 1.975,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 6.83,
+    "out_tok_s": 2623.2,
+    "ttft_p50": 1.985,
+    "ttft_p95": 5.562,
+    "lat_p50": 2.716,
+    "lat_p95": 6.457,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.98,
+    "out_tok_s": 1512.7,
+    "ttft_p50": 4.055,
+    "ttft_p95": 4.942,
+    "lat_p50": 4.752,
+    "lat_p95": 5.604,
+    "first_error": null
+   }
+  ],
+  "load-hi-vllm-27b": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 6.97,
+    "out_tok_s": 1489.4,
+    "ttft_p50": 0.65,
+    "ttft_p95": 1.809,
+    "lat_p50": 2.932,
+    "lat_p95": 5.681,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 12.98,
+    "out_tok_s": 1596.8,
+    "ttft_p50": 0.934,
+    "ttft_p95": 4.012,
+    "lat_p50": 5.27,
+    "lat_p95": 11.068,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 8.86,
+    "out_tok_s": 1172.6,
+    "ttft_p50": 4.273,
+    "ttft_p95": 6.384,
+    "lat_p50": 7.285,
+    "lat_p95": 8.338,
+    "first_error": null
+   }
+  ],
+  "load-hi-vllm-9b": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 2.29,
+    "out_tok_s": 4534.8,
+    "ttft_p50": 0.173,
+    "ttft_p95": 0.46,
+    "lat_p50": 0.97,
+    "lat_p95": 1.808,
+    "first_error": null
+   },
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 5.32,
+    "out_tok_s": 3892.8,
+    "ttft_p50": 0.488,
+    "ttft_p95": 2.334,
+    "lat_p50": 2.056,
+    "lat_p95": 4.593,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "error": "client connection reset (httpx.ReadError) during the burst; not retried"
+   }
+  ],
+  "load-pe-27b": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 5.8,
+    "out_tok_s": 67.1,
+    "ttft_p50": 0.027,
+    "ttft_p95": 0.033,
+    "lat_p50": 0.289,
+    "lat_p95": 0.469,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 5.38,
+    "out_tok_s": 311.7,
+    "ttft_p50": 0.056,
+    "ttft_p95": 0.066,
+    "lat_p50": 0.532,
+    "lat_p95": 1.13,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 4.66,
+    "out_tok_s": 562.8,
+    "ttft_p50": 0.058,
+    "ttft_p95": 0.089,
+    "lat_p50": 0.592,
+    "lat_p95": 1.445,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 4.6,
+    "out_tok_s": 742.7,
+    "ttft_p50": 0.094,
+    "ttft_p95": 0.384,
+    "lat_p50": 0.904,
+    "lat_p95": 1.945,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 5.38,
+    "out_tok_s": 933.6,
+    "ttft_p50": 0.165,
+    "ttft_p95": 0.652,
+    "lat_p50": 1.359,
+    "lat_p95": 3.092,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.08,
+    "out_tok_s": 804.3,
+    "ttft_p50": 0.538,
+    "ttft_p95": 0.789,
+    "lat_p50": 1.296,
+    "lat_p95": 1.829,
+    "first_error": null
+   }
+  ],
+  "load-pe-9b-q4km-emulated": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 23.13,
+    "out_tok_s": 26.8,
+    "ttft_p50": 0.16,
+    "ttft_p95": 0.235,
+    "lat_p50": 1.199,
+    "lat_p95": 2.35,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 17.36,
+    "out_tok_s": 132.9,
+    "ttft_p50": 0.238,
+    "ttft_p95": 0.394,
+    "lat_p50": 1.913,
+    "lat_p95": 3.682,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 12.45,
+    "out_tok_s": 284.4,
+    "ttft_p50": 0.235,
+    "ttft_p95": 0.367,
+    "lat_p50": 1.695,
+    "lat_p95": 3.662,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 15.55,
+    "out_tok_s": 291.6,
+    "ttft_p50": 0.441,
+    "ttft_p95": 1.54,
+    "lat_p50": 3.339,
+    "lat_p95": 6.427,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 21.22,
+    "out_tok_s": 315.7,
+    "ttft_p50": 0.815,
+    "ttft_p95": 2.963,
+    "lat_p50": 6.387,
+    "lat_p95": 13.076,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 7.64,
+    "out_tok_s": 304.2,
+    "ttft_p50": 1.791,
+    "ttft_p95": 2.959,
+    "lat_p50": 6.084,
+    "lat_p95": 7.605,
+    "first_error": null
+   }
+  ],
+  "load-pe-9b-q4km": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 8.52,
+    "out_tok_s": 76.3,
+    "ttft_p50": 0.097,
+    "ttft_p95": 0.141,
+    "lat_p50": 0.474,
+    "lat_p95": 0.821,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 7.66,
+    "out_tok_s": 299.8,
+    "ttft_p50": 0.111,
+    "ttft_p95": 0.199,
+    "lat_p50": 0.832,
+    "lat_p95": 1.544,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 6.7,
+    "out_tok_s": 528.1,
+    "ttft_p50": 0.114,
+    "ttft_p95": 0.197,
+    "lat_p50": 0.988,
+    "lat_p95": 1.679,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 7.45,
+    "out_tok_s": 609.1,
+    "ttft_p50": 0.146,
+    "ttft_p95": 0.474,
+    "lat_p50": 1.505,
+    "lat_p95": 3.132,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 8.19,
+    "out_tok_s": 813.5,
+    "ttft_p50": 0.25,
+    "ttft_p95": 0.888,
+    "lat_p50": 2.23,
+    "lat_p95": 4.398,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 3.26,
+    "out_tok_s": 682.2,
+    "ttft_p50": 0.862,
+    "ttft_p95": 0.882,
+    "lat_p50": 2.618,
+    "lat_p95": 3.23,
+    "first_error": null
+   }
+  ],
+  "load-pe-9b": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 2.75,
+    "out_tok_s": 211.1,
+    "ttft_p50": 0.011,
+    "ttft_p95": 0.013,
+    "lat_p50": 0.149,
+    "lat_p95": 0.299,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.22,
+    "out_tok_s": 1010.8,
+    "ttft_p50": 0.02,
+    "ttft_p95": 0.026,
+    "lat_p50": 0.237,
+    "lat_p95": 0.47,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 2.0,
+    "out_tok_s": 1734.9,
+    "ttft_p50": 0.02,
+    "ttft_p95": 0.033,
+    "lat_p50": 0.266,
+    "lat_p95": 0.524,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.87,
+    "out_tok_s": 2408.1,
+    "ttft_p50": 0.038,
+    "ttft_p95": 0.125,
+    "lat_p50": 0.401,
+    "lat_p95": 0.787,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 2.1,
+    "out_tok_s": 3127.7,
+    "ttft_p50": 0.064,
+    "ttft_p95": 0.269,
+    "lat_p50": 0.572,
+    "lat_p95": 1.138,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 0.79,
+    "out_tok_s": 2864.0,
+    "ttft_p50": 0.176,
+    "ttft_p95": 0.281,
+    "lat_p50": 0.536,
+    "lat_p95": 0.76,
+    "first_error": null
+   }
+  ],
+  "load-vllm-27b": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 8.81,
+    "out_tok_s": 76.3,
+    "ttft_p50": 0.037,
+    "ttft_p95": 0.041,
+    "lat_p50": 0.426,
+    "lat_p95": 0.831,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 7.33,
+    "out_tok_s": 349.2,
+    "ttft_p50": 0.099,
+    "ttft_p95": 0.147,
+    "lat_p50": 0.762,
+    "lat_p95": 1.411,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 6.75,
+    "out_tok_s": 587.4,
+    "ttft_p50": 0.123,
+    "ttft_p95": 0.259,
+    "lat_p50": 0.958,
+    "lat_p95": 1.668,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.83,
+    "out_tok_s": 872.5,
+    "ttft_p50": 0.193,
+    "ttft_p95": 0.513,
+    "lat_p50": 1.249,
+    "lat_p95": 2.194,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 6.46,
+    "out_tok_s": 1166.1,
+    "ttft_p50": 0.353,
+    "ttft_p95": 0.958,
+    "lat_p50": 1.711,
+    "lat_p95": 3.349,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.35,
+    "out_tok_s": 1087.4,
+    "ttft_p50": 0.981,
+    "ttft_p95": 0.999,
+    "lat_p50": 1.72,
+    "lat_p95": 2.332,
+    "first_error": null
+   }
+  ],
+  "load-vllm-9b": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 3.25,
+    "out_tok_s": 207.0,
+    "ttft_p50": 0.025,
+    "ttft_p95": 0.026,
+    "lat_p50": 0.16,
+    "lat_p95": 0.298,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 3.31,
+    "out_tok_s": 772.4,
+    "ttft_p50": 0.069,
+    "ttft_p95": 0.082,
+    "lat_p50": 0.381,
+    "lat_p95": 0.652,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 3.14,
+    "out_tok_s": 1262.6,
+    "ttft_p50": 0.078,
+    "ttft_p95": 0.104,
+    "lat_p50": 0.501,
+    "lat_p95": 0.811,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 2.49,
+    "out_tok_s": 2046.2,
+    "ttft_p50": 0.107,
+    "ttft_p95": 0.147,
+    "lat_p50": 0.523,
+    "lat_p95": 0.973,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 2.3,
+    "out_tok_s": 3272.6,
+    "ttft_p50": 0.135,
+    "ttft_p95": 0.251,
+    "lat_p50": 0.626,
+    "lat_p95": 1.11,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 0.8,
+    "out_tok_s": 3198.5,
+    "ttft_p50": 0.243,
+    "ttft_p95": 0.294,
+    "lat_p50": 0.557,
+    "lat_p95": 0.781,
+    "first_error": null
+   }
+  ]
+ },
+ "notes": [
+  "Startup, launch to serving: pocket-engine 1.6-2.5 s (9B) and 5.3 s (27B); vLLM 260 s (9B) and 316 s (27B), including AITER JIT builds and graph compilation.",
+  "Accuracy on this GPU (teacher-forced against Transformers bf16, tests/fixtures): 9B bf16 218-219 of 220 picks, misses within one bf16 step, median |dlogprob| 0.0003, p95 0.034; 9B Q4_K_M 210 of 220 (int8 activations), 208 with --no-int8. tests/gpu.rs passes for 9B bf16, 27B bf16 and 9B Q4_K_M.",
+  "HIP graphs on ROCm 7.14: greedy 256-token generations of four prompts are identical with and without graphs.",
+  "load-hi-* runs 128 then 256 in flight on one server. pocket-engine's second high-load phase on the same server is slower than on a fresh one (load-hi-pe-9b-256-twice-same-server: 3,741 then 2,102 tok/s at 256, median first token 0.20 then 2.25 s) with no KV blocks or slots leaked; under investigation.",
+  "vLLM 9B: the burst of 256 failed with a client connection reset (httpx.ReadError) on two attempts; its 128 and 256 closed-loop results stand.",
+  "load-pe-9b-q4km-emulated: GGUF before the native int8 MFMA kernel (mma.sync emulated with shuffles). vLLM cannot load Qwen3.5 GGUF files.",
+  "--max-batch-tokens 16384 (load-hi-pe-9b-16k-batch-tokens) does not change the 256-in-flight result."
+ ]
+}

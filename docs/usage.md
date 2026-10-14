@@ -1,6 +1,6 @@
 # Usage
 
-The binary is `target/release/pocket-engine`. It needs `libcublas.so.13` and `libcublasLt.so.13` on the library path.
+The binary is `target/release/pocket-engine`. It needs `libcublas.so.13` and `libcublasLt.so.13` on the library path, or for AMD, ROCm 7's `libamdhip64` and `libhipblas`.
 
 ## Models and hardware
 
@@ -11,6 +11,7 @@ Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Mixture-of-experts mo
 | H100, H200 | `CUDA_COMPUTE_CAP=90a` |
 | B200 | `CUDA_COMPUTE_CAP=100a` |
 | RTX 50-series | `CUDA_COMPUTE_CAP=120a` |
+| AMD MI325X (gfx942) | `--features rocm` in place of `--features cuda` (`ROCM_ARCH`, `ROCM_PATH` to override) |
 
 ## Weights
 

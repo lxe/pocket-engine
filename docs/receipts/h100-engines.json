@@ -14,7 +14,11 @@
   "vLLM 0.31.0 does not load Qwen3.5 GGUF files",
   "vLLM 27B needed --max-num-seqs 256 and VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0 (missing cubin)",
   "FP8: pocket-engine and vLLM quantize bf16 at load for 0.8B-9B; Qwen3.8-27B-FP8 checkpoint for 27B",
-  "load.py repeats prompts across buckets, which prefix caches exploit"
+  "load.py repeats prompts across buckets, which prefix caches exploit",
+  "GGUF files: unsloth's BF16 and Q4_K_M for Qwen3.5 0.8B-9B, ggml-org's for Qwen3.8-27B",
+  "'plain blocks' rows (pe): every Q4_K_M matrix in GGUF's own block layout; main Q4_K_M rows (pe2): Q4_K tiled, Q6_K plain",
+  "llama.cpp's default host prompt cache and context checkpoints snapshot the recurrent state, several hundred MB per request on 27B; the main llama.cpp rows turn them off",
+  "Ready: launch to serving. TTFT: median time to first token at 64 in flight"
  ],
  "runs": {
   "llama-0.8b-bf16": {

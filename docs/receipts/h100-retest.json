@@ -1131,5 +1131,10 @@
     "lat_p50": 0.49
    }
   ]
- }
+ },
+ "notes": [
+  "shared and multiturn: scripts/workloads.py, both prefix caches on (vLLM's default, align mode for the recurrent state)",
+  "mtp: pocket-engine --mtp 2, vLLM --speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":2}",
+  "load rows: vLLM prefix cache off"
+ ]
 }

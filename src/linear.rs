@@ -88,9 +88,17 @@ pub struct TiledKernels {
     pub tile: Kernel,
     pub dequant: Kernel,
     pub mma: [Kernel; 4],
-    /// The same tiles against int8 activations, and the most rows they beat
-    /// the bf16 paths at.
-    pub mma8: Option<([Kernel; 4], usize)>,
+    /// The same tiles against int8 activations.
+    pub mma8: Option<Int8Kernels>,
+}
+
+#[derive(Clone)]
+pub struct Int8Kernels {
+    pub tiles: [Kernel; 4],
+    /// The most rows int8 beats the bf16 paths at.
+    pub most: usize,
+    /// 128 x 64 blocks for large batches, their shared memory and threads.
+    pub big: Option<(Kernel, usize, usize)>,
 }
 
 const MMA_TILES: [usize; 4] = [8, 16, 32, 64];
@@ -150,6 +158,8 @@ pub struct Quants {
     /// kernels before dequantizing to bf16 for cuBLAS.
     int8_max: usize,
     dense_rows: usize,
+    /// Rows from which int8 takes the 128 x 64 block kernels.
+    big_rows: usize,
 }
 
 /// Widest input the int8 activation buffer holds.
@@ -173,6 +183,7 @@ impl Quants {
     fn tune(&mut self, arch: u32) {
         let dc = datacenter(arch);
         self.int8_max = env_usize("POCKET_INT8_MAX_ROWS", if dc { 48 } else { 4096 });
+        self.big_rows = env_usize("POCKET_INT8_BIG_ROWS", 128);
         self.dense_rows = env_usize("POCKET_DENSE_ROWS", if dc { 112 } else { DENSE_ROWS });
     }
 
@@ -220,7 +231,28 @@ impl Quants {
                                 k.push(gpu.kernel(&format!("qtile8_{name}_{t}"))?);
                             }
                             let most = if name == "q6_k" { 640 } else { usize::MAX };
-                            Some((k.try_into().unwrap_or_else(|_| unreachable!()), most))
+                            let big = match name {
+                                "q6_k" => None,
+                                _ => {
+                                    // Formats with more decoding per weight do better
+                                    // with 4 warps of 64 tokens than 8 of 32.
+                                    let wm = match name {
+                                        "q4_0" | "q4_k" => 2,
+                                        _ => 1,
+                                    };
+                                    let wm = env_usize("POCKET_QBIG_WM", wm);
+                                    let k = gpu.kernel(&format!("qbig8_{name}_{wm}"))?;
+                                    let chunk = ty.tile_chunk().expect("tiled");
+                                    let smem = 2 * (8 * chunk + 64 * 320 + (10 + 8) * 64 * 4);
+                                    gpu.set_smem(k, smem)?;
+                                    Some((k, smem, 128 * wm))
+                                }
+                            };
+                            Some(Int8Kernels {
+                                tiles: k.try_into().unwrap_or_else(|_| unreachable!()),
+                                most,
+                                big,
+                            })
                         }
                         _ => None,
                     },
@@ -330,8 +362,7 @@ impl Linear {
                 .loaded(ty)
                 .and_then(|k| k.tiled.as_ref())
                 .and_then(|t| t.mma8.as_ref())
-                .filter(|(_, most)| rows <= *most)
-                .map(|(k, _)| k),
+                .filter(|k| rows <= k.most),
             _ => None,
         };
         let act8 = match &q.act8 {
@@ -573,6 +604,31 @@ impl Linear {
                             )?;
                             r0 += n;
                         }
+                    } else if let Some(((xq, xs, mp), k8)) = mma8
+                        && rows >= q.big_rows
+                        // At least three blocks for every four SMs.
+                        && 4 * rows.div_ceil(64) * p.rows.div_ceil(128) >= 3 * q.sms
+                        && let Some((big, smem, threads)) = k8.big
+                    {
+                        gpu.launch(
+                            big,
+                            (rows.div_ceil(64) as u32, p.rows.div_ceil(128) as u32, 1),
+                            threads as u32,
+                            smem as u32,
+                            &[
+                                P(p.buf.ptr),
+                                I(p.rows as i32),
+                                I(self.cols as i32),
+                                P(xq),
+                                P(xs),
+                                I(mp as i32),
+                                I(rows as i32),
+                                P(y),
+                                I(ldy as i32),
+                                I(p.off as i32),
+                                I(f32_out as i32),
+                            ],
+                        )?;
                     } else if tiled.is_none() && rows <= gemv_rows() {
                         gpu.launch(
                             k.gemv[rows - 1],
@@ -603,7 +659,7 @@ impl Linear {
                         let ws = q.workspace.as_ref().map_or(0, |b| b.ptr);
                         let (kernel, margs) = match mma8 {
                             Some(((xq, xs, mp), k8)) => (
-                                k8[ti],
+                                k8.tiles[ti],
                                 vec![
                                     P(p.buf.ptr),
                                     I(p.rows as i32),

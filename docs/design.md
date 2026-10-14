@@ -86,7 +86,7 @@ In batches of 16 rows or more, those formats run on int8 tensor cores, against a
 
 ## AMD
 
-The `rocm` feature builds the same kernels with hipcc for gfx942 and runs them through HIP and hipBLAS (`src/hip.rs`). The few hardware primitives the kernels need (asynchronous copies, `ldmatrix`, `mma.sync`, streaming loads) live in `kernels/backend/cuda.cuh` and `kernels/backend/hip.cuh`. On AMD they emulate NVIDIA's fragments with shuffles, so the hot paths have native versions in `kernels/amd/`, written for 64-lane waves and MFMA matrix instructions: the chunked delta rule, prompt attention, int8 GGUF tiles, the decode recurrence, and matrix-vector products for 1 to 4 rows. FP8 and FP4 are NVIDIA only.
+The `rocm` feature builds the same kernels with hipcc for gfx942 and runs them through HIP and hipBLAS (`src/hip.rs`). The few hardware primitives the kernels need (asynchronous copies, `ldmatrix`, `mma.sync`, streaming loads) live in `kernels/backend/cuda.cuh` and `kernels/backend/hip.cuh`. On AMD they emulate NVIDIA's fragments with shuffles, so the hot paths have native versions in `kernels/amd/`, written for 64-lane waves and MFMA matrix instructions: the chunked delta rule, prompt and decode attention, int8 GGUF tiles, the decode recurrence, and matrix-vector products for 1 to 4 rows. FP8 and FP4 are NVIDIA only.
 
 ## Loading
 

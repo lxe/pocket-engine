@@ -45,19 +45,19 @@ These pods capped each container at 20 CPUs on a busy host. That slows vLLM's sc
 
 ## AMD MI325X
 
-One MI325X (ROCm 7.14) against vLLM 0.31.0's ROCm image with AITER attention. Output tokens/s from `scripts/load.py`, plus 128 and 256 in flight with the same prompts. Receipts: [mi325x.json](receipts/mi325x.json).
+One MI325X (ROCm 7.14) against vLLM 0.31.0's ROCm image with AITER attention. Output tokens/s from `scripts/load.py`, plus 128 and 256 in flight with the same prompts. pocket-engine measured 2026-10-14, vLLM 2026-10-13. Receipts: [mi325x.json](receipts/mi325x.json).
 
 | In flight | 9B pocket-engine | 9B vLLM | 27B pocket-engine | 27B vLLM |
 |---:|---:|---:|---:|---:|
-| 1 | **211** | 207 | 67 | **76** |
-| 8 | **1,012** | 772 | 315 | **349** |
-| 16 | **1,764** | 1,263 | 579 | **587** |
-| 32 | **2,506** | 2,046 | 770 | **873** |
-| 64 | 3,235 | **3,273** | 954 | **1,166** |
-| 128 | 4,277 | **4,580** | 1,199 | **1,485** |
-| 256 | 4,857 | **5,445** | 1,359 | **1,669** |
+| 1 | **213** | 207 | 70 | **76** |
+| 8 | **1,024** | 772 | 326 | **349** |
+| 16 | **1,796** | 1,263 | **601** | 587 |
+| 32 | **2,526** | 2,046 | 777 | **873** |
+| 64 | **3,307** | 3,273 | 1,007 | **1,166** |
+| 128 | 4,214 | **4,580** | 1,189 | **1,485** |
+| 256 | 4,745 | **5,445** | 1,317 | **1,669** |
 
-Startup takes 2 to 4 s against vLLM's 260 to 316 s, and the median first token at 64 in flight is 63 ms against 135 (9B) and 158 against 353 (27B). Qwen3.5-9B Q4_K_M serves 81, 891 and 2,135 tokens/s at 1, 16 and 64 in flight.
+Startup takes 2 to 8 s against vLLM's 260 to 316 s, and the median first token at 64 in flight is 62 ms against 135 (9B) and 153 against 353 (27B). Qwen3.5-9B Q4_K_M serves 81, 879 and 2,146 tokens/s at 1, 16 and 64 in flight.
 
 ## First token by prompt length, H100
 

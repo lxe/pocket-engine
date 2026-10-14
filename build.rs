@@ -7,7 +7,12 @@ fn main() {
         "fp8.cuh",
         "fp4.cuh",
         "ggml-common.h",
-        "hip_compat.h",
+        "backend/cuda.cuh",
+        "backend/hip.cuh",
+        "amd/gdn_decode.cuh",
+        "amd/gdn_chunk.cuh",
+        "amd/attention.cuh",
+        "amd/skinny.cuh",
     ] {
         println!("cargo:rerun-if-changed=src/kernels/{f}");
     }
@@ -76,8 +81,7 @@ fn rocm(out: &std::path::Path) {
         .args(["--genco", "-std=c++17", "-O3", "-ffp-contract=fast"])
         .arg(format!("--offload-arch={arch}"))
         .args([
-            "-include",
-            "src/kernels/hip_compat.h",
+            "-DHIP_DISABLE_WARP_SYNC_BUILTINS=1",
             "-x",
             "hip",
             "src/kernels/qwen35.cu",

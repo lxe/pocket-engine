@@ -1,5 +1,7 @@
-// Builds the CUDA kernel sources with hipcc for AMD Instinct GPUs (gfx942).
-// build.rs force-includes this header; on NVIDIA it is never seen.
+// The HIP backend's primitives (AMD Instinct, gfx942), the same set as
+// backend/cuda.cuh, plus the CUDA names the kernels use mapped to HIP. Built
+// with HIP_DISABLE_WARP_SYNC_BUILTINS (build.rs) so the warp primitives below
+// replace HIP's.
 //
 // The kernels are written for 32-lane warps. A gfx942 wavefront has 64
 // lanes, so a "warp" here is half a wavefront: lane = threadIdx.x & 31 as
@@ -11,7 +13,6 @@
 // portable, not fast. Kernels that matter get native MFMA versions.
 #pragma once
 
-#define HIP_DISABLE_WARP_SYNC_BUILTINS 1
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -164,3 +165,62 @@ __device__ __forceinline__ void ldsm_x4(uint32_t* r, const void* p, bool trans) 
 }
 
 }  // namespace pe
+
+// The primitives. Asynchronous copies are synchronous here (no cp.async), so
+// commits and waits are no-ops; mma.sync and ldmatrix are emulated (pe::).
+__device__ __forceinline__ float fast_exp2(float x) {
+    return exp2f(x);
+}
+
+__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
+    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    // cp.async copies are synchronous on AMD.
+}
+
+__device__ __forceinline__ void cp_async_wait1() {
+    // cp.async copies are synchronous on AMD.
+}
+
+__device__ __forceinline__ void cp_async_wait0() {
+    // cp.async copies are synchronous on AMD.
+}
+
+__device__ __forceinline__ void cp16z(void* dst, const void* src, bool valid) {
+    *reinterpret_cast<uint4*>(dst) = valid ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
+}
+
+__device__ __forceinline__ void cp4(void* dst, const void* src) {
+    *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(src);
+}
+
+__device__ __forceinline__ void cp_commit() {
+    // cp.async copies are synchronous on AMD.
+}
+
+template <int N>
+__device__ __forceinline__ void cp_wait() {
+    // cp.async copies are synchronous on AMD.
+}
+
+__device__ __forceinline__ void ldsm_x4(uint32_t* r, const void* p) {
+    pe::ldsm_x4(r, p, false);
+}
+
+__device__ __forceinline__ void ldsm_x4_t(uint32_t* r, const void* p) {
+    pe::ldsm_x4(r, p, true);
+}
+
+__device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    pe::mma_16816_bf16(d, a, b0, b1);
+}
+
+__device__ __forceinline__ uint4 ld_stream(const uint8_t* p) {
+    return *reinterpret_cast<const uint4*>(p);
+}
+
+__device__ __forceinline__ void mma_s8(int* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    pe::mma_16832_s8(c, a, b0, b1);
+}

@@ -7,8 +7,12 @@
 // Activations are row-major bf16 [tokens, width]. Reductions run in f32, and
 // values are rounded to bf16 where the reference model rounds them.
 
-#ifndef __HIP_PLATFORM_AMD__
-#include <cuda_bf16.h>
+// hipcc predefines __HIP__; backend/hip.cuh then brings __HIP_PLATFORM_AMD__,
+// which the rest of the sources test.
+#ifdef __HIP__
+#include "backend/hip.cuh"
+#else
+#include "backend/cuda.cuh"
 #endif
 #include <stdint.h>
 
@@ -84,9 +88,6 @@ __device__ __forceinline__ uint4 pack8(const float* f) {
     return u;
 }
 
-#ifndef __HIP_PLATFORM_AMD__
-#include <cuda.h>
-#endif
 #include <type_traits>
 #include "fp8.cuh"
 
@@ -274,153 +275,7 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
 }
 
 #ifdef __HIP_PLATFORM_AMD__
-// gdn_one for AMD: the same math with each thread holding 4 adjacent
-// columns of 16 rows (thread t: columns 4 (t / 8).., rows 16 (t % 8)..), so
-// the state moves in 8- or 16-byte loads instead of 2-byte ones; a column's
-// sums over rows reduce across the 8 lanes of its group.
-__device__ __forceinline__ void gdn_one_w(int s, int h, const bf16* __restrict__ conv,
-                                          const bf16* __restrict__ proj, int pstride, int C, int Hk, int Hv,
-                                          const float* __restrict__ neg_a, const float* __restrict__ dt_bias,
-                                          const float* __restrict__ norm_w, void* __restrict__ state, int state_bf16,
-                                          const int* __restrict__ cu, const int* __restrict__ slots,
-                                          const int* __restrict__ fresh, bf16* __restrict__ out, float eps, int tiled,
-                                          uint8_t* fq, void* fs, int fmode, int frows, const int* __restrict__ outs,
-                                          int spec) {
-    constexpr int RW = 16, CW = 4;
-    __shared__ float qs[GDN_DIM], ks[GDN_DIM], sh[32], ys[GDN_DIM];
-    const Fp8Out fo{fq, fs, fmode, frows};
-    const int tid = threadIdx.x, rg = tid & 7, c0 = CW * (tid >> 3), r0 = RW * rg;
-    const int t0 = cu[s], t1 = cu[s + 1];
-    if (t0 == t1) return;
-    const int kh = tiled ? h % Hk : h / (Hv / Hk);
-    const size_t base = ((size_t)slots[s] * Hv + h) * GDN_DIM * GDN_DIM;
-    float r[RW][CW];
-    const bool is_fresh = fresh[s] != 0;
-    auto load = [&](size_t b) {
-#pragma unroll
-        for (int i = 0; i < RW; i++) {
-            const size_t at = b + (size_t)(r0 + i) * GDN_DIM + c0;
-            if (is_fresh) {
-                r[i][0] = r[i][1] = r[i][2] = r[i][3] = 0.f;
-            } else if (state_bf16) {
-                const uint2 u = *reinterpret_cast<const uint2*>((const bf16*)state + at);
-                r[i][0] = __uint_as_float(u.x << 16), r[i][1] = __uint_as_float(u.x & 0xffff0000u);
-                r[i][2] = __uint_as_float(u.y << 16), r[i][3] = __uint_as_float(u.y & 0xffff0000u);
-            } else {
-                const float4 f = *reinterpret_cast<const float4*>((const float*)state + at);
-                r[i][0] = f.x, r[i][1] = f.y, r[i][2] = f.z, r[i][3] = f.w;
-            }
-        }
-    };
-    auto store = [&](size_t b) {
-#pragma unroll
-        for (int i = 0; i < RW; i++) {
-            const size_t at = b + (size_t)(r0 + i) * GDN_DIM + c0;
-            if (state_bf16) {
-                __nv_bfloat162 lo = __floats2bfloat162_rn(r[i][0], r[i][1]), hi = __floats2bfloat162_rn(r[i][2], r[i][3]);
-                *reinterpret_cast<uint2*>((bf16*)state + at) =
-                    make_uint2(*reinterpret_cast<uint32_t*>(&lo), *reinterpret_cast<uint32_t*>(&hi));
-            } else {
-                *reinterpret_cast<float4*>((float*)state + at) = make_float4(r[i][0], r[i][1], r[i][2], r[i][3]);
-            }
-        }
-    };
-    load(base);
-    auto rows8 = [](float v) {
-        v += __shfl_xor(v, 1, 32);
-        v += __shfl_xor(v, 2, 32);
-        return v + __shfl_xor(v, 4, 32);
-    };
-    const bool keep = is_spec(outs, spec, s);
-    const bool round_qk = ((t1 - t0) > 1 && !keep) || is_fresh;
-    const float na = neg_a[h], db = dt_bias[h];
-    const float qscale = rsqrtf((float)GDN_DIM);
-    for (int t = t0; t < t1; t++) {
-        const bf16* row = conv + (size_t)t * C;
-        const bf16* prow = proj + (size_t)t * pstride + C;
-        float q = 0.f, k = 0.f;
-        if (tid < GDN_DIM) {
-            q = b2f(row[kh * GDN_DIM + tid]);
-            k = b2f(row[Hk * GDN_DIM + kh * GDN_DIM + tid]);
-        }
-        const float b = b2f(prow[Hv * GDN_DIM + h]);
-        const float a = b2f(prow[Hv * GDN_DIM + Hv + h]);
-        const float qq = block_sum(q * q, sh);
-        const float kk = block_sum(k * k, sh);
-        if (tid < GDN_DIM) {
-            q = q / sqrtf(qq + 1e-6f);
-            k = k / sqrtf(kk + 1e-6f);
-            if (round_qk) {
-                q = rbf(q);
-                k = rbf(k);
-            }
-            qs[tid] = q * qscale;
-            ks[tid] = k;
-        }
-        const float beta = 1.f / (1.f + expf(-b));
-        const float x = a + db;
-        const float sp = fmaxf(x, 0.f) + logf(1.f + expf(-fabsf(x)));
-        const float decay = expf(na * sp);
-        __syncthreads();
-        float kv[CW] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-        for (int i = 0; i < RW; i++) {
-            const float kk_ = ks[r0 + i];
-#pragma unroll
-            for (int c = 0; c < CW; c++) {
-                r[i][c] *= decay;
-                kv[c] += kk_ * r[i][c];
-            }
-        }
-        float delta[CW], o[CW] = {0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-        for (int c = 0; c < CW; c++) {
-            const float v = b2f(row[2 * Hk * GDN_DIM + h * GDN_DIM + c0 + c]);
-            delta[c] = (v - rows8(kv[c])) * beta;
-        }
-#pragma unroll
-        for (int i = 0; i < RW; i++) {
-            const float kk_ = ks[r0 + i], qq_ = qs[r0 + i];
-#pragma unroll
-            for (int c = 0; c < CW; c++) {
-                r[i][c] += kk_ * delta[c];
-                o[c] += qq_ * r[i][c];
-            }
-        }
-        float ob[CW], ss = 0.f;
-#pragma unroll
-        for (int c = 0; c < CW; c++) {
-            ob[c] = rbf(rows8(o[c]));
-            ss += ob[c] * ob[c];
-        }
-        const float var = block_sum(rg == 0 ? ss : 0.f, sh) / GDN_DIM;
-        if (rg == 0) {
-            const float inv = 1.f / sqrtf(var + eps);
-            float y[CW];
-#pragma unroll
-            for (int c = 0; c < CW; c++) {
-                const int j = c0 + c;
-                y[c] = ob[c] * inv * norm_w[j] * silu(b2f(prow[h * GDN_DIM + j]));
-                ys[j] = y[c];
-            }
-            __nv_bfloat162 lo = __floats2bfloat162_rn(y[0], y[1]), hi = __floats2bfloat162_rn(y[2], y[3]);
-            *reinterpret_cast<uint2*>(out + (size_t)t * Hv * GDN_DIM + h * GDN_DIM + c0) =
-                make_uint2(*reinterpret_cast<uint32_t*>(&lo), *reinterpret_cast<uint32_t*>(&hi));
-        }
-        if (fmode) {
-            __syncthreads();
-            if (tid < 32) {
-                float v[8];
-#pragma unroll
-                for (int i = 0; i < 8; i++) v[i] = tid < 16 ? ys[8 * tid + i] : 0.f;
-                quant8(v, t, h * GDN_DIM + 8 * (tid & 15), Hv * GDN_DIM, fo, tid < 16);
-            }
-            __syncthreads();
-        }
-        if (keep) store(((size_t)outs[(size_t)s * spec + (t - t0)] * Hv + h) * GDN_DIM * GDN_DIM);
-    }
-    if (!keep) store(base);
-}
+#include "amd/gdn_decode.cuh"
 #endif
 
 // Gated delta rule, one block of 256 threads per (sequence, value head). The
@@ -576,69 +431,6 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_recurrent(GDN_ARGS
 #define GSTR 136  // bf16 row stride of 128-wide tiles, padded against bank conflicts
 #define GPSTR 40  // bf16 row stride of the 32-wide P tile
 // cp.async of 16 (or 4) bytes that zero-fills when !valid (src is not read).
-__device__ __forceinline__ void cp16z(void* dst, const void* src, bool valid) {
-#ifdef __HIP_PLATFORM_AMD__
-    *reinterpret_cast<uint4*>(dst) = valid ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
-#else
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"((uint32_t)__cvta_generic_to_shared(dst)),
-                 "l"(src), "r"(valid ? 16 : 0)
-                 : "memory");
-#endif
-}
-__device__ __forceinline__ void cp4(void* dst, const void* src) {
-#ifdef __HIP_PLATFORM_AMD__
-    *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(src);
-#else
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((uint32_t)__cvta_generic_to_shared(dst)), "l"(src)
-                 : "memory");
-#endif
-}
-__device__ __forceinline__ void cp_commit() {
-#ifdef __HIP_PLATFORM_AMD__
-    // cp.async copies are synchronous on AMD.
-#else
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-#endif
-}
-template <int N>
-__device__ __forceinline__ void cp_wait() {
-#ifdef __HIP_PLATFORM_AMD__
-    // cp.async copies are synchronous on AMD.
-#else
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
-#endif
-}
-__device__ __forceinline__ void ldsm_x4(uint32_t* r, const void* p) {
-#ifdef __HIP_PLATFORM_AMD__
-    pe::ldsm_x4(r, p, false);
-#else
-    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(a));
-#endif
-}
-__device__ __forceinline__ void ldsm_x4_t(uint32_t* r, const void* p) {
-#ifdef __HIP_PLATFORM_AMD__
-    pe::ldsm_x4(r, p, true);
-#else
-    const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(a));
-#endif
-}
-__device__ __forceinline__ void gmma(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
-#ifdef __HIP_PLATFORM_AMD__
-    pe::mma_16816_bf16(d, a, b0, b1);
-#else
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-        "{%0,%1,%2,%3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#endif
-}
 // Fragment loads (lane l: q = l / 8, r = l % 8). A tile 16 x 16 at (m0, k0)
 // from row-major X[m][k], or from X[k][m] (transposed); B as two 8-column
 // tiles at (k0, n0) from Bt[n][k] or from B[k][n] (transposed).
@@ -815,8 +607,8 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM)
             uint32_t a[4], b[4];
             frag_a(a, X, GSTR, m0, k0);
             frag_b(b, sK, GSTR, k0, n0);
-            gmma(acc[0], a, b[0], b[1]);
-            gmma(acc[1], a, b[2], b[3]);
+            mma_bf16(acc[0], a, b[0], b[1]);
+            mma_bf16(acc[1], a, b[2], b[3]);
         }
 #pragma unroll
         for (int nt = 0; nt < 2; nt++)
@@ -1004,8 +796,8 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
                     for (int nt = 0; nt < ON; nt++) {
                         uint32_t b[4];
                         frag_b_t(b, sS, VS, k0, on0 + 8 * nt);
-                        gmma(acc[nt], a, b[0], b[1]);
-                        gmma(accq[nt], aq, b[0], b[1]);
+                        mma_bf16(acc[nt], a, b[0], b[1]);
+                        mma_bf16(accq[nt], aq, b[0], b[1]);
                     }
                 }
             }
@@ -1040,7 +832,7 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
             for (int nt = 0; nt < ON; nt++) {
                 uint32_t b[4];
                 frag_b_t(b, sD, VS, k0, on0 + 8 * nt);
-                gmma(accq[nt], a, b[0], b[1]);
+                mma_bf16(accq[nt], a, b[0], b[1]);
             }
         }
 #pragma unroll
@@ -1067,8 +859,8 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
                 for (int np = 0; np < VW / 16; np++) {
                     uint32_t b[4];
                     frag_b_t(b, sDk, VS, k0, 16 * np);
-                    gmma(st[2 * np], a, b[0], b[1]);
-                    gmma(st[2 * np + 1], a, b[2], b[3]);
+                    mma_bf16(st[2 * np], a, b[0], b[1]);
+                    mma_bf16(st[2 * np + 1], a, b[2], b[3]);
                 }
             }
         }
@@ -1084,178 +876,7 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
     store_state(slots[s]);
 }
 #ifdef __HIP_PLATFORM_AMD__
-// gdn_scan on AMD's matrix cores (MFMA 16x16x16 bf16, 64-lane waves): the
-// same products as gdn_scan_cols, tiled per wave. A lane holds A[m][k..k+3]
-// (m = lane % 16, k = 4 (lane / 16)), B[k..k+3][n] and C[m..m+3][n], so both
-// operands want k contiguous: K, D, Dk and the state's bf16 copy sit
-// transposed in shared memory. Wave w keeps state rows 32w .. 32w + 31 of
-// the block's columns in registers.
-#define GKT (GC + 8)  // bf16 stride of token-contiguous rows
-template <int NS>
-__host__ __device__ constexpr int gdn_mfma_smem() {
-    return (2 * GC * GSTR + GDN_DIM * GKT + GC * (GDN_DIM / NS + 8) + GC * GPSTR + 2 * (GDN_DIM / NS) * GKT +
-            (GDN_DIM / NS) * GSTR) * 2 + 3 * GC * 4;
-}
-template <int NS>
-__device__ __forceinline__ void gdn_scan_mfma(GDN_ARGS, const bf16* __restrict__ Ui, const bf16* __restrict__ Wi,
-                                              const float* __restrict__ Nqi, const float* __restrict__ Nki,
-                                              const bf16* __restrict__ Pi, const float* __restrict__ Gi,
-                                              const int* __restrict__ snaps) {
-    constexpr int VW = GDN_DIM / NS, CT = VW / 16, CW = CT / 2, VS = VW + 8;
-    static_assert(CT >= 2, "two waves share a row tile's columns");
-    extern __shared__ __align__(16) unsigned char ssm[];
-    bf16* sW = (bf16*)ssm;                // [GC][GSTR] W
-    bf16* sQ = sW + GC * GSTR;            // [GC][GSTR] q (unnormalized)
-    bf16* sKt = sQ + GC * GSTR;           // [GDN_DIM][GKT] k, transposed
-    bf16* sU = sKt + GDN_DIM * GKT;       // [GC][VS] U, this block's columns
-    bf16* sP = sU + GC * VS;              // [GC][GPSTR] P
-    bf16* sDt = sP + GC * GPSTR;          // [VW][GKT] D, transposed
-    bf16* sDkt = sDt + VW * GKT;          // [VW][GKT] D rows times exp(G_last - G_i) |k_i|^-1, transposed
-    bf16* sSt = sDkt + VW * GKT;          // [VW][GSTR] the state's columns, transposed, bf16
-    float* sG = (float*)(sSt + VW * GSTR);  // [GC] G, then Nq, Nk
-    float* sNq = sG + GC;
-    float* sNk = sNq + GC;
-    const int s = gridDim.x - 1 - blockIdx.x, h = blockIdx.y, vz = blockIdx.z, tid = threadIdx.x;
-    const int wave = tid >> 6, lane = tid & 63, lr = lane & 15, lq = lane >> 4;
-    const int t0 = cu[s], t1 = cu[s + 1];
-    if (t0 == t1) return;
-    if (t1 - t0 == 1 || is_spec(outs, spec, s)) {
-        if (vz == 0) gdn_one(s, h, GDN_PASS);
-        return;
-    }
-    const int v0 = vz * VW, kh = tiled ? h % Hk : h / (Hv / Hk);
-    const size_t base = ((size_t)slots[s] * Hv + h) * GDN_DIM * GDN_DIM;
-    const bool is_fresh = fresh[s] != 0;
-    const float qscale = rsqrtf((float)GDN_DIM);
-    // State tile (rt, ct): rows 32 wave + 16 rt + 4 lq + j, columns 16 ct + lr.
-    pe_f4 st[2][CT];
-#pragma unroll
-    for (int rt = 0; rt < 2; rt++)
-#pragma unroll
-        for (int ct = 0; ct < CT; ct++)
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const size_t at = base + (size_t)(32 * wave + 16 * rt + 4 * lq + j) * GDN_DIM + v0 + 16 * ct + lr;
-                st[rt][ct][j] = is_fresh ? 0.f : state_bf16 ? b2f(((const bf16*)state)[at]) : ((const float*)state)[at];
-            }
-    auto store_state_smem = [&]() {
-#pragma unroll
-        for (int rt = 0; rt < 2; rt++)
-#pragma unroll
-            for (int ct = 0; ct < CT; ct++)
-                *reinterpret_cast<uint2*>(sSt + (16 * ct + lr) * GSTR + 32 * wave + 16 * rt + 4 * lq) =
-                    pack4(st[rt][ct][0], st[rt][ct][1], st[rt][ct][2], st[rt][ct][3]);
-    };
-    auto store_state = [&](int slot) {
-        const size_t b = ((size_t)slot * Hv + h) * GDN_DIM * GDN_DIM;
-#pragma unroll
-        for (int rt = 0; rt < 2; rt++)
-#pragma unroll
-            for (int ct = 0; ct < CT; ct++)
-#pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    const size_t at = b + (size_t)(32 * wave + 16 * rt + 4 * lq + j) * GDN_DIM + v0 + 16 * ct + lr;
-                    if (state_bf16) ((bf16*)state)[at] = f2b(st[rt][ct][j]);
-                    else ((float*)state)[at] = st[rt][ct][j];
-                }
-    };
-    store_state_smem();
-    bool zero_state = is_fresh;
-    // This wave's output tiles: token rows 16 (wave & 1) .., columns CW tiles from (wave >> 1) CW.
-    const int om0 = 16 * (wave & 1), oc0 = (wave >> 1) * CW;
-    for (int c0 = t0; c0 < t1; c0 += GC) {
-        const int n = min(GC, t1 - c0);
-        for (int e = tid; e < GC * (GDN_DIM / 8); e += 2 * GDN_DIM) {
-            const int i = e / (GDN_DIM / 8), c = (e % (GDN_DIM / 8)) * 8, r = c0 + min(i, n - 1);
-            const bool ok = i < n;
-            const size_t at = ((size_t)r * Hv + h) * GDN_DIM + c;
-            const bf16* row = conv + (size_t)r * C + kh * GDN_DIM + c;
-            const uint4 z = make_uint4(0, 0, 0, 0);
-            *reinterpret_cast<uint4*>(sW + i * GSTR + c) = ok ? *reinterpret_cast<const uint4*>(Wi + at) : z;
-            *reinterpret_cast<uint4*>(sQ + i * GSTR + c) = ok ? *reinterpret_cast<const uint4*>(row) : z;
-            const uint4 kv = ok ? *reinterpret_cast<const uint4*>(row + Hk * GDN_DIM) : z;
-            const bf16* kb = reinterpret_cast<const bf16*>(&kv);
-#pragma unroll
-            for (int d = 0; d < 8; d++) sKt[(c + d) * GKT + i] = kb[d];
-            if (c < VW) *reinterpret_cast<uint4*>(sU + i * VS + c) = ok ? *reinterpret_cast<const uint4*>(Ui + at + v0) : z;
-        }
-        for (int e = tid; e < GC * (GC / 8); e += 2 * GDN_DIM) {
-            const int i = e / (GC / 8), c = (e % (GC / 8)) * 8;
-            *reinterpret_cast<uint4*>(sP + i * GPSTR + c) =
-                i < n ? *reinterpret_cast<const uint4*>(Pi + ((size_t)(c0 + i) * Hv + h) * GC + c) : make_uint4(0, 0, 0, 0);
-        }
-        if (tid < GC) {
-            const size_t at = (size_t)(c0 + min(tid, n - 1)) * Hv + h;
-            sG[tid] = Gi[at];
-            sNq[tid] = Nqi[at];
-            sNk[tid] = Nki[at];
-        }
-        __syncthreads();
-        const float glast = sG[GC - 1];
-        // D = U - W S0 and Q S0 for this wave's tiles.
-        pe_f4 accq[CW];
-#pragma unroll
-        for (int cw = 0; cw < CW; cw++) {
-            const int ct = oc0 + cw;
-            pe_f4 acc = {0.f, 0.f, 0.f, 0.f};
-            accq[cw] = acc;
-            if (!zero_state) {
-#pragma unroll
-                for (int k0 = 0; k0 < GDN_DIM; k0 += 16) {
-                    const pe_s4 b = frag4(sSt, GSTR, 16 * ct + lr, k0 + 4 * lq);
-                    acc = mfma16(frag4(sW, GSTR, om0 + lr, k0 + 4 * lq), b, acc);
-                    accq[cw] = mfma16(frag4(sQ, GSTR, om0 + lr, k0 + 4 * lq), b, accq[cw]);
-                }
-            }
-            const int c = 16 * ct + lr, i0 = om0 + 4 * lq;
-            float d[4], dk[4];
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const int i = i0 + j;
-                d[j] = b2f(sU[i * VS + c]) - acc[j];
-                dk[j] = d[j] * expf(glast - sG[i]) * sNk[i];
-                accq[cw][j] *= qscale * expf(sG[i]) * sNq[i];
-            }
-            *reinterpret_cast<uint2*>(sDt + c * GKT + i0) = pack4(d[0], d[1], d[2], d[3]);
-            *reinterpret_cast<uint2*>(sDkt + c * GKT + i0) = pack4(dk[0], dk[1], dk[2], dk[3]);
-        }
-        __syncthreads();
-        // O = exp(G) qscale Q S0 + P D, written unnormalized.
-#pragma unroll
-        for (int cw = 0; cw < CW; cw++) {
-            const int ct = oc0 + cw;
-#pragma unroll
-            for (int k0 = 0; k0 < GC; k0 += 16)
-                accq[cw] = mfma16(frag4(sP, GPSTR, om0 + lr, k0 + 4 * lq), frag4(sDt, GKT, 16 * ct + lr, k0 + 4 * lq),
-                                  accq[cw]);
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const int i = om0 + 4 * lq + j;
-                if (i < n) out[(size_t)(c0 + i) * Hv * GDN_DIM + h * GDN_DIM + v0 + 16 * ct + lr] = f2b(accq[cw][j]);
-            }
-        }
-        // S = exp(G_last) S0 + K^T Dk.
-        const float decay = expf(glast);
-#pragma unroll
-        for (int rt = 0; rt < 2; rt++)
-#pragma unroll
-            for (int ct = 0; ct < CT; ct++) {
-                st[rt][ct] *= decay;
-#pragma unroll
-                for (int k0 = 0; k0 < GC; k0 += 16)
-                    st[rt][ct] = mfma16(frag4(sKt, GKT, 32 * wave + 16 * rt + lr, k0 + 4 * lq),
-                                        frag4(sDkt, GKT, 16 * ct + lr, k0 + 4 * lq), st[rt][ct]);
-            }
-        if (snaps)
-            for (int j = 0; j < 2; j++)
-                if (snaps[4 * s + 2 * j] == c0 + n - t0) store_state(snaps[4 * s + 2 * j + 1]);
-        __syncthreads();
-        store_state_smem();
-        zero_state = false;
-        __syncthreads();
-    }
-    store_state(slots[s]);
-}
+#include "amd/gdn_chunk.cuh"
 #endif
 #define GDN_SCAN_ARGS                                                                                   \
     GDN_ARGS, const bf16 *__restrict__ Ui, const bf16 *__restrict__ Wi, const float *__restrict__ Nqi, \
@@ -1602,15 +1223,6 @@ ATTN_KERNEL(8, 4)
 // more than one token) in tiles of 16; others exit.
 #define FA_STR (HEAD_DIM + 8)
 #define LOG2E 1.4426950408889634f
-__device__ __forceinline__ float fast_exp2(float x) {
-#ifdef __HIP_PLATFORM_AMD__
-    return exp2f(x);
-#else
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-#endif
-}
 __device__ __forceinline__ uint32_t fa_bf2(float lo, float hi) {
     __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
     return *reinterpret_cast<uint32_t*>(&v);
@@ -1627,35 +1239,6 @@ __device__ __forceinline__ uint32_t fa_bf2(float lo, float hi) {
 // heads and two buffers of BN keys and values.
 template <int G, int NT, int BN>
 __host__ __device__ constexpr int fg_smem() { return (G * 16 * NT + 4 * BN) * FA_STR * 2; }
-__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
-#ifdef __HIP_PLATFORM_AMD__
-    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
-#else
-    const uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src));
-#endif
-}
-__device__ __forceinline__ void cp_async_commit() {
-#ifdef __HIP_PLATFORM_AMD__
-    // cp.async copies are synchronous on AMD.
-#else
-    asm volatile("cp.async.commit_group;\n" ::);
-#endif
-}
-__device__ __forceinline__ void cp_async_wait1() {
-#ifdef __HIP_PLATFORM_AMD__
-    // cp.async copies are synchronous on AMD.
-#else
-    asm volatile("cp.async.wait_group 1;\n" ::);
-#endif
-}
-__device__ __forceinline__ void cp_async_wait0() {
-#ifdef __HIP_PLATFORM_AMD__
-    // cp.async copies are synchronous on AMD.
-#else
-    asm volatile("cp.async.wait_group 0;\n" ::);
-#endif
-}
 
 template <int G, bool F8, int NT, int BN, bool QR>
 __device__ __forceinline__ void attn_flash_group(
@@ -1769,8 +1352,8 @@ __device__ __forceinline__ void attn_flash_group(
             for (int np = 0; np < BN / 16; np++) {
                 uint32_t b[4];
                 frag_b(b, cK, FA_STR, kd, 16 * np);
-                gmma(sc[2 * np], a, b[0], b[1]);
-                gmma(sc[2 * np + 1], a, b[2], b[3]);
+                mma_bf16(sc[2 * np], a, b[0], b[1]);
+                mma_bf16(sc[2 * np + 1], a, b[2], b[3]);
             }
         }
         // Only tiles reaching past the first query or the context's end need
@@ -1836,8 +1419,8 @@ __device__ __forceinline__ void attn_flash_group(
             for (int np = 0; np < HEAD_DIM / 16; np++) {
                 uint32_t b[4];
                 frag_b_t(b, cV, FA_STR, 16 * ks, np * 16);
-                gmma(o[2 * np], a, b[0], b[1]);
-                gmma(o[2 * np + 1], a, b[2], b[3]);
+                mma_bf16(o[2 * np], a, b[0], b[1]);
+                mma_bf16(o[2 * np + 1], a, b[2], b[3]);
             }
         }
     };
@@ -1880,145 +1463,7 @@ __device__ __forceinline__ void attn_flash_group(
     }
 }
 #ifdef __HIP_PLATFORM_AMD__
-// Flash attention for prompts on AMD's matrix cores (MFMA 16x16x16 bf16,
-// 64-lane waves): wave w takes 16 queries of query head w % G, tile w / G,
-// and computes scores transposed, S^T = K Q^T, so a lane's accumulators
-// (keys 4 (lane / 16) .. + 3 of query lane % 16) are already the B operand
-// of O^T += V^T P^T and each lane rescales only its own query. Queries stay
-// in registers; keys and values (transposed) are staged per tile of AM_BN.
-#define AM_BN 32
-#define AM_VS (AM_BN + 8)
-template <int G, int NT>
-__device__ __forceinline__ void attn_mfma(ATTN_FLASH_ARGS) {
-    extern __shared__ __align__(16) unsigned char fsm[];
-    bf16* sK = (bf16*)fsm;            // [AM_BN][FA_STR]
-    bf16* sVt = sK + AM_BN * FA_STR;  // [HEAD_DIM][AM_VS]
-    constexpr int BT = 16 * NT, T = NT * G * 64;
-    const int tid = threadIdx.x, wave = tid >> 6, lane = tid & 63, lr = lane & 15, lq = lane >> 4;
-    const int kvh = blockIdx.y, h = kvh * G + wave % G, qt = wave / G;
-    int s = -1, tile = blockIdx.x;
-    for (int i = 0; i < seqs; i++) {
-        const int n = cu[i + 1] - cu[i];
-        if (n <= 1 || is_spec(outs, spec, i)) continue;
-        const int tiles = (n + BT - 1) / BT;
-        if (tile < tiles) {
-            s = i;
-            break;
-        }
-        tile -= tiles;
-    }
-    if (s < 0) return;
-    const int tb = cu[s] + tile * BT, nb = min(BT, cu[s + 1] - tb);
-    const int L = pos[tb] + nb;
-    const int t0 = tb + qt * 16, n = max(0, min(16, nb - qt * 16)), p0 = pos[tb] + qt * 16;
-    const int* bt = block_table + (size_t)s * max_blocks;
-    // Query lr's dimensions 16 kd + 4 lq .. + 3, scaled into log2 units.
-    pe_s4 qb[HEAD_DIM / 16];
-    {
-        const bool ok = lr < n;
-        const bf16* qrow = q + ((size_t)(t0 + (ok ? lr : 0)) * Hq + h) * HEAD_DIM;
-#pragma unroll
-        for (int kd = 0; kd < HEAD_DIM / 16; kd++) {
-            const uint2 raw = ok ? *reinterpret_cast<const uint2*>(qrow + 16 * kd + 4 * lq) : make_uint2(0, 0);
-            const float f = scale * LOG2E;
-            const uint2 v = pack4(__uint_as_float(raw.x << 16) * f, __uint_as_float(raw.x & 0xffff0000u) * f,
-                                  __uint_as_float(raw.y << 16) * f, __uint_as_float(raw.y & 0xffff0000u) * f);
-            qb[kd] = *reinterpret_cast<const pe_s4*>(&v);
-        }
-    }
-    pe_f4 o[HEAD_DIM / 16];
-#pragma unroll
-    for (int dt = 0; dt < HEAD_DIM / 16; dt++) o[dt] = pe_f4{0.f, 0.f, 0.f, 0.f};
-    float m = -INFINITY, l = 0.f;
-    const int last = p0 + n - 1;
-    for (int k0 = 0; k0 < L; k0 += AM_BN) {
-        __syncthreads();  // the previous tile is consumed
-        for (int e = tid; e < AM_BN * (HEAD_DIM / 8); e += T) {
-            const int j = e / (HEAD_DIM / 8), c = (e % (HEAD_DIM / 8)) * 8, kp = k0 + j;
-            uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
-            if (kp < L) {
-                const size_t slot = (size_t)bt[kp / block_size] * block_size + kp % block_size;
-                const size_t at = (slot * Hkv + kvh) * HEAD_DIM + c;
-                kv = *reinterpret_cast<const uint4*>((const bf16*)kcache + at);
-                vv = *reinterpret_cast<const uint4*>((const bf16*)vcache + at);
-            }
-            *reinterpret_cast<uint4*>(sK + j * FA_STR + c) = kv;
-            const bf16* vb = reinterpret_cast<const bf16*>(&vv);
-#pragma unroll
-            for (int d = 0; d < 8; d++) sVt[(c + d) * AM_VS + j] = vb[d];
-        }
-        __syncthreads();
-        if (k0 > last) continue;  // keys past all of this wave's queries add nothing
-        pe_f4 sc[AM_BN / 16];
-#pragma unroll
-        for (int kt = 0; kt < AM_BN / 16; kt++) {
-            sc[kt] = pe_f4{0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-            for (int kd = 0; kd < HEAD_DIM / 16; kd++)
-                sc[kt] = mfma16(frag4(sK, FA_STR, 16 * kt + lr, 16 * kd + 4 * lq), qb[kd], sc[kt]);
-        }
-        if (k0 + AM_BN - 1 > p0 || k0 + AM_BN > L) {
-#pragma unroll
-            for (int kt = 0; kt < AM_BN / 16; kt++)
-#pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    const int kp = k0 + 16 * kt + 4 * lq + j;
-                    if (kp > p0 + lr || kp >= L) sc[kt][j] = -INFINITY;
-                }
-        }
-        float mx = m;
-#pragma unroll
-        for (int kt = 0; kt < AM_BN / 16; kt++)
-#pragma unroll
-            for (int j = 0; j < 4; j++) mx = fmaxf(mx, sc[kt][j]);
-        mx = fmaxf(mx, __shfl_xor(mx, 16, 64));
-        mx = fmaxf(mx, __shfl_xor(mx, 32, 64));
-        // A query with no key yet keeps -inf; it subtracts 0 so exp2 gives 0.
-        const float b = mx == -INFINITY ? 0.f : mx, c = fast_exp2(m - b);
-        float sum = 0.f;
-#pragma unroll
-        for (int kt = 0; kt < AM_BN / 16; kt++)
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                sc[kt][j] = fast_exp2(sc[kt][j] - b);
-                sum += sc[kt][j];
-            }
-        sum += __shfl_xor(sum, 16, 64);
-        sum += __shfl_xor(sum, 32, 64);
-        l = l * c + sum;
-        m = mx;
-#pragma unroll
-        for (int dt = 0; dt < HEAD_DIM / 16; dt++) o[dt] *= c;
-#pragma unroll
-        for (int kt = 0; kt < AM_BN / 16; kt++) {
-            const uint2 pv = pack4(sc[kt][0], sc[kt][1], sc[kt][2], sc[kt][3]);
-            const pe_s4 pb = *reinterpret_cast<const pe_s4*>(&pv);
-#pragma unroll
-            for (int dt = 0; dt < HEAD_DIM / 16; dt++)
-                o[dt] = mfma16(frag4(sVt, AM_VS, 16 * dt + lr, 16 * kt + 4 * lq), pb, o[dt]);
-        }
-    }
-    if (lr >= n) return;
-    const float inv = l > 0.f ? 1.f / l : 0.f;
-    const size_t t = (size_t)t0 + lr;
-#pragma unroll
-    for (int dt = 0; dt < HEAD_DIM / 16; dt++) {
-        const int d = 16 * dt + 4 * lq;
-        const uint2 graw = *reinterpret_cast<const uint2*>(qkv + t * qstride + h * 2 * HEAD_DIM + HEAD_DIM + d);
-        const float gate[4] = {__uint_as_float(graw.x << 16), __uint_as_float(graw.x & 0xffff0000u),
-                               __uint_as_float(graw.y << 16), __uint_as_float(graw.y & 0xffff0000u)};
-        float y[4];
-#pragma unroll
-        for (int j = 0; j < 4; j++) y[j] = rbf(o[dt][j] * inv) / (1.f + expf(-gate[j]));
-        *reinterpret_cast<uint2*>(out + (t * Hq + h) * HEAD_DIM + d) = pack4(y[0], y[1], y[2], y[3]);
-    }
-}
-#define ATTN_MFMA(G, NT)                                                                                       \
-    extern "C" __global__ void __launch_bounds__(G * 64 * NT) attn_mfma_g##G##_t##NT(ATTN_FLASH_ARGS) {         \
-        attn_mfma<G, NT>(ATTN_FLASH_PASS);                                                                     \
-    }
-ATTN_MFMA(4, 2)
-ATTN_MFMA(6, 2)
+#include "amd/attention.cuh"
 #endif
 // attn_group_g<G>_t<NT>_k<BN>: groups of G, NT query tiles, key tiles of BN;
 // attn_group8_... reads an E4M3 cache; attn_groupr_... keeps the queries in
@@ -2898,69 +2343,7 @@ extern "C" __global__ void vit_bias(const float* __restrict__ y, const float* __
 }
 
 #ifdef __HIP_PLATFORM_AMD__
-// y[r][n] = x[r] . W[n] for r < R (1 to 4 rows) with bf16 W [N][K]: the
-// matrix-vector products of decoding, which hipBLASLt runs at about 60% of
-// HBM bandwidth on an MI325X. A block of four 64-lane waves takes four rows
-// of W, each wave a quarter of K in 16-byte loads; partial sums reduce over
-// lanes, then over waves in a fixed order (deterministic).
-template <int R>
-__device__ __forceinline__ void skinny_bf16(const bf16* __restrict__ W, const bf16* __restrict__ x, void* __restrict__ y,
-                                            int K, int N, int ldy, int f32_out) {
-    constexpr int NR = 4;
-    __shared__ float part[4][NR * R];
-    const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63, n0 = blockIdx.x * NR;
-    const int kq = K / 4, kb = wave * kq, ke = kb + kq;
-    float acc[NR][R];
-#pragma unroll
-    for (int i = 0; i < NR; i++)
-#pragma unroll
-        for (int r = 0; r < R; r++) acc[i][r] = 0.f;
-    for (int k = kb + 8 * lane; k < ke; k += 512) {
-        uint4 w[NR], xv[R];
-#pragma unroll
-        for (int i = 0; i < NR; i++)
-            w[i] = n0 + i < N ? *reinterpret_cast<const uint4*>(W + (size_t)(n0 + i) * K + k) : make_uint4(0, 0, 0, 0);
-#pragma unroll
-        for (int r = 0; r < R; r++) xv[r] = *reinterpret_cast<const uint4*>(x + (size_t)r * K + k);
-#pragma unroll
-        for (int i = 0; i < NR; i++) {
-            const uint32_t* wp = reinterpret_cast<const uint32_t*>(&w[i]);
-#pragma unroll
-            for (int r = 0; r < R; r++) {
-                const uint32_t* xp = reinterpret_cast<const uint32_t*>(&xv[r]);
-#pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    acc[i][r] = fmaf(__uint_as_float(wp[e] << 16), __uint_as_float(xp[e] << 16), acc[i][r]);
-                    acc[i][r] = fmaf(__uint_as_float(wp[e] & 0xffff0000u), __uint_as_float(xp[e] & 0xffff0000u), acc[i][r]);
-                }
-            }
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < NR; i++)
-#pragma unroll
-        for (int r = 0; r < R; r++) {
-            float v = acc[i][r];
-#pragma unroll
-            for (int o = 32; o > 0; o >>= 1) v += __shfl_xor(v, o, 64);
-            if (lane == 0) part[wave][i * R + r] = v;
-        }
-    __syncthreads();
-    if (threadIdx.x < NR * R) {
-        const int i = threadIdx.x / R, r = threadIdx.x % R, n = n0 + i;
-        const float v = ((part[0][threadIdx.x] + part[1][threadIdx.x]) + part[2][threadIdx.x]) + part[3][threadIdx.x];
-        if (n < N) {
-            if (f32_out) ((float*)y)[(size_t)r * ldy + n] = v;
-            else ((bf16*)y)[(size_t)r * ldy + n] = f2b(v);
-        }
-    }
-}
-#define SKINNY(R)                                                                                             \
-    extern "C" __global__ void __launch_bounds__(256) skinny_bf16_r##R(const bf16* W, const bf16* x, void* y,   \
-                                                                       int K, int N, int ldy, int f32_out) { \
-        skinny_bf16<R>(W, x, y, K, N, ldy, f32_out);                                                           \
-    }
-SKINNY(1) SKINNY(2) SKINNY(3) SKINNY(4)
+#include "amd/skinny.cuh"
 #endif
 
 #include "quant.cuh"

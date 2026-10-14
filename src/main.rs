@@ -67,6 +67,10 @@ struct EngineArgs {
     /// omitted).
     #[arg(long, num_args = 0..=1, default_missing_value = "2")]
     mtp: Option<usize>,
+    /// Draft N tokens a step by prompt lookup: what followed the last earlier
+    /// occurrence of the latest few tokens (4 if N is omitted).
+    #[arg(long, num_args = 0..=1, default_missing_value = "4")]
+    ngram: Option<usize>,
     /// bf16 activations for GGUF weights, instead of int8 in batches.
     #[arg(long)]
     no_int8: bool,
@@ -102,6 +106,7 @@ impl EngineArgs {
             state_bf16: !self.state_f32,
             prefix_cache: self.prefix_cache,
             mtp: self.mtp.unwrap_or(0),
+            ngram: self.ngram.unwrap_or(0),
             int8: !self.no_int8,
             loras: self
                 .lora

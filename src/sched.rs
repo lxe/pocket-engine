@@ -139,6 +139,11 @@ pub struct Seq {
     lora: usize,
     /// The grammar's allowed tokens for this step's pick, when constrained.
     mask: Option<llguidance::toktrie::SimpleVob>,
+    /// The prompt-lookup index, when drafts come from it.
+    ngrams: Option<Box<Ngrams>>,
+    /// Whether `drafts` are a guess (a lookup match or the draft layer's)
+    /// rather than filler.
+    guessed: bool,
     /// Draft tokens to verify next step (multi-token prediction).
     drafts: Vec<u32>,
     /// While verifying drafts: the slot to keep the state in after each fed
@@ -183,6 +188,17 @@ impl Seq {
     /// Whether a row feeding `n` tokens verifies drafts.
     fn verifies(&self, n: usize) -> bool {
         !self.in_prompt() && n > 1
+    }
+    /// Up to `k` tokens that followed the last earlier occurrence of the
+    /// current suffix.
+    fn lookup(&self, k: usize) -> Vec<u32> {
+        let (Some(g), total) = (&self.ngrams, self.total()) else {
+            return Vec::new();
+        };
+        let Some(end) = g.matched else {
+            return Vec::new();
+        };
+        (end..(end + k).min(total)).map(|i| self.token(i)).collect()
     }
 }
 
@@ -341,6 +357,46 @@ fn unit_hashes(adapter: u32, tokens: &[u32]) -> Vec<u64> {
     out
 }
 
+/// Prompt lookup: for each n-gram of 2 to 4 tokens, where its latest
+/// occurrence in the prompt and output so far ended, kept as tokens arrive.
+/// A suffix seen before proposes the tokens that followed it.
+#[derive(Default)]
+struct Ngrams {
+    ends: [HashMap<u64, usize>; NGRAM_MAX - NGRAM_MIN + 1],
+    tail: Vec<u32>,
+    /// Where the longest earlier occurrence of the current suffix ended.
+    matched: Option<usize>,
+    len: usize,
+}
+
+const NGRAM_MIN: usize = 2;
+const NGRAM_MAX: usize = 4;
+
+impl Ngrams {
+    fn push(&mut self, tok: u32) {
+        self.tail.push(tok);
+        if self.tail.len() > NGRAM_MAX {
+            self.tail.remove(0);
+        }
+        self.len += 1;
+        self.matched = None;
+        for n in (NGRAM_MIN..=NGRAM_MAX).rev() {
+            if self.tail.len() < n {
+                continue;
+            }
+            let h = self.tail[self.tail.len() - n..]
+                .iter()
+                .fold(n as u64, |h, &t| {
+                    (h ^ t as u64).wrapping_mul(0x100_0000_01b3)
+                });
+            let prev = self.ends[n - NGRAM_MIN].insert(h, self.len);
+            if self.matched.is_none() {
+                self.matched = prev;
+            }
+        }
+    }
+}
+
 /// Which adapter each GPU slot holds (index 0 unused), how many running
 /// sequences use it, and when it was last placed.
 #[derive(Default)]
@@ -402,6 +458,8 @@ pub struct Scheduler {
     pending_copies: Vec<(usize, usize)>,
     /// Most tokens a step verifying drafts may feed.
     verify_rows: usize,
+    /// Drafts from prompt lookup (`--ngram`).
+    ngram: bool,
     waiting: VecDeque<Seq>,
     running: Vec<Seq>,
     eos: Vec<u32>,
@@ -451,6 +509,7 @@ impl Scheduler {
             lora: LoraSlots::default(),
             pending_copies: Vec::new(),
             verify_rows: VERIFY_ROWS,
+            ngram: false,
             waiting: VecDeque::new(),
             running: Vec::new(),
             eos,
@@ -467,6 +526,13 @@ impl Scheduler {
     /// with more compute per byte of memory bandwidth.
     pub fn with_verify_rows(mut self, rows: usize) -> Self {
         self.verify_rows = rows;
+        self
+    }
+
+    /// Drafts from prompt lookup: the tokens after the latest earlier
+    /// occurrence of a sequence's last 2 to 4 tokens.
+    pub fn with_ngram(mut self) -> Self {
+        self.ngram = true;
         self
     }
 
@@ -571,6 +637,8 @@ impl Scheduler {
             slot: 0,
             lora: 0,
             mask: None,
+            ngrams: None,
+            guessed: false,
             drafts: Vec::new(),
             outs: Vec::new(),
             blocks: Vec::new(),
@@ -703,6 +771,13 @@ impl Scheduler {
                 }
             }
             seq.admitted = Instant::now();
+            if self.ngram && seq.forced.is_none() {
+                let mut g = Box::<Ngrams>::default();
+                for &t in &seq.req.prompt {
+                    g.push(t);
+                }
+                seq.ngrams = Some(g);
+            }
             if seq.req.sampling.repetition_penalty != 1.0 {
                 seq.prompt_tokens = seq.req.prompt.iter().copied().collect();
             }
@@ -826,7 +901,10 @@ impl Scheduler {
         // still bound by reading the weights: all of them, so the step can
         // replay a graph, or none.
         let drafting = self.running.iter().filter(|s| !s.drafts.is_empty()).count();
+        // Filler drafts only keep steps uniform; with no real guess anywhere,
+        // decode plainly.
         let verify = drafting > 0
+            && self.running.iter().any(|s| s.guessed)
             && self.free_slots.len() >= drafting * (self.meta.spec - 1)
             && drafting * self.meta.spec <= self.verify_rows;
         let mut budget = self.meta.max_tokens;
@@ -1266,6 +1344,9 @@ impl Scheduler {
                 }
                 if !stop {
                     s.generated.push(tok);
+                    if let Some(g) = s.ngrams.as_mut() {
+                        g.push(tok);
+                    }
                     if s.req.sampling.adjusts_logits() {
                         *s.counts.entry(tok).or_default() += 1;
                     }
@@ -1288,16 +1369,34 @@ impl Scheduler {
             }
             if finished {
                 done.push(ri);
-            } else if let Some(d) = drafts
-                && self.meta.spec > 1
+            } else if self.meta.spec > 1
                 && s.forced.is_none()
                 && !s.req.sampling.adjusts_logits()
                 && s.req.logprobs.is_none()
                 && s.req.constraint.is_none()
             {
+                // A full prompt-lookup match first, then the draft layer's
+                // guesses; without either, the lookup's partial match or the
+                // last token stand in, so every row verifies a full set and
+                // the step can replay a graph.
+                let k = self.meta.spec - 1;
                 let n = step.rows.len();
-                s.drafts
-                    .extend((0..self.meta.spec - 1).map(|k| d[k * n + si] as u32));
+                let mtp = drafts.map(|d| (0..k).map(|j| d[j * n + si] as u32).collect::<Vec<_>>());
+                let found = if self.ngram { s.lookup(k) } else { Vec::new() };
+                s.guessed = mtp.is_some() || !found.is_empty();
+                s.drafts = match mtp {
+                    Some(m) if found.len() < k => m,
+                    _ if self.ngram => {
+                        let mut d = found;
+                        let fill = d
+                            .last()
+                            .copied()
+                            .unwrap_or(*s.generated.last().unwrap_or(&0));
+                        d.resize(k, fill);
+                        d
+                    }
+                    _ => Vec::new(),
+                };
             }
         }
         done.sort_unstable_by(|a, b| b.cmp(a));

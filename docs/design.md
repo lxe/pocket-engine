@@ -53,6 +53,7 @@ The checkpoints carry one extra layer trained to predict the token after next. W
 
 - The draft layer runs inside the same step and CUDA graph as the model.
 - When checking drafts, the linear-attention state after each draft goes into a spare state slot, so a rejected draft needs no recomputation and drafting reserves no memory.
+- With `--ngram`, drafts also come from prompt lookup: each sequence keeps an index of its 2- to 4-token n-grams, and the latest earlier occurrence of its current suffix proposes what followed. A sequence with no match pads its drafts so steps stay uniform enough to replay graphs, and steps where no sequence has a real guess decode plainly.
 - Drafting turns itself off when a step gets too large to profit, or when spare slots run out under heavy load.
 
 ## LoRA adapters

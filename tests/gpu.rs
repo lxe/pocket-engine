@@ -1212,3 +1212,52 @@ fn serves_structured_output() {
         assert_eq!(bad.status(), 400);
     });
 }
+
+/// Prompt-lookup drafts on a prompt the output copies from are mostly
+/// accepted, and greedy output stays the model's own.
+#[test]
+fn ngram_drafts_keep_the_models_greedy_choices() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let text = "The quick brown fox jumps over the lazy dog near the riverbank at dawn, while three herons wait in the reeds and a fisherman counts his nets. ".repeat(3);
+    let (prompt, _) = tok
+        .chat(&[serde_json::json!({ "role": "user", "content": format!("Repeat this exactly:\\n\\n{text}") })])
+        .unwrap();
+    let mut e = Engine::new(EngineConfig {
+        ngram: 4,
+        ..config(dir.clone())
+    })
+    .unwrap();
+    let out = generate(&mut e, std::slice::from_ref(&prompt), 64).remove(0);
+    let c = e.sched.counters.clone();
+    assert!(
+        c.accepted * 2 > c.drafted && c.accepted > 20,
+        "{} of {} drafts accepted",
+        c.accepted,
+        c.drafted
+    );
+    let scored = e
+        .score(scorings(
+            &[Pair {
+                prompt,
+                forced: out.clone(),
+            }],
+            &[0],
+        ))
+        .unwrap();
+    let worst = out
+        .iter()
+        .zip(&scored[0])
+        .filter(|(t, s)| **t != s.argmax)
+        .map(|(t, s)| {
+            let lp = |x: u32| s.top.iter().find(|y| y.0 == x).map(|y| y.1);
+            lp(s.argmax).unwrap() - lp(*t).unwrap_or(f32::INFINITY)
+        })
+        .fold(0.0f32, f32::max);
+    if fp8() || fp4() || kv_fp8() || (quantized(&dir) && int8()) {
+        assert!(worst < 0.5, "worst departure {worst}");
+    } else {
+        assert!(worst < 0.15, "worst departure {worst}");
+    }
+}

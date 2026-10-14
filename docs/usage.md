@@ -21,6 +21,8 @@ Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Mixture-of-experts mo
 | FP4 | RTX 50-series | an NVFP4 checkpoint, or any bf16 one with `--fp4` |
 | GGUF | all | a `.gguf` file (Q4_K_M, Q8_0, IQ4_XS and the other common types); text only |
 
+`--ngram` drafts by prompt lookup: the tokens that followed the last earlier occurrence of the latest 2 to 4 tokens, in the prompt or the output. It needs no draft layer and pays off when output copies its input (extraction, editing, quoting): repeating a passage runs 3.7 times as fast on 9B and 4 times on 27B. Steps without a match decode as usual, so it costs nothing elsewhere. It combines with `--mtp`, which then guesses where the lookup finds nothing.
+
 `--mtp` needs a checkpoint or GGUF file that includes the draft layer; among GGUF files, Unsloth's Qwen3.8-27B UD quantizations do. Use it for a few streams at a time: it speeds up each one (64 to 112 tok/s on 27B on an RTX 5090) and costs a few percent at high load.
 
 GGUF weights in 4- to 6-bit formats run batches against int8 activations, which serves about 20% more tokens/s under load on RTX GPUs and a few percent more on H100, with the same agreement with Transformers. `--no-int8` keeps activations in bf16.
@@ -79,6 +81,7 @@ Neither turns on speculative decoding for the request. On an RTX 5090 with 9B Q4
 | `--max-seqs N` | 256 | Most requests at once (lowered to fit memory) |
 | `--max-batch-tokens N` | 4096 | Most tokens per step |
 | `--mtp [N]` | off | Draft N tokens a step (2 if N is omitted) |
+| `--ngram [N]` | off | Draft N tokens a step by prompt lookup (4 if N is omitted) |
 | `--prefix-cache N` | `--max-seqs` / 4 | Prompt prefixes to keep; 0 turns caching off |
 | `--memory-fraction F` | 0.9 | Share of GPU memory to use |
 | `--fp8` | off | Quantize a bf16 checkpoint to FP8 |

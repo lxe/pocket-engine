@@ -48,6 +48,8 @@ pub struct EngineConfig {
     /// Drafts per step from the multi-token-prediction layer; 0 turns
     /// speculative decoding off.
     pub mtp: usize,
+    /// Drafts per step from prompt lookup (n-grams of the prompt and output).
+    pub ngram: usize,
     /// Quantize activations to int8 for 4- to 6-bit GGUF matrices in batches.
     pub int8: bool,
     /// LoRA adapters to load at startup: (name, PEFT directory or GGUF file).
@@ -78,6 +80,7 @@ impl EngineConfig {
             state_bf16: true,
             prefix_cache: None,
             mtp: 0,
+            ngram: 0,
             int8: true,
             loras: Vec::new(),
             max_loras: 0,
@@ -199,8 +202,10 @@ impl Engine {
             mtp: cfg.mtp > 0,
             int8: cfg.int8,
         };
-        if cfg.mtp > 7 {
-            return Err(Error::Config("--mtp takes 1 to 7 drafts per step".into()));
+        if cfg.mtp > 7 || cfg.ngram > 7 {
+            return Err(Error::Config(
+                "--mtp and --ngram take 1 to 7 drafts per step".into(),
+            ));
         }
         if cfg.fp4 && load.fp8 != Some(crate::gpu::Fp8Mode::Mx32) {
             return Err(Error::Config(
@@ -226,7 +231,7 @@ impl Engine {
         gpu.end_uploads()?;
         let pool_rows = if vision.is_some() { cfg.image_pool } else { 0 };
         // A sequence verifying drafts feeds up to `spec` tokens a step.
-        let spec = cfg.mtp + 1;
+        let spec = cfg.mtp.max(cfg.ngram) + 1;
         // Each sequence holds a recurrent state slot (tens of MB on larger
         // models). Keep slots within half of what is left after the weights,
         // and leave the KV cache at least one full context.
@@ -327,6 +332,9 @@ impl Engine {
         }
         if let Some(l) = &lora {
             sched = sched.with_lora_slots(l.max_slots);
+        }
+        if cfg.ngram > 0 {
+            sched = sched.with_ngram();
         }
         let mut e = Self {
             gpu,

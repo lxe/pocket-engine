@@ -12,6 +12,8 @@ Qwen3.5 and Qwen3.8 are hybrid models: three of every four layers use linear att
 - `src/kernels/` holds the CUDA kernels. Large matrix multiplies go to cuBLAS.
 - `src/server.rs` is the OpenAI-compatible HTTP API.
 
+There is no Python or PyTorch in the serving path. The host spends 0.01 to 0.04 ms on each step, so steps run back to back without overlapping the scheduler with the GPU.
+
 ## Steps
 
 Every step is one forward pass over a flat batch of tokens:
@@ -21,21 +23,36 @@ Every step is one forward pass over a flat batch of tokens:
 
 A new request starts on the next step instead of waiting for others to finish, and a long prompt is spread over several steps. A request is admitted only when its whole prompt and `max_tokens` fit in the KV cache, so nothing is ever preempted.
 
-Steps that only decode replay a CUDA graph captured at startup, which costs one launch. Sampling runs on the GPU, so only one token id per request comes back to the host.
+Steps that only decode replay a CUDA graph captured at startup, which costs one launch. Steps with adapters and steps that check drafts have graphs of their own. Sampling runs on the GPU, so only one token id per request comes back to the host.
+
+## Sampling
+
+- Top-k, top-p and min-p select candidates with a radix select on the GPU, and the token is drawn by Gumbel-max.
+- Presence, frequency and repetition penalties and `logit_bias` apply in one kernel before sampling.
+- Structured output (`response_format`, `guided_*`): llguidance computes each request's allowed tokens on the CPU, all requests in parallel, and the same kernel masks the rest.
+- Log-probabilities come from the logits after penalties and masks, before temperature, in OpenAI's format.
 
 ## Linear attention
 
 Each request keeps a 128×128 state per head (25 MB per request on 9B), stored in bf16 between steps and computed in f32.
 
-- **Decoding** updates the state one token at a time. Blocks stay resident and load the next heads' states into shared memory while they compute one, so the update runs near memory bandwidth.
-- **Prompts** run in chunks of 32 tokens on tensor cores, in the same chunked form FLA and FlashInfer use. A first kernel computes each chunk's local terms for all chunks at once; a second walks the chunks in order, carrying the state. The second kernel loads the next chunk while it computes the current one.
+- **Decoding** updates the state one token at a time. Blocks stay resident and load the next heads' states, and the token's q, k and v, into shared memory while they compute one. The update takes one pass over the state: with kS = kᵀS and qS = qᵀS of the decayed state, δ = β (v − kS), the output is qS + δ (q·k) and the new state S + k δᵀ.
+- **Prompts** run in chunks of 32 tokens on tensor cores, in the same chunked form FLA and FlashInfer use. A first kernel computes each chunk's local terms for all chunks at once; a second walks the chunks in order, carrying the state. The second kernel loads the next chunk while it computes the current one, and splits each head's 128 state columns across up to four blocks, since every column updates independently.
+- **The short convolution** before it reads eight channels per thread and keeps its last three inputs per request with the state.
+- **The gated norm** after it runs inside the decoding kernel, and for prompts as its own kernel, a half-warp per head.
 
 ## Full attention
 
 Keys and values live in a paged cache of 16-token blocks.
 
+- **Before attention**, one kernel normalizes q and k, applies the rotary positions and writes keys and values to the cache.
 - **Decoding** reads a request's cached keys and values directly. For long contexts, one request's keys are split across the whole GPU and the partial results merged.
-- **Prompts** run flash attention. On H100 and H200 it is a FlashAttention-3-style kernel: one warpgroup loads key and value tiles with TMA while two others compute, overlapping the softmax with the matrix multiplies. On B200 it is FlashAttention-4-style: tcgen05 matrix multiplies accumulate in tensor memory, and separate warps issue them, load, run the softmax and correct the output. The query heads that share a key/value head run as one cluster, which loads each key and value tile once for all of them. On other GPUs it is a FlashAttention-2-style kernel on `mma.sync`.
+- **Prompts** run flash attention, by GPU:
+  - H100 and H200: FlashAttention-3-style. One warpgroup loads key and value tiles with TMA while two others compute, overlapping the softmax with the matrix multiplies.
+  - B200: FlashAttention-4-style. tcgen05 matrix multiplies accumulate in tensor memory, and separate warps issue them, load, and run the softmax. Two heads that share a key/value head run as one 256-row matrix multiply across a pair of SMs, each SM holding half of every key and value tile; at head dimension 256 a single SM spends too long taking in keys and values. The other heads of the group share those loads by multicast.
+  - Other GPUs: FlashAttention-2-style on `mma.sync`.
+- **The softmax rescales lazily**: the running maximum changes only when a row's new maximum exceeds it by more than 2⁸, so most tiles skip rescaling the output.
+- **The output gate** (sigmoid of a second projection) applies as each kernel writes its output.
 
 ## Prefix cache
 
@@ -58,7 +75,7 @@ The checkpoints carry one extra layer trained to predict the token after next. W
 
 ## LoRA adapters
 
-Each adapter is prepared once on the host in the layout the kernels read (bf16, scale folded in, ranks padded to 16, value heads reordered for GGUF bases) and copied into one of a fixed set of GPU slots when a request needs it. Per step, the scheduler lists tiles of up to 16 tokens that share an adapter. After each linear layer's own matrix multiply, two kernels add the low-rank update: one computes x Aᵀ for all of the layer's fused projections at once, on a second stream so it overlaps the main matrix multiply; the other adds its product with Bᵀ into the output. Swapping an adapter changes only a table the kernels read, so steps with adapters replay CUDA graphs too. Prefix-cache entries are kept per adapter.
+Each adapter is prepared once on the host in the layout the kernels read (bf16, scale folded in, ranks padded to 16, value heads reordered for GGUF bases) and copied into one of a fixed set of GPU slots when a request needs it. Adapters load and unload while the server runs, through vLLM's endpoints; the slots are reserved at startup. Per step, the scheduler lists tiles of up to 16 tokens that share an adapter. After each linear layer's own matrix multiply, two kernels add the low-rank update: one computes x Aᵀ for all of the layer's fused projections at once, on a second stream so it overlaps the main matrix multiply; the other adds its product with Bᵀ into the output. Swapping an adapter changes only a table the kernels read, so steps with adapters replay CUDA graphs too. Prefix-cache entries are kept per adapter.
 
 ## Images
 

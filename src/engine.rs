@@ -152,7 +152,7 @@ pub struct Stats {
 }
 
 pub struct Engine {
-    gpu: Gpu,
+    pub gpu: Gpu,
     model: Model,
     state: State,
     act: Act,
@@ -781,6 +781,9 @@ pub fn spawn(cfg: EngineConfig) -> Result<Spawned> {
                         load.running,
                         load.waiting
                     );
+                    if let Some(p) = engine.gpu.profile_report() {
+                        eprintln!("{p}");
+                    }
                     last_report = Instant::now();
                 }
             }

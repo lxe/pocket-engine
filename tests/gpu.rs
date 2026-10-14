@@ -328,6 +328,9 @@ fn batching_does_not_change_predictions() {
 
 /// Whether a checkpoint directory has a multi-token-prediction layer.
 fn has_mtp(dir: &std::path::Path) -> bool {
+    if dir.extension().is_some_and(|e| e == "gguf") {
+        return pocket_engine::gguf::Gguf::open(dir).is_ok_and(|g| g.nextn_block().is_some());
+    }
     std::fs::read_to_string(dir.join("model.safetensors.index.json"))
         .is_ok_and(|s| s.contains("\"mtp.fc.weight\""))
 }

@@ -298,6 +298,17 @@ impl Gguf {
         self.meta.get(key)
     }
 
+    /// The block holding the multi-token-prediction layer, if the file has
+    /// one (`blk.N.nextn.*` after the decoder layers).
+    pub fn nextn_block(&self) -> Option<usize> {
+        self.tensors.keys().find_map(|n| {
+            n.strip_suffix(".nextn.eh_proj.weight")?
+                .strip_prefix("blk.")?
+                .parse()
+                .ok()
+        })
+    }
+
     pub fn tensor(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {
         let t = self.tensors.get(name)?;
         let start = self.data + t.offset;

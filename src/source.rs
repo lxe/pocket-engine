@@ -405,13 +405,30 @@ pub fn gguf_path(path: &Path) -> Option<PathBuf> {
     (ggufs.len() == 1).then(|| ggufs[0].clone())
 }
 
-/// The GGUF name of a text-model tensor.
-fn gguf_name(name: &str) -> String {
+/// The GGUF name of a text-model tensor. The multi-token-prediction layer
+/// (`mtp.*`) is block `nextn` of the file, with its own names for the
+/// projection and norms that join the embedding and the hidden state.
+fn gguf_name(g: &Gguf, name: &str) -> String {
     match name {
         "embed_tokens.weight" => return "token_embd.weight".into(),
         "norm.weight" => return "output_norm.weight".into(),
         "/lm_head.weight" => return "output.weight".into(),
         _ => {}
+    }
+    if let Some(tail) = name.strip_prefix("/mtp.") {
+        let Some(n) = g.nextn_block() else {
+            return name.into();
+        };
+        return match tail {
+            "fc.weight" => format!("blk.{n}.nextn.eh_proj.weight"),
+            "pre_fc_norm_embedding.weight" => format!("blk.{n}.nextn.enorm.weight"),
+            "pre_fc_norm_hidden.weight" => format!("blk.{n}.nextn.hnorm.weight"),
+            "norm.weight" => format!("blk.{n}.nextn.shared_head_norm.weight"),
+            _ => match tail.strip_prefix("layers.0.") {
+                Some(t) => gguf_name(g, &format!("layers.{n}.{t}")),
+                None => name.into(),
+            },
+        };
     }
     let Some(rest) = name.strip_prefix("layers.") else {
         return name.into();
@@ -484,7 +501,7 @@ impl Source {
             }
             Source::Gguf(g) => g
                 .tensors
-                .get(&gguf_name(name))
+                .get(&gguf_name(g, name))
                 .map(|t| t.dims.iter().rev().copied().collect()),
         }
     }
@@ -495,7 +512,7 @@ impl Source {
                 Some(full) => ck.has(full),
                 None => ck.has(&format!("{}{name}", ck.prefix)),
             },
-            Source::Gguf(g) => g.tensors.contains_key(&gguf_name(name)),
+            Source::Gguf(g) => g.tensors.contains_key(&gguf_name(g, name)),
         }
     }
 
@@ -505,7 +522,7 @@ impl Source {
         name: &str,
         numel: usize,
     ) -> Result<(GgmlType, Vec<usize>, &'g [u8])> {
-        let gname = gguf_name(name);
+        let gname = gguf_name(g, name);
         let (t, data) = g
             .tensor(&gname)
             .ok_or_else(|| Error::Config(format!("missing tensor {gname}")))?;
@@ -640,11 +657,11 @@ impl Source {
                 if dims.first() != Some(&cols) {
                     return Err(Error::Config(format!(
                         "{}: dims {dims:?}, expected rows of {cols}",
-                        gguf_name(name)
+                        gguf_name(g, name)
                     )));
                 }
                 if ty.is_quantized() || ty == GgmlType::BF16 {
-                    let (offset, len) = g.file_range(&gguf_name(name)).expect("found above");
+                    let (offset, len) = g.file_range(&gguf_name(g, name)).expect("found above");
                     Ok(Mat {
                         kind: if ty == GgmlType::BF16 {
                             Kind::Bf16

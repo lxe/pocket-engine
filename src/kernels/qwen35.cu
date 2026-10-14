@@ -2096,7 +2096,9 @@ __device__ __forceinline__ void attn_ws_body(ATTN_FLASH_ARGS, const CUtensorMap*
 #define ATTN_WS_PASS ATTN_FLASH_PASS, &kmap, &vmap, nslots
 extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g4(ATTN_WS_ARGS) { attn_ws_body<4>(ATTN_WS_PASS); }
 extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g6(ATTN_WS_ARGS) { attn_ws_body<6>(ATTN_WS_PASS); }
-#include "attn_sm100.cuh"
+#ifndef __HIP_PLATFORM_AMD__
+#include "attn_sm100.cuh"  // B200 (tcgen05) only
+#endif
 
 
 // Combines the key ranges of split decode attention (attn_body with `part`)

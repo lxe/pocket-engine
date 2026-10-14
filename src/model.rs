@@ -145,9 +145,9 @@ impl FaShape {
 /// each, the stages' mbarriers and 8 bytes per consumer thread.
 pub const WS_SMEM: usize = 6 * 64 * HEAD_DIM * 2 + 128 + 8 * 256;
 /// Dynamic shared memory of attn_tc_g<G> (TC_SMEM in attn_sm100.cuh): 128
-/// queries, two stages each of a key half and a value half (32 KB each), the
-/// mbarriers, row maxima and sums, and the tensor memory address.
-pub const TC_SMEM: usize = 128 * HEAD_DIM * 2 + 2 * 2 * 32768 + 256 + 6 * 128 * 4 + 16;
+/// queries, a ring of five 32 KB slots of key and value halves, the
+/// mbarriers, row maxima, and the tensor memory address.
+pub const TC_SMEM: usize = 128 * HEAD_DIM * 2 + 5 * 32768 + 256 + 4 * 128 * 4 + 16;
 
 /// The warp-specialized flash kernel that prompts take when the GPU has one
 /// (a bf16 cache and groups of 4 or 6): wgmma on Hopper, tcgen05 on B200.

@@ -1023,14 +1023,19 @@ async fn health_report(State(app): State<Arc<App>>) -> Response {
 }
 
 /// The structured-output compiler for this tokenizer.
-fn grammars(tok: &ChatTokenizer, info: &Info) -> Result<llguidance::ParserFactory> {
+/// The structured-output parser factory over the model's vocabulary (about a
+/// second for Qwen's 248k tokens; `serve` callers build it beside the engine).
+pub fn grammars(
+    tok: &ChatTokenizer,
+    cfg: &crate::model::Config,
+) -> Result<llguidance::ParserFactory> {
     fn e(e: impl std::fmt::Display) -> Error {
         Error::Config(format!("structured output setup: {e}"))
     }
     let mut bt =
         toktrie_hf_tokenizers::ByteTokenizer::from_json_bytes(tok.json().as_bytes()).map_err(e)?;
-    bt.set_eos_tokens(&info.cfg.eos);
-    let env = bt.into_tok_env(Some(info.cfg.vocab)).map_err(e)?;
+    bt.set_eos_tokens(&cfg.eos);
+    let env = bt.into_tok_env(Some(cfg.vocab)).map_err(e)?;
     let mut f = llguidance::ParserFactory::new_simple(&env).map_err(e)?;
     f.quiet();
     Ok(f)
@@ -1039,6 +1044,7 @@ fn grammars(tok: &ChatTokenizer, info: &Info) -> Result<llguidance::ParserFactor
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     tok: ChatTokenizer,
+    grammars: llguidance::ParserFactory,
     spec: Option<crate::image::Spec>,
     engine: mpsc::Sender<Msg>,
     info: Info,
@@ -1051,7 +1057,7 @@ pub async fn serve(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Config(e.to_string()))?;
-    let grammars = Arc::new(grammars(&tok, &info)?);
+    let grammars = Arc::new(grammars);
     let app = Arc::new(App {
         tok,
         spec,

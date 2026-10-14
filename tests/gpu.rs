@@ -727,11 +727,13 @@ fn serves_chat_completions() {
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let (tx, info, health, _) = engine::spawn(config(dir.clone())).unwrap();
     let tok = ChatTokenizer::load(&dir).unwrap();
+    let grammars = server::grammars(&tok, &info.cfg).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let bind = "127.0.0.1:18197";
         tokio::spawn(server::serve(
             tok,
+            grammars,
             None,
             tx,
             info,
@@ -1035,11 +1037,13 @@ fn serves_adapters() {
     })
     .unwrap();
     let tok = ChatTokenizer::load(&dir).unwrap();
+    let grammars = server::grammars(&tok, &info.cfg).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let bind = "127.0.0.1:18198";
         tokio::spawn(server::serve(
             tok,
+            grammars,
             None,
             tx,
             info,
@@ -1167,10 +1171,11 @@ fn serves_structured_output() {
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let (tx, info, health, _) = engine::spawn(config(dir.clone())).unwrap();
     let tok = ChatTokenizer::load(&dir).unwrap();
+    let grammars = server::grammars(&tok, &info.cfg).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let bind = "127.0.0.1:18199";
-        tokio::spawn(server::serve(tok, None, tx, info, health, None, "m".into(), bind));
+        tokio::spawn(server::serve(tok, grammars, None, tx, info, health, None, "m".into(), bind));
         let client = reqwest::Client::new();
         let url = format!("http://{bind}");
         for _ in 0..100 {

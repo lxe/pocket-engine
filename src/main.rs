@@ -289,8 +289,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             let cfg = args.config();
             let lora_on = cfg.max_loras > 0;
+            // The tokenizer and the structured-output tables (about a second)
+            // load while the engine loads weights.
+            let prep = {
+                let model = args.model.clone();
+                std::thread::spawn(move || -> pocket_engine::Result<_> {
+                    let tok = ChatTokenizer::load(&model)?;
+                    let grammars = server::grammars(&tok, &Config::for_model(&model)?)?;
+                    Ok((tok, grammars))
+                })
+            };
             let (tx, info, health, adapters) = engine::spawn(cfg)?;
-            let tok = ChatTokenizer::load(&args.model)?;
+            let (tok, grammars) = prep.join().expect("tokenizer thread")?;
             let spec = if info.vision {
                 Some(Spec::load(&args.model, args.max_image_pixels)?)
             } else {
@@ -305,6 +315,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?
                 .block_on(server::serve(
                     tok,
+                    grammars,
                     spec,
                     tx,
                     info,

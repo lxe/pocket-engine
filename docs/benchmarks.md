@@ -1,6 +1,6 @@
 # Benchmarks
 
-pocket-engine against vLLM 0.31.0 on the same rented GPU, and llama.cpp on the H100. Startup is launch to serving. First tokens are for a 60-to-200-token prompt (median) and a 64k-token prompt. Throughput is output tokens per second from [`scripts/load.py`](../scripts/load.py). Receipts: [H100](receipts/h100-mtp-ttft.json), [H200](receipts/h200-gauntlet.json), [B200](receipts/b200-gauntlet.json), [RTX 5090](receipts/rtx5090-gauntlet.json).
+pocket-engine against vLLM 0.31.0 on the same rented GPU, and llama.cpp on the H100. Startup is launch to serving. First tokens are for a 60-to-200-token prompt (median) and a 64k-token prompt. Throughput is output tokens per second from [`scripts/load.py`](../scripts/load.py). Receipts: [H100](receipts/h100-mtp-ttft.json), [H200](receipts/h200-gauntlet.json), [B200](receipts/b200-gauntlet.json), [RTX 5090](receipts/rtx5090-gauntlet.json), [MI325X](receipts/mi325x.json).
 
 ## Across GPUs
 

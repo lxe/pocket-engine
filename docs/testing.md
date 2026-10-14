@@ -58,6 +58,10 @@ python scripts/accuracy.py compare out.ref.json out.ours.json             # agre
 
 `POCKET_PROFILE=shapes` also splits cuBLAS matmuls by shape: output by input columns, and rows rounded down to a power of two.
 
+On AMD, `rocprofv3 --kernel-trace --stats -- pocket-engine serve ...` lists every kernel, graphs included; stop the server with Ctrl-C so the trace is written.
+
+`POCKET_SKIP_KERNELS=1 cargo check --features rocm` type-checks a backend without its kernel compiler.
+
 `POCKET_NO_WS=1` sends prompts on Hopper and B200 to the portable flash kernel instead of the warp-specialized one, for A/B runs.
 
 `POCKET_CHECK_HEADS=1 pocket-engine bench-attn ... --check` also reports the largest difference per head, and for heads off by more than 5e-3 which tokens and columns: a wrong warp shows up as a block of 32 tokens.

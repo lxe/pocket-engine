@@ -1,6 +1,6 @@
 # pocket-engine
 
-An inference server for Qwen3.5 and Qwen3.8 models, written from scratch in Rust and CUDA, with an OpenAI-compatible chat API.
+An inference server for Qwen3.5 and Qwen3.8 models, written from scratch in Rust and CUDA, with an OpenAI-compatible chat API. Runs on NVIDIA GPUs and on AMD's MI325X.
 
 - **Starts in seconds.** Serving 3 seconds after launch, where vLLM takes 1.5 to 3 minutes.
 - **Fast first tokens.** 13.5 ms for a short prompt against vLLM's 57.5 ms.
@@ -18,11 +18,11 @@ Qwen3.5-9B on one H100, against vLLM 0.31.0 on the same machine:
 | First token, 64k-token prompt | 2.29 s | **2.28 s** |
 | Output tokens/s, 64 requests in flight | **3,534** | 2,567 |
 
-H200, B200, RTX 5090, Qwen3.8-27B and other formats are in [benchmarks](docs/benchmarks.md).
+H200, B200, RTX 5090, AMD MI325X, Qwen3.8-27B and other formats are in [benchmarks](docs/benchmarks.md).
 
 ## Quick start
 
-Requires an NVIDIA GPU with driver 580 or newer, the CUDA 13 toolkit and Rust 1.98 or newer.
+Requires Rust 1.98 or newer and either an NVIDIA GPU with driver 580 or newer and the CUDA 13 toolkit, or an AMD MI325X with ROCm 7 (hipcc, HIP and hipBLAS).
 
 ```sh
 git clone https://github.com/lxe/pocket-engine && cd pocket-engine
@@ -42,7 +42,7 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 
 - **Models:** Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Dense models only.
 - **GPUs:** H100, H200, B200 and RTX 50-series; AMD MI325X (ROCm).
-- **Weights:** bf16, FP8, FP4 (RTX 50-series) and GGUF.
+- **Weights:** bf16, FP8 (NVIDIA), FP4 (RTX 50-series) and GGUF.
 - **Adapters:** PEFT and llama.cpp LoRA, over any of those weights.
 
 ## Documentation

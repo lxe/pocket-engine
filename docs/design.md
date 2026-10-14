@@ -9,7 +9,7 @@ Qwen3.5 and Qwen3.8 are hybrid models: three of every four layers use linear att
 - `src/sched.rs` decides what runs in each step. It has no GPU code.
 - `src/engine.rs` runs steps on the GPU and streams tokens back.
 - `src/model.rs` launches each layer's kernels.
-- `src/kernels/` holds the CUDA kernels. Large matrix multiplies go to cuBLAS.
+- `src/kernels/` holds the CUDA kernels, which also build for AMD (see [AMD](#amd)). Large matrix multiplies go to cuBLAS, or hipBLASLt on AMD.
 - `src/server.rs` is the OpenAI-compatible HTTP API.
 
 There is no Python or PyTorch in the serving path. The host spends 0.01 to 0.04 ms on each step, so steps run back to back without overlapping the scheduler with the GPU.
@@ -103,8 +103,13 @@ In batches of 16 rows or more, those formats run on int8 tensor cores, against a
 
 ## AMD
 
-The `rocm` feature builds the same kernels with hipcc for gfx942 and runs them through HIP and hipBLAS (`src/hip.rs`). The few hardware primitives the kernels need (asynchronous copies, `ldmatrix`, `mma.sync`, streaming loads) live in `kernels/backend/cuda.cuh` and `kernels/backend/hip.cuh`. On AMD they emulate NVIDIA's fragments with shuffles, so the hot paths have native versions in `kernels/amd/`, written for 64-lane waves and MFMA matrix instructions: the chunked delta rule, prompt and decode attention, int8 GGUF tiles, the decode recurrence, and matrix-vector products for 1 to 4 rows. FP8 and FP4 are NVIDIA only.
+The `rocm` feature builds the same kernels with hipcc for gfx942 and runs them through HIP and hipBLAS (`src/hip.rs`). The few hardware primitives the kernels need (asynchronous copies, `ldmatrix`, `mma.sync`, streaming loads) live in `kernels/backend/cuda.cuh` and `kernels/backend/hip.cuh`. On AMD they emulate NVIDIA's fragments with shuffles, so the hot paths have native versions in `kernels/amd/`, written for 64-lane waves and MFMA matrix instructions: the chunked delta rule, prompt and decode attention, int8 GGUF tiles, the decode recurrence, and matrix-vector products for 1 to 4 rows. FP8 and FP4 are NVIDIA only. Other differences on AMD:
+
+- Matrix-vector products for decoding stream the weights in a kernel modelled on vLLM's wvSplitK (4.8 to 5.4 TB/s on an MI325X); larger products go to hipBLASLt, and GGUF batches dequantize to bf16 for it.
+- Split decode attention uses shorter key ranges (64 keys), since each wave keeps fewer loads in flight.
+- An adapter's x Aᵀ runs in stream order rather than on a second stream, which changed outputs on AMD.
+- A server started right after another exits waits up to 5 seconds in GPU setup while the driver frees the old process's memory.
 
 ## Loading
 
-Weights are read from the file with parallel `pread` calls into pinned buffers, while the GPU copies the previous buffer. Nothing goes through memory-mapped pages, which is about five times slower. A 9B model is ready to serve in under 2 seconds from the page cache.
+Weights are read from the file with parallel `pread` calls into pinned buffers, while the GPU copies the previous buffer. Nothing goes through memory-mapped pages, which is about five times slower. The tokenizer and the structured-output tables load on another thread meanwhile. A 9B model is ready to serve in under 2 seconds from the page cache.

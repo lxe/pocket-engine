@@ -26,7 +26,7 @@ Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Mixture-of-experts mo
 
 `--mtp` needs a checkpoint or GGUF file that includes the draft layer; among GGUF files, Unsloth's Qwen3.8-27B UD quantizations do. Use it for a few streams at a time: it speeds up each one (64 to 112 tok/s on 27B on an RTX 5090) and costs a few percent at high load.
 
-GGUF weights in 4- to 6-bit formats run batches against int8 activations, which serves about 20% more tokens/s under load on RTX GPUs and a few percent more on H100, with the same agreement with Transformers. `--no-int8` keeps activations in bf16.
+GGUF weights in 4- to 6-bit formats run batches against int8 activations, which serves about 20% more tokens/s under load on RTX GPUs and a few percent more on H100, with the same agreement with Transformers. `--no-int8` keeps activations in bf16. On AMD, batches dequantize to bf16 for hipBLASLt instead.
 
 `--kv-fp8` stores the KV cache in FP8, which fits about twice the tokens. How each format runs is in [the design notes](design.md#quantized-weights).
 
@@ -97,4 +97,4 @@ Neither turns on speculative decoding for the request. On an RTX 5090 with 9B Q4
 | `--max-image-pixels N` | 4194304 | Largest image after resizing |
 | `--image-pool N` | 16384 | Image embeddings waiting at once |
 | `--wait-for PATH` | none | Wait for `PATH` to exist before loading, so GPU setup overlaps a download |
-| `--no-graphs` | off | Disable CUDA graphs |
+| `--no-graphs` | off | Disable CUDA (or HIP) graphs |

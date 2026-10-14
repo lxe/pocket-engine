@@ -60,5 +60,7 @@ python scripts/accuracy.py compare out.ref.json out.ours.json             # agre
 
 `POCKET_NO_WS=1` sends prompts on Hopper and B200 to the portable flash kernel instead of the warp-specialized one, for A/B runs.
 
+`POCKET_CHECK_HEADS=1 pocket-engine bench-attn ... --check` also reports the largest difference per head, and for heads off by more than 5e-3 which tokens and columns: a wrong warp shows up as a block of 32 tokens.
+
 `scripts/perf_check.py` reruns the matmul, attention and linear-attention benchmarks and short load tests against a stored baseline for the GPU, and fails on a regression.
 

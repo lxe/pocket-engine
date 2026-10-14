@@ -193,9 +193,12 @@ extern "C" __global__ void silu_mul(const bf16* __restrict__ gu, bf16* __restric
 // Depthwise causal convolution (kernel 4) over each sequence's tokens, then
 // SiLU. The state holds the last three inputs of each sequence: [slot][3][C].
 // proj rows hold the convolution inputs in their first C columns. A thread
-// takes one channel of CONV_CHUNK tokens (blockIdx.z), reading the three
-// inputs before them from the rows before or, at the start, the state.
-#define CONV_CHUNK 64
+// takes eight channels (16-byte loads; C is a multiple of 8) of CONV_CHUNK
+// tokens (blockIdx.z), reading the three inputs before them from the rows
+// before or, at the start, the state.
+#define CONV_CHUNK 32
+__device__ __forceinline__ void conv_load(const bf16* p, float* x) { unpack8(*reinterpret_cast<const uint4*>(p), x); }
+__device__ __forceinline__ void conv_store(bf16* p, const float* x) { *reinterpret_cast<uint4*>(p) = pack8(x); }
 extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
                                     const float* __restrict__ w, bf16* __restrict__ state,
                                     bf16* __restrict__ out, const int* __restrict__ cu,
@@ -203,22 +206,29 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
                                     int C, const int* __restrict__ outs, int spec,
                                     const int* __restrict__ snaps) {
     const int s = blockIdx.y;
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int c = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
     if (c >= C) return;
     const int t0 = cu[s], t1 = cu[s + 1];
     const int ta = t0 + blockIdx.z * CONV_CHUNK, tz = min(t1, ta + CONV_CHUNK);
     if (ta >= tz) return;
     bf16* st = state + (size_t)slots[s] * 3 * C;
     const bool keep = is_spec(outs, spec, s);
-    // Inputs at ta - 3, ta - 2, ta - 1.
-    float x[3];
+    // Inputs at ta - 3, ta - 2, ta - 1, as x[0..2][channel].
+    float x[3][8];
 #pragma unroll
     for (int i = 0; i < 3; i++) {
         const int tt = ta - 3 + i;
-        x[i] = tt >= t0 ? b2f(proj[(size_t)tt * pstride + c]) : fresh[s] ? 0.f : b2f(st[(size_t)(tt - t0 + 3) * C + c]);
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (tt >= t0) v = *reinterpret_cast<const uint4*>(proj + (size_t)tt * pstride + c);
+        else if (!fresh[s]) v = *reinterpret_cast<const uint4*>(st + (size_t)(tt - t0 + 3) * C + c);
+        unpack8(v, x[i]);
     }
-    float x0 = x[0], x1 = x[1], x2 = x[2];
-    const float4 k = *reinterpret_cast<const float4*>(w + 4 * c);
+    float k[8][4];
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+        const float4 v = *reinterpret_cast<const float4*>(w + 4 * (c + e));
+        k[e][0] = v.x, k[e][1] = v.y, k[e][2] = v.z, k[e][3] = v.w;
+    }
     // Prefix-cache snapshots (snaps: per sequence two (tokens into the row,
     // slot) pairs, or null): the three inputs before that point.
     if (snaps && blockIdx.z == 0) {
@@ -229,34 +239,43 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
 #pragma unroll
             for (int i = 0; i < 3; i++) {
                 const int tt = t0 + rel - 3 + i;
-                o[i * C + c] = f2b(tt >= t0 ? b2f(proj[(size_t)tt * pstride + c]) : x[tt - t0 + 3]);
+                // Read again rather than indexing x, which would move it to
+                // local memory.
+                uint4 v = make_uint4(0, 0, 0, 0);
+                if (tt >= t0) v = *reinterpret_cast<const uint4*>(proj + (size_t)tt * pstride + c);
+                else if (!fresh[s]) v = *reinterpret_cast<const uint4*>(st + (size_t)(tt - t0 + 3) * C + c);
+                *reinterpret_cast<uint4*>(o + (size_t)i * C + c) = v;
             }
         }
     }
-    // Inputs are loaded 8 tokens at a time, so a chunk waits for one load
-    // latency per 8 tokens rather than per token.
-    for (int t = ta; t < tz; t += 8) {
-        float xs[8];
+    // Inputs are loaded 4 tokens at a time, so a chunk waits for one load
+    // latency per 4 tokens rather than per token.
+    for (int t = ta; t < tz; t += 4) {
+        float xs[4][8];
 #pragma unroll
-        for (int u = 0; u < 8; u++) xs[u] = t + u < tz ? b2f(proj[(size_t)(t + u) * pstride + c]) : 0.f;
+        for (int u = 0; u < 4; u++)
+            if (t + u < tz) conv_load(proj + (size_t)(t + u) * pstride + c, xs[u]);
 #pragma unroll
-        for (int u = 0; u < 8; u++) {
+        for (int u = 0; u < 4; u++) {
             if (t + u >= tz) break;
-            const float x3 = xs[u];
-            float acc = 0.f;
-            acc += x0 * k.x;
-            acc += x1 * k.y;
-            acc += x2 * k.z;
-            acc += x3 * k.w;
-            out[(size_t)(t + u) * C + c] = f2b(silu(acc));
-            x0 = x1;
-            x1 = x2;
-            x2 = x3;
+            float y[8];
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                float acc = 0.f;
+                acc += x[0][e] * k[e][0];
+                acc += x[1][e] * k[e][1];
+                acc += x[2][e] * k[e][2];
+                acc += xs[u][e] * k[e][3];
+                y[e] = silu(acc);
+                x[0][e] = x[1][e];
+                x[1][e] = x[2][e];
+                x[2][e] = xs[u][e];
+            }
+            conv_store(out + (size_t)(t + u) * C + c, y);
             if (keep) {
                 bf16* o = state + (size_t)outs[(size_t)s * spec + (t + u - t0)] * 3 * C;
-                o[c] = f2b(x0);
-                o[C + c] = f2b(x1);
-                o[2 * C + c] = f2b(x2);
+#pragma unroll
+                for (int i = 0; i < 3; i++) conv_store(o + (size_t)i * C + c, x[i]);
             }
         }
     }
@@ -264,14 +283,11 @@ extern "C" __global__ void gdn_conv(const bf16* __restrict__ proj, int pstride,
     // its own window, or the sequence's last three rows (a sequence of more
     // than one chunk has at least three).
     if (keep || blockIdx.z != 0) return;
-    if (tz != t1) {
-        x0 = b2f(proj[(size_t)(t1 - 3) * pstride + c]);
-        x1 = b2f(proj[(size_t)(t1 - 2) * pstride + c]);
-        x2 = b2f(proj[(size_t)(t1 - 1) * pstride + c]);
-    }
-    st[c] = f2b(x0);
-    st[C + c] = f2b(x1);
-    st[2 * C + c] = f2b(x2);
+    if (tz != t1)
+#pragma unroll
+        for (int i = 0; i < 3; i++) conv_load(proj + (size_t)(t1 - 3 + i) * pstride + c, x[i]);
+#pragma unroll
+    for (int i = 0; i < 3; i++) conv_store(st + (size_t)i * C + c, x[i]);
 }
 
 #ifdef __HIP_PLATFORM_AMD__
@@ -957,32 +973,43 @@ extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan4(GDN_SCAN_ARG
 #endif
 }
 
-// The gated RMSNorm of one (token, head): lane l < 16 holds outputs 8l ..
-// 8l + 7 in o; y = o / rms(o) * w * silu(z), written as bf16 and, with
-// fmode, as FP8. Every lane of the warp calls it.
-__device__ __forceinline__ void gdn_gate8(float* o, int t, int h, int Hv, const bf16* __restrict__ proj, int pstride,
-                                          int C, const float* __restrict__ norm_w, bf16* __restrict__ out, float eps,
-                                          const Fp8Out& fo, int fmode, int lane) {
+// The gated RMSNorm of one (token, head) per 16 lanes: lane l of a half-warp
+// holds outputs 8 (l % 16) .. + 7 of head h in o; y = o / rms(o) * w *
+// silu(z), written as bf16 and, with fmode, as FP8. Every lane of the warp
+// calls it; `active` halves store (an inactive half's h may be any head).
+__device__ __forceinline__ void gdn_gate8z(float* o, uint4 zq, int t, int h, int Hv,
+                                           const float* __restrict__ norm_w, bf16* __restrict__ out, float eps,
+                                           const Fp8Out& fo, int fmode, int lane, bool active) {
+    const int l = lane & 15;
     float ss = 0.f;
 #pragma unroll
     for (int e = 0; e < 8; e++) ss += o[e] * o[e];
-    const float var = warp_sum(ss) / GDN_DIM;
-    const float inv = 1.f / sqrtf(var + eps);
-    if (lane < 16) {
+#pragma unroll
+    for (int m = 1; m < 16; m <<= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+    const float inv = 1.f / sqrtf(ss / GDN_DIM + eps);
+    if (active) {
         float z[8];
-        unpack8(*reinterpret_cast<const uint4*>(proj + (size_t)t * pstride + C + h * GDN_DIM + 8 * lane), z);
-        const float4 w0 = *reinterpret_cast<const float4*>(norm_w + 8 * lane);
-        const float4 w1 = *reinterpret_cast<const float4*>(norm_w + 8 * lane + 4);
+        unpack8(zq, z);
+        const float4 w0 = *reinterpret_cast<const float4*>(norm_w + 8 * l);
+        const float4 w1 = *reinterpret_cast<const float4*>(norm_w + 8 * l + 4);
         const float w[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
 #pragma unroll
         for (int e = 0; e < 8; e++) o[e] = o[e] * inv * w[e] * silu(z[e]);
-        *reinterpret_cast<uint4*>(out + (size_t)t * Hv * GDN_DIM + h * GDN_DIM + 8 * lane) = pack8(o);
+        *reinterpret_cast<uint4*>(out + (size_t)t * Hv * GDN_DIM + h * GDN_DIM + 8 * l) = pack8(o);
     }
-    if (fmode) quant8(o, t, h * GDN_DIM + 8 * (lane & 15), Hv * GDN_DIM, fo, lane < 16);
+    if (fmode) quant8(o, t, h * GDN_DIM + 8 * l, Hv * GDN_DIM, fo, active);
+}
+// As gdn_gate8z, loading the gate inputs from proj.
+__device__ __forceinline__ void gdn_gate8(float* o, int t, int h, int Hv, const bf16* __restrict__ proj, int pstride,
+                                          int C, const float* __restrict__ norm_w, bf16* __restrict__ out, float eps,
+                                          const Fp8Out& fo, int fmode, int lane, bool active) {
+    const uint4 z = active ? *reinterpret_cast<const uint4*>(proj + (size_t)t * pstride + C + h * GDN_DIM + 8 * (lane & 15))
+                           : make_uint4(0, 0, 0, 0);
+    gdn_gate8z(o, z, t, h, Hv, norm_w, out, eps, fo, fmode, lane, active);
 }
 // The gated norm for gdn_scan's outputs, in place: a block per token of a
-// sequence with more than one, a warp per head (warp w takes heads w, w + 8,
-// ...).
+// sequence with more than one, a half-warp per head (warp w takes heads
+// 2w and 2w + 1, then 2w + 16, ...).
 extern "C" __global__ void gdn_norm(const bf16* __restrict__ proj, int pstride, int C, int Hv,
                                     const float* __restrict__ norm_w, bf16* __restrict__ out, int T, float eps,
                                     const int* __restrict__ cu, const int* __restrict__ tok_seq, uint8_t* fq,
@@ -991,11 +1018,13 @@ extern "C" __global__ void gdn_norm(const bf16* __restrict__ proj, int pstride, 
     const int t = blockIdx.x, lane = threadIdx.x & 31;
     const int sq = tok_seq[t];
     if (cu[sq + 1] - cu[sq] == 1 || is_spec(outs, spec, sq)) return;  // finished by gdn_one or gdn_decode
-#pragma unroll 2
-    for (int h = threadIdx.x >> 5; h < Hv; h += blockDim.x >> 5) {
+    for (int h0 = 2 * (threadIdx.x >> 5); h0 < Hv; h0 += 2 * (blockDim.x >> 5)) {
+        const int h = h0 + (lane >> 4);
+        const bool active = h < Hv;
         float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        if (lane < 16) unpack8(*reinterpret_cast<const uint4*>(out + (size_t)t * Hv * GDN_DIM + h * GDN_DIM + 8 * lane), o);
-        gdn_gate8(o, t, h, Hv, proj, pstride, C, norm_w, out, eps, fo, fmode, lane);
+        if (active)
+            unpack8(*reinterpret_cast<const uint4*>(out + (size_t)t * Hv * GDN_DIM + h * GDN_DIM + 8 * (lane & 15)), o);
+        gdn_gate8(o, t, h, Hv, proj, pstride, C, norm_w, out, eps, fo, fmode, lane, active);
     }
 }
 
@@ -1667,7 +1696,11 @@ __device__ __forceinline__ void mbar_wait(uint32_t bar, int parity) {
 extern "C" __global__ void __launch_bounds__(256, 2) gdn_decode(GDN_ARGS, int seqs, int nbuf) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     extern __shared__ __align__(128) unsigned char dsm[];
-    __shared__ float qs[GDN_DIM], ks[GDN_DIM], ds[GDN_DIM], ys[GDN_DIM], red[2][8][GDN_DIM], sh[32];
+    __shared__ float qs[GDN_DIM], ks[GDN_DIM], ds[GDN_DIM], ys[GDN_DIM], red[2][8][GDN_DIM], sh[32], sh3[3][8];
+    // Per buffer, the item's first token's q, k, v and gate inputs z, and
+    // the 4-byte words holding its b and a.
+    __shared__ __align__(16) bf16 sin[3][4][GDN_DIM];
+    __shared__ uint32_t sba[3][2];
     __shared__ __align__(8) uint64_t full[3];
     const Fp8Out fo{fq, fs, fmode, frows};
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -1676,26 +1709,38 @@ extern "C" __global__ void __launch_bounds__(256, 2) gdn_decode(GDN_ARGS, int se
     const int items = seqs * Hv;
     const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(full), buf0 = (uint32_t)__cvta_generic_to_shared(dsm);
     auto state_at = [&](int slot, int h) { return (size_t)slot * Hv + h; };
-    // Every thread issues its share of item n's state load as 16-byte
-    // cp.async copies that arrive on the item's barrier when they land (a
-    // fresh or empty sequence's just arrive). TMA's bulk copy would be one
+    // Every thread issues its share of item n's loads as cp.async copies
+    // that arrive on the item's barrier when they land: the state (none for
+    // a fresh sequence) and the first token's inputs, so an item's math
+    // waits on no global load. TMA's bulk copy would take the state in one
     // instruction, but a kernel using it costs about 14 MB of device memory
     // per CUDA graph node.
     auto issue = [&](int n) {
         const int it = blockIdx.x + n * gridDim.x;
         if (it >= items) return;
-        const int s = it / Hv, h = it % Hv, b = n % nbuf;
-        const uint32_t bar = bar0 + 8 * b;
-        if (!fresh[s] && cu[s] < cu[s + 1]) {
-            const char* src = (const char*)state + state_at(slots[s], h) * bytes;
-            for (int c = tid; c < bytes / 16; c += blockDim.x)
-                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(buf0 + b * bytes + 16 * c),
-                             "l"(src + 16 * c)
-                             : "memory");
-            mbar_arrive_cp(bar);
-        } else {
-            mbar_arrive(bar);
+        const int s = it / Hv, h = it % Hv, b = n % nbuf, t0 = cu[s];
+        if (t0 < cu[s + 1]) {
+            if (!fresh[s]) {
+                const char* src = (const char*)state + state_at(slots[s], h) * bytes;
+                for (int c = tid; c < bytes / 16; c += blockDim.x)
+                    cp16z(dsm + b * bytes + 16 * c, src + 16 * c, true);
+            }
+            const int kh = tiled ? h % Hk : h / (Hv / Hk);
+            const bf16* crow = conv + (size_t)t0 * C;
+            const bf16* prow = proj + (size_t)t0 * pstride + C;
+            if (tid < 64) {
+                const int which = tid >> 4, off = 8 * (tid & 15);
+                const bf16* src = which == 0   ? crow + kh * GDN_DIM
+                                  : which == 1 ? crow + (Hk + kh) * GDN_DIM
+                                  : which == 2 ? crow + 2 * Hk * GDN_DIM + h * GDN_DIM
+                                               : prow + h * GDN_DIM;
+                cp16z(&sin[b][which][off], src + off, true);
+            } else if (tid < 66) {
+                const bf16* src = prow + Hv * GDN_DIM + (tid - 64) * Hv + h;
+                cp4(&sba[b][tid - 64], reinterpret_cast<const void*>((uintptr_t)src & ~(uintptr_t)3));
+            }
         }
+        mbar_arrive_cp(bar0 + 8 * b);
     };
     if (tid == 0)
         for (int b = 0; b < nbuf; b++) mbar_init(bar0 + 8 * b, blockDim.x);
@@ -1733,16 +1778,44 @@ extern "C" __global__ void __launch_bounds__(256, 2) gdn_decode(GDN_ARGS, int se
         for (int t = t0; t < t1; t++) {
             const bf16* crow = conv + (size_t)t * C;
             const bf16* prow = proj + (size_t)t * pstride + C;
-            float q = 0.f, k = 0.f, v = 0.f;
-            if (tid < GDN_DIM) {
-                q = b2f(crow[kh * GDN_DIM + tid]);
-                k = b2f(crow[Hk * GDN_DIM + kh * GDN_DIM + tid]);
-                v = b2f(crow[2 * Hk * GDN_DIM + h * GDN_DIM + tid]);
+            float q = 0.f, k = 0.f, v = 0.f, bb, a;
+            uint4 zq;
+            if (t == t0) {
+                if (tid < GDN_DIM) {
+                    q = b2f(sin[b][0][tid]);
+                    k = b2f(sin[b][1][tid]);
+                    v = b2f(sin[b][2][tid]);
+                }
+                zq = *reinterpret_cast<const uint4*>(&sin[b][3][8 * (lane & 15)]);
+                const uintptr_t pb = (uintptr_t)(prow + Hv * GDN_DIM + h), pa = pb + 2 * Hv;
+                bb = __uint_as_float((pb & 2 ? sba[b][0] >> 16 : sba[b][0] & 0xFFFF) << 16);
+                a = __uint_as_float((pa & 2 ? sba[b][1] >> 16 : sba[b][1] & 0xFFFF) << 16);
+            } else {
+                if (tid < GDN_DIM) {
+                    q = b2f(crow[kh * GDN_DIM + tid]);
+                    k = b2f(crow[Hk * GDN_DIM + kh * GDN_DIM + tid]);
+                    v = b2f(crow[2 * Hk * GDN_DIM + h * GDN_DIM + tid]);
+                }
+                zq = warp == 0 ? *reinterpret_cast<const uint4*>(prow + h * GDN_DIM + 8 * (lane & 15))
+                               : make_uint4(0, 0, 0, 0);
+                bb = b2f(prow[Hv * GDN_DIM + h]);
+                a = b2f(prow[Hv * GDN_DIM + Hv + h]);
             }
-            const float bb = b2f(prow[Hv * GDN_DIM + h]), a = b2f(prow[Hv * GDN_DIM + Hv + h]);
-            const float qq = block_sum(q * q, sh), kk = block_sum(k * k, sh);
-            q = q / sqrtf(qq + 1e-6f);
-            k = k / sqrtf(kk + 1e-6f);
+            // q.q, k.k and q.k in one block reduction.
+            float r3[3] = {warp_sum(q * q), warp_sum(k * k), warp_sum(q * k)};
+            if (lane == 0)
+#pragma unroll
+                for (int e = 0; e < 3; e++) sh3[e][warp] = r3[e];
+            __syncthreads();
+#pragma unroll
+            for (int e = 0; e < 3; e++) {
+                r3[e] = 0.f;
+#pragma unroll
+                for (int w = 0; w < 8; w++) r3[e] += sh3[e][w];
+            }
+            const float nq = 1.f / sqrtf(r3[0] + 1e-6f), nk = 1.f / sqrtf(r3[1] + 1e-6f);
+            q *= nq;
+            k *= nk;
             if (round_qk) {
                 q = rbf(q);
                 k = rbf(k);
@@ -1752,7 +1825,15 @@ extern "C" __global__ void __launch_bounds__(256, 2) gdn_decode(GDN_ARGS, int se
                 qs[tid] = q;
                 ks[tid] = k;
             }
-            const float qk = block_sum(tid < GDN_DIM ? q * k : 0.f, sh);  // its syncs publish qs and ks
+            // Rounded q and k need their own product; otherwise it follows
+            // from the raw one. Either way the syncs publish qs and ks.
+            float qk;
+            if (round_qk) {
+                qk = block_sum(tid < GDN_DIM ? q * k : 0.f, sh);
+            } else {
+                qk = r3[2] * nq * nk * qscale;
+                __syncthreads();
+            }
             const float beta = 1.f / (1.f + expf(-bb));
             const float x = a + db;
             const float decay = expf(na * (fmaxf(x, 0.f) + logf(1.f + expf(-fabsf(x)))));
@@ -1804,7 +1885,7 @@ extern "C" __global__ void __launch_bounds__(256, 2) gdn_decode(GDN_ARGS, int se
                 if (lane < 16)
 #pragma unroll
                     for (int e = 0; e < 8; e++) o[e] = ys[col + e];
-                gdn_gate8(o, t, h, Hv, proj, pstride, C, norm_w, out, eps, fo, fmode, lane);
+                gdn_gate8z(o, zq, t, h, Hv, norm_w, out, eps, fo, fmode, lane, lane < 16);
             }
             if (keep) {
                 // The state after each token, so rejected drafts cost nothing.

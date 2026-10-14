@@ -145,9 +145,9 @@ impl FaShape {
 /// each, the stages' mbarriers and 8 bytes per consumer thread.
 pub const WS_SMEM: usize = 6 * 64 * HEAD_DIM * 2 + 128 + 8 * 256;
 /// Dynamic shared memory of attn_tc_g<G> (TC_SMEM in attn_sm100.cuh): 128
-/// queries, two stages each of 64 keys and values (256 bf16 per row), the
-/// mbarriers, row scales and sums, and the tensor memory address.
-pub const TC_SMEM: usize = 3 * 128 * HEAD_DIM * 2 + 256 + 3 * 128 * 4 + 16;
+/// queries, two stages each of a key half and a value half (32 KB each), the
+/// mbarriers, row maxima and sums, and the tensor memory address.
+pub const TC_SMEM: usize = 128 * HEAD_DIM * 2 + 2 * 2 * 32768 + 256 + 6 * 128 * 4 + 16;
 
 /// The warp-specialized flash kernel that prompts take when the GPU has one
 /// (a bf16 cache and groups of 4 or 6): wgmma on Hopper, tcgen05 on B200.
@@ -194,8 +194,10 @@ impl FaWs {
 }
 
 /// gdn_decode's static shared memory: q, k, delta and outputs, the column
-/// sums of 8 warps, block_sum's slots and the buffers' barriers.
-const GDN_DECODE_STATIC: usize = 4 * GDN_DIM * 4 + 2 * 8 * GDN_DIM * 4 + 32 * 4 + 3 * 8;
+/// sums of 8 warps, the reductions' slots, and per buffer its staged inputs
+/// and barrier.
+const GDN_DECODE_STATIC: usize =
+    4 * GDN_DIM * 4 + 2 * 8 * GDN_DIM * 4 + (32 + 24) * 4 + 3 * (4 * GDN_DIM * 2 + 8 + 8);
 /// How gdn_decode runs: state buffers per block and blocks per SM, or None
 /// where two buffers do not fit (an f32 state on RTX 50-series), which
 /// leaves gdn_recurrent.
@@ -2126,8 +2128,9 @@ impl Model {
                     w_in.forward(gpu, q, xn_in, t, a.proj.ptr, pw, false)?;
                     gpu.launch(
                         k.gdn_conv,
-                        // Chunks of CONV_CHUNK tokens; a sequence has at most t.
-                        (cd.div_ceil(128) as u32, si, t.div_ceil(64) as u32),
+                        // 8 channels a thread, chunks of CONV_CHUNK tokens; a
+                        // sequence has at most t.
+                        (cd.div_ceil(8 * 128) as u32, si, t.div_ceil(32) as u32),
                         128,
                         0,
                         &[

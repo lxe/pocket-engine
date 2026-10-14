@@ -37,6 +37,7 @@ Add one of these to the command above to run the same checks with that option on
 | `POCKET_ENGINE_STATE_F32=1` | `--state-f32` |
 | `POCKET_ENGINE_MTP=3` | `--mtp 3` |
 | `POCKET_ENGINE_NO_INT8=1` | `--no-int8` |
+| `POCKET_ENGINE_LORA=DIR` | checks that adapter against `tests/fixtures/<size>.lora.*.json` |
 
 Quantized runs allow slightly larger differences from Transformers.
 
@@ -50,3 +51,10 @@ uv venv && uv pip install torch transformers
 target/release/pocket-engine score --model models/qwen3.5-2b out.pairs.json out.ours.json
 python scripts/accuracy.py compare out.ref.json out.ours.json             # agreement report
 ```
+
+## Profiling
+
+`POCKET_PROFILE=1` times every kernel and cuBLAS call with CUDA events and adds GPU time by kernel to the server's 10-second report. CUDA graphs hide the kernels inside them, so profile with `--no-graphs`. It works where `ncu` cannot read counters, as in most rented containers.
+
+`scripts/perf_check.py` reruns the matmul, attention and linear-attention benchmarks and short load tests against a stored baseline for the GPU, and fails on a regression.
+

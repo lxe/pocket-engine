@@ -1,5 +1,9 @@
 """Closed-loop and burst load against an OpenAI-style /v1/chat/completions endpoint (streamed): output tok/s, TTFT and
-latency percentiles. Usage: load.py URL MODEL OUT.json"""
+latency percentiles. Usage: load.py URL MODEL OUT.json
+LOAD_CASES="1:16,16:96" picks other closed-loop cases (requests in flight:total); LOAD_BURST=0 skips the burst;
+LOAD_MODELS="a,b" sends requests to those model names in turn (LoRA adapters) instead of MODEL;
+LOAD_EXTRA='{"response_format": {"type": "json_object"}}' adds fields to every request."""
+import os
 import asyncio, json, random, sys, time
 import httpx
 
@@ -9,12 +13,17 @@ rng = random.Random(7)
 def prompt():
     n = rng.randint(40, 150)   # (~60-200 tokens with the chat template)
     return "Summarize briefly: " + " ".join(rng.choice(WORDS) for _ in range(n))
-REQS = [(prompt(), rng.choice([16, 32, 48, 64])) for _ in range(512)]
+REQS = [(prompt(), rng.choice([16, 32, 48, 64])) for _ in range(int(os.environ.get("LOAD_POOL", 512)))]
+
+MODELS = os.environ.get("LOAD_MODELS", "").split(",") if os.environ.get("LOAD_MODELS") else [MODEL]
+EXTRA = json.loads(os.environ.get("LOAD_EXTRA", "{}"))
+SENT = [0]
 
 async def one(c, p, mt):
     t0 = time.perf_counter(); ttft = None; toks = 0
-    async with c.stream("POST", URL + "/v1/chat/completions", json={"model": MODEL, "messages": [{"role": "user", "content": p}],
-            "max_tokens": mt, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}) as r:
+    model = MODELS[SENT[0] % len(MODELS)]; SENT[0] += 1
+    async with c.stream("POST", URL + "/v1/chat/completions", json={"model": model, "messages": [{"role": "user", "content": p}],
+            "max_tokens": mt, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}, **EXTRA}) as r:
         if r.status_code != 200:
             return {"err": r.status_code, "body": (await r.aread())[:200].decode(errors="replace")}
         async for line in r.aiter_lines():
@@ -55,8 +64,10 @@ async def main():
     out = []
     async with httpx.AsyncClient(timeout=600, limits=httpx.Limits(max_connections=256)) as c:
         await one(c, "hello", 8)   # warm
-        for conc, total in ((1, 16), (8, 64), (16, 96), (32, 128), (64, 192)):
+        cases = os.environ.get("LOAD_CASES", "1:16,8:64,16:96,32:128,64:192")
+        for conc, total in (map(int, x.split(":")) for x in cases.split(",")):
             out.append(await closed(c, conc, total))
-        out.append(await burst(c, 64))
+        if os.environ.get("LOAD_BURST", "1") != "0":
+            out.append(await burst(c, 64))
     json.dump(out, open(OUT, "w"), indent=1)
 asyncio.run(main())

@@ -1,19 +1,71 @@
 """Accuracy check against Transformers.
 
-  python scripts/accuracy.py reference MODEL_DIR OUT [N]   # greedy continuations + teacher-forced top-5
+  python scripts/accuracy.py reference MODEL_DIR OUT [N] [--adapter LORA_DIR]   # greedy + teacher-forced top-5
   python scripts/accuracy.py long MODEL_DIR OUT            # the same over ~3,300-token prompts (docs/)
   pocket-engine score --model MODEL_DIR OUT.pairs.json OUT.ours.json
   python scripts/accuracy.py compare OUT.ref.json OUT.ours.json
 
-`reference` needs torch and transformers (see docs/testing.md); `compare` needs only Python."""
-import json, sys
+`reference` needs torch and transformers (see docs/testing.md); `compare` needs only Python. With --adapter,
+the PEFT adapter runs unmerged, as PEFT and vLLM run it: y += scale * (x A^T) B^T in f32. ADAPTER_MERGED=1
+merges it into the bf16 weights instead, which rounds every weight it touches again. REF_PAIRS=FILE scores the
+continuations of an earlier pairs file instead of generating new ones."""
+import json, os, sys
 
 
-def reference(M, OUT, N=48, prompts=None):
+def hook_adapter(model, path):
+    """Applies a PEFT adapter unmerged, as PEFT runs it: y += scale * (x A^T) B^T, in f32."""
+    import torch, re
+    from safetensors.torch import load_file
+    cfg = json.load(open(path + "/adapter_config.json"))
+    sd = load_file(path + "/adapter_model.safetensors")
+    mods = dict(model.named_modules())
+    n = 0
+    for k, a in sd.items():
+        if not k.endswith(".lora_A.weight"):
+            continue
+        stem = k[: -len(".lora_A.weight")]
+        layer, module = re.search(r"layers\.(\d+)\.(.+)$", stem).groups()
+        b = sd[stem + ".lora_B.weight"]
+        r = a.shape[0]
+        scale = cfg["lora_alpha"] / (r ** 0.5 if cfg.get("use_rslora") else r)
+        m = mods[f"model.layers.{layer}.{module}"]
+        A, B = a.float().to(m.weight.device), (b.float() * scale).to(m.weight.device)
+        m.register_forward_hook(lambda mod, inp, out, A=A, B=B: (out.float() + (inp[0].float() @ A.T) @ B.T).to(out.dtype))
+        n += 1
+    print(f"hooked {n} LoRA modules from {path}")
+
+
+def merge_adapter(model, path):
+    import torch, re
+    from safetensors.torch import load_file
+    cfg = json.load(open(path + "/adapter_config.json"))
+    sd = load_file(path + "/adapter_model.safetensors")
+    mods = dict(model.named_modules())
+    n = 0
+    for k, a in sd.items():
+        if not k.endswith(".lora_A.weight"):
+            continue
+        stem = k[: -len(".lora_A.weight")]
+        layer, module = re.search(r"layers\.(\d+)\.(.+)$", stem).groups()
+        b = sd[stem + ".lora_B.weight"]
+        r = a.shape[0]
+        scale = cfg["lora_alpha"] / (r ** 0.5 if cfg.get("use_rslora") else r)
+        w = mods[f"model.layers.{layer}.{module}"].weight
+        with torch.no_grad():
+            w.copy_((w.float() + scale * (b.float().to(w.device) @ a.float().to(w.device))).to(w.dtype))
+        n += 1
+    print(f"merged {n} LoRA modules from {path}")
+
+
+def reference(M, OUT, N=48, prompts=None, adapter=None):
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
     tok = AutoTokenizer.from_pretrained(M)
     model = AutoModelForCausalLM.from_pretrained(M, dtype=torch.bfloat16, device_map="cuda").eval()
+    if adapter and os.environ.get("ADAPTER_MERGED"):
+        merge_adapter(model, adapter)
+    elif adapter:
+        hook_adapter(model, adapter)
     if callable(prompts):
         prompts = prompts(tok)
     prompts = prompts or [
@@ -24,12 +76,18 @@ def reference(M, OUT, N=48, prompts=None):
         "What is 17 * 23? Show your work step by step.",
     ]
     pairs, ref = [], []
-    for p in prompts:
-        text = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False, tokenize=False)
-        ids = tok(text, add_special_tokens=False)["input_ids"]
+    # REF_PAIRS scores the continuations of an earlier pairs file instead of generating.
+    given = json.load(open(os.environ["REF_PAIRS"])) if os.environ.get("REF_PAIRS") else None
+    for i, p in enumerate(given or prompts):
+        if given:
+            ids, g = p["prompt"], p["forced"]
+        else:
+            text = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False, tokenize=False)
+            ids = tok(text, add_special_tokens=False)["input_ids"]
         x = torch.tensor([ids], device="cuda")
         with torch.no_grad():
-            g = model.generate(x, max_new_tokens=N, do_sample=False, temperature=None, top_p=None, top_k=None)[0, len(ids):].tolist()
+            if not given:
+                g = model.generate(x, max_new_tokens=N, do_sample=False, temperature=None, top_p=None, top_k=None)[0, len(ids):].tolist()
             full = torch.tensor([ids + g], device="cuda")
             lp = torch.log_softmax(model(full).logits[0, len(ids) - 1:-1].float(), -1)
         top = lp.topk(5, -1)
@@ -73,9 +131,14 @@ def compare(ref_path, ours_path):
 
 
 if __name__ == "__main__":
+    adapter = None
+    if "--adapter" in sys.argv:
+        i = sys.argv.index("--adapter")
+        adapter = sys.argv[i + 1]
+        del sys.argv[i:i + 2]
     if sys.argv[1] == "long":
-        reference(sys.argv[2], sys.argv[3], 96, long_prompts)
+        reference(sys.argv[2], sys.argv[3], 96, long_prompts, adapter)
     elif sys.argv[1] == "reference":
-        reference(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 48)
+        reference(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 48, adapter=adapter)
     else:
         compare(sys.argv[2], sys.argv[3])

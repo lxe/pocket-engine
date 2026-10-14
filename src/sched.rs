@@ -18,12 +18,22 @@ pub enum Finish {
 #[derive(Debug)]
 pub enum Event {
     Token(u32),
+    /// Log-probabilities of the token the next `Token` carries, for
+    /// requests that ask for them.
+    Logprobs(TokenLogprobs),
     Done {
         finish: Finish,
         prompt_tokens: usize,
         completion_tokens: usize,
     },
     Error(String),
+}
+
+/// A token's log-probability and the most likely tokens at its position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprobs {
+    pub logprob: f32,
+    pub top: Vec<(u32, f32)>,
 }
 
 /// How the next token is picked. Temperature 0 is greedy. Penalties and
@@ -78,6 +88,13 @@ pub struct Request {
     /// Rotary positions of the prompt's tokens and the offset after it, when
     /// they differ from the token index (prompts with images).
     pub rope: Option<crate::image::Rope>,
+    /// The LoRA adapter to run with (an id from `Loras`), or 0.
+    pub adapter: u32,
+    /// Log-probabilities to return with each token: the picked one's and
+    /// this many most likely.
+    pub logprobs: Option<usize>,
+    /// A grammar the output must follow (structured output).
+    pub constraint: Option<Box<llguidance::Matcher>>,
 }
 
 impl Request {
@@ -94,6 +111,9 @@ impl Request {
             tx,
             images: Vec::new(),
             rope: None,
+            adapter: 0,
+            logprobs: None,
+            constraint: None,
         }
     }
 }
@@ -115,6 +135,15 @@ pub struct Scored {
 pub struct Seq {
     pub req: Request,
     slot: usize,
+    /// The GPU slot holding its adapter, or 0.
+    lora: usize,
+    /// The grammar's allowed tokens for this step's pick, when constrained.
+    mask: Option<llguidance::toktrie::SimpleVob>,
+    /// The prompt-lookup index, when drafts come from it.
+    ngrams: Option<Box<Ngrams>>,
+    /// Whether `drafts` are a guess (a lookup match or the draft layer's)
+    /// rather than filler.
+    guessed: bool,
     /// Draft tokens to verify next step (multi-token prediction).
     drafts: Vec<u32>,
     /// While verifying drafts: the slot to keep the state in after each fed
@@ -159,6 +188,17 @@ impl Seq {
     /// Whether a row feeding `n` tokens verifies drafts.
     fn verifies(&self, n: usize) -> bool {
         !self.in_prompt() && n > 1
+    }
+    /// Up to `k` tokens that followed the last earlier occurrence of the
+    /// current suffix.
+    fn lookup(&self, k: usize) -> Vec<u32> {
+        let (Some(g), total) = (&self.ngrams, self.total()) else {
+            return Vec::new();
+        };
+        let Some(end) = g.matched else {
+            return Vec::new();
+        };
+        (end..(end + k).min(total)).map(|i| self.token(i)).collect()
     }
 }
 
@@ -230,6 +270,10 @@ pub struct Step {
     /// state slot). The recurrence keeps its state at the prefix's end, which
     /// falls on its chunk grid, so the prompt need not stop there.
     snaps: Vec<(usize, usize, usize)>,
+    /// Adapters to copy into GPU slots before the step: (slot, adapter).
+    pub lora_loads: Vec<(usize, u32)>,
+    /// Kernel tiles of the step's tokens that have adapters.
+    pub lora_tiles: usize,
 }
 
 impl Step {
@@ -280,6 +324,7 @@ pub const CACHE_UNIT: usize = 64;
 /// A cached prompt prefix: its tokens, the KV blocks that hold their keys
 /// and values, and a state slot holding the recurrent state after them.
 struct Entry {
+    adapter: u32,
     tokens: Vec<u32>,
     blocks: Vec<u32>,
     snap: usize,
@@ -297,11 +342,11 @@ struct Prefixes {
 }
 
 /// Chained hashes of a prompt's whole units: element k covers tokens
-/// [0, (k + 1) * CACHE_UNIT).
-fn unit_hashes(tokens: &[u32]) -> Vec<u64> {
+/// [0, (k + 1) * CACHE_UNIT). Prompts for different adapters never share.
+fn unit_hashes(adapter: u32, tokens: &[u32]) -> Vec<u64> {
     use std::hash::{Hash, Hasher};
     let mut out = Vec::with_capacity(tokens.len() / CACHE_UNIT);
-    let mut h = 0u64;
+    let mut h = adapter as u64;
     for unit in tokens.as_chunks::<CACHE_UNIT>().0 {
         let mut st = std::collections::hash_map::DefaultHasher::new();
         h.hash(&mut st);
@@ -312,8 +357,100 @@ fn unit_hashes(tokens: &[u32]) -> Vec<u64> {
     out
 }
 
+/// Prompt lookup: for each n-gram of 2 to 4 tokens, where its latest
+/// occurrence in the prompt and output so far ended, kept as tokens arrive.
+/// A suffix seen before proposes the tokens that followed it.
+#[derive(Default)]
+struct Ngrams {
+    ends: [HashMap<u64, usize>; NGRAM_MAX - NGRAM_MIN + 1],
+    tail: Vec<u32>,
+    /// Where the longest earlier occurrence of the current suffix ended.
+    matched: Option<usize>,
+    len: usize,
+    /// Running average of lookup drafts accepted per verification, and
+    /// steps since the last real guess: matches that keep failing (common
+    /// words in repetitive text) stop counting as guesses, with a retry
+    /// every few steps.
+    hit: f32,
+    idle: u32,
+}
+
+/// Accepted lookup drafts per step below which matches stop counting.
+const NGRAM_MIN_HIT: f32 = 0.5;
+const NGRAM_RETRY: u32 = 16;
+
+const NGRAM_MIN: usize = 2;
+const NGRAM_MAX: usize = 4;
+
+impl Ngrams {
+    fn push(&mut self, tok: u32) {
+        self.tail.push(tok);
+        if self.tail.len() > NGRAM_MAX {
+            self.tail.remove(0);
+        }
+        self.len += 1;
+        self.matched = None;
+        for n in (NGRAM_MIN..=NGRAM_MAX).rev() {
+            if self.tail.len() < n {
+                continue;
+            }
+            let h = self.tail[self.tail.len() - n..]
+                .iter()
+                .fold(n as u64, |h, &t| {
+                    (h ^ t as u64).wrapping_mul(0x100_0000_01b3)
+                });
+            let prev = self.ends[n - NGRAM_MIN].insert(h, self.len);
+            if self.matched.is_none() {
+                self.matched = prev;
+            }
+        }
+    }
+}
+
+/// Which adapter each GPU slot holds (index 0 unused), how many running
+/// sequences use it, and when it was last placed.
+#[derive(Default)]
+struct LoraSlots {
+    held: Vec<Option<u32>>,
+    refs: Vec<usize>,
+    used: Vec<u64>,
+    clock: u64,
+    /// Adapters to copy into slots before the next step.
+    loads: Vec<(usize, u32)>,
+}
+
+impl LoraSlots {
+    fn holding(&self, a: u32) -> Option<usize> {
+        (1..self.held.len()).find(|&i| self.held[i] == Some(a))
+    }
+    fn can_place(&self, a: u32) -> bool {
+        self.holding(a).is_some() || (1..self.held.len()).any(|i| self.refs[i] == 0)
+    }
+    /// The slot for adapter `a`: the one holding it, or a free one (empty
+    /// first, then least recently used), queued for upload.
+    fn place(&mut self, a: u32) -> usize {
+        self.clock += 1;
+        let i = match self.holding(a) {
+            Some(i) => i,
+            None => {
+                let i = (1..self.held.len())
+                    .filter(|&i| self.refs[i] == 0)
+                    .min_by_key(|&i| (self.held[i].is_some(), self.used[i]))
+                    .expect("checked by can_place");
+                self.held[i] = Some(a);
+                self.loads.push((i, a));
+                i
+            }
+        };
+        self.refs[i] += 1;
+        self.used[i] = self.clock;
+        i
+    }
+}
+
 pub struct Scheduler {
     meta: Meta,
+    lora: LoraSlots,
     image_token: u32,
     pool_free: Vec<(usize, usize)>,
     pool_rows: usize,
@@ -331,6 +468,8 @@ pub struct Scheduler {
     pending_copies: Vec<(usize, usize)>,
     /// Most tokens a step verifying drafts may feed.
     verify_rows: usize,
+    /// Drafts from prompt lookup (`--ngram`).
+    ngram: bool,
     waiting: VecDeque<Seq>,
     running: Vec<Seq>,
     eos: Vec<u32>,
@@ -377,8 +516,10 @@ impl Scheduler {
             block_refs: vec![0; blocks],
             total_blocks: blocks,
             prefixes: Prefixes::default(),
+            lora: LoraSlots::default(),
             pending_copies: Vec::new(),
             verify_rows: VERIFY_ROWS,
+            ngram: false,
             waiting: VecDeque::new(),
             running: Vec::new(),
             eos,
@@ -396,6 +537,51 @@ impl Scheduler {
     pub fn with_verify_rows(mut self, rows: usize) -> Self {
         self.verify_rows = rows;
         self
+    }
+
+    /// Drafts from prompt lookup: the tokens after the latest earlier
+    /// occurrence of a sequence's last 2 to 4 tokens.
+    pub fn with_ngram(mut self) -> Self {
+        self.ngram = true;
+        self
+    }
+
+    /// Lets requests run adapters, `slots` of them on the GPU at once.
+    pub fn with_lora_slots(mut self, slots: usize) -> Self {
+        self.lora = LoraSlots {
+            held: vec![None; slots + 1],
+            refs: vec![0; slots + 1],
+            used: vec![0; slots + 1],
+            ..Default::default()
+        };
+        self
+    }
+
+    /// Whether a running or waiting request uses adapter `a`.
+    pub fn uses_adapter(&self, a: u32) -> bool {
+        self.running
+            .iter()
+            .chain(&self.waiting)
+            .any(|s| s.req.adapter == a)
+    }
+
+    /// Forgets adapter `a`'s slot and cache entries once it is unloaded.
+    pub fn forget_adapter(&mut self, a: u32) {
+        if let Some(i) = self.lora.holding(a) {
+            self.lora.held[i] = None;
+        }
+        let gone: Vec<u64> = self
+            .prefixes
+            .entries
+            .iter()
+            .filter(|(_, e)| e.adapter == a)
+            .map(|(&h, _)| h)
+            .collect();
+        for h in gone {
+            let e = self.prefixes.entries.remove(&h).expect("present");
+            self.unref_blocks(&e.blocks);
+            self.prefixes.free_snaps.push(e.snap);
+        }
     }
 
     pub fn with_prefix_cache(mut self, slots: std::ops::Range<usize>, turn: u32) -> Self {
@@ -459,6 +645,10 @@ impl Scheduler {
         self.waiting.push_back(Seq {
             req,
             slot: 0,
+            lora: 0,
+            mask: None,
+            ngrams: None,
+            guessed: false,
             drafts: Vec::new(),
             outs: Vec::new(),
             blocks: Vec::new(),
@@ -477,10 +667,17 @@ impl Scheduler {
     }
 
     fn admit(&mut self) {
+        // Requests whose adapter cannot get a GPU slot yet wait; those after
+        // them may still start.
+        let mut at = 0;
         while self.running.len() < self.meta.max_seqs {
-            let Some(seq) = self.waiting.front() else {
+            let Some(seq) = self.waiting.get(at) else {
                 break;
             };
+            if seq.req.adapter != 0 && !self.lora.can_place(seq.req.adapter) {
+                at += 1;
+                continue;
+            }
             let total_blocks = (seq.req.prompt.len() + seq.req.max_new).div_ceil(BLOCK_SIZE);
             let rows: usize = seq.req.images.iter().map(Image::tokens).sum();
             // Text prompts may reuse and leave cached prefixes; prompts with
@@ -488,7 +685,7 @@ impl Scheduler {
             let cacheable = rows == 0
                 && (!self.prefixes.free_snaps.is_empty() || !self.prefixes.entries.is_empty());
             let hit = if cacheable {
-                self.lookup(&seq.req.prompt)
+                self.lookup(seq.req.adapter, &seq.req.prompt)
             } else {
                 None
             };
@@ -524,7 +721,10 @@ impl Scheduler {
             {
                 break;
             }
-            let mut seq = self.waiting.pop_front().expect("front exists");
+            let mut seq = self.waiting.remove(at).expect("checked above");
+            if seq.req.adapter != 0 {
+                seq.lora = self.lora.place(seq.req.adapter);
+            }
             if let Some(i) = pool_at {
                 let (start, len) = self.pool_free[i];
                 if len == rows {
@@ -581,6 +781,16 @@ impl Scheduler {
                 }
             }
             seq.admitted = Instant::now();
+            if self.ngram && seq.forced.is_none() {
+                let mut g = Box::new(Ngrams {
+                    hit: 1.0,
+                    ..Default::default()
+                });
+                for &t in &seq.req.prompt {
+                    g.push(t);
+                }
+                seq.ngrams = Some(g);
+            }
             if seq.req.sampling.repetition_penalty != 1.0 {
                 seq.prompt_tokens = seq.req.prompt.iter().copied().collect();
             }
@@ -619,20 +829,24 @@ impl Scheduler {
 
     /// The longest cached prefix of `prompt` that leaves at least one token to
     /// compute: its hash and length.
-    fn lookup(&self, prompt: &[u32]) -> Option<(u64, usize)> {
-        let hashes = unit_hashes(&prompt[..prompt.len() - 1]);
+    fn lookup(&self, adapter: u32, prompt: &[u32]) -> Option<(u64, usize)> {
+        let hashes = unit_hashes(adapter, &prompt[..prompt.len() - 1]);
         hashes.iter().enumerate().rev().find_map(|(k, h)| {
             let len = (k + 1) * CACHE_UNIT;
             self.prefixes
                 .entries
                 .get(h)
-                .filter(|e| e.tokens[..] == prompt[..len])
+                .filter(|e| e.adapter == adapter && e.tokens[..] == prompt[..len])
                 .map(|_| (*h, len))
         })
     }
 
     fn release(&mut self, mut seq: Seq) -> Seq {
         self.free_slots.push(seq.slot);
+        if seq.lora != 0 {
+            self.lora.refs[seq.lora] -= 1;
+            seq.lora = 0;
+        }
         let blocks = std::mem::take(&mut seq.blocks);
         self.unref_blocks(&blocks);
         self.release_pool(&mut seq);
@@ -700,7 +914,15 @@ impl Scheduler {
         // still bound by reading the weights: all of them, so the step can
         // replay a graph, or none.
         let drafting = self.running.iter().filter(|s| !s.drafts.is_empty()).count();
+        // Filler drafts only keep steps uniform, and verifying saves a state
+        // per draft, so verify only when at least half the drafts are guesses.
+        let guessed = self
+            .running
+            .iter()
+            .filter(|s| s.guessed && !s.drafts.is_empty())
+            .count();
         let verify = drafting > 0
+            && 2 * guessed >= drafting
             && self.free_slots.len() >= drafting * (self.meta.spec - 1)
             && drafting * self.meta.spec <= self.verify_rows;
         let mut budget = self.meta.max_tokens;
@@ -754,19 +976,60 @@ impl Scheduler {
                 }
                 self.running[ri].snap_at.remove(0);
                 let prefix = self.running[ri].req.prompt[..at].to_vec();
-                if let Some(slot) = self.reserve_snap(&prefix) {
+                if let Some(slot) = self.reserve_snap(self.running[ri].req.adapter, &prefix) {
                     step.snaps.push((si, at, slot));
                 }
             }
         }
+        // Grammar masks for constrained rows whose pick is a token, on all
+        // cores (each takes tens of microseconds). On a grammar error `fill`
+        // allows nothing and the token's check in `finish` reports it.
+        let picks: HashSet<usize> = step
+            .rows
+            .iter()
+            .filter(|&&(ri, n)| {
+                let s = &self.running[ri];
+                s.req.constraint.is_some() && s.fed + n >= s.total()
+            })
+            .map(|&(ri, _)| ri)
+            .collect();
+        if !picks.is_empty() {
+            use rayon::prelude::*;
+            let mut todo: Vec<&mut Seq> = self
+                .running
+                .iter_mut()
+                .enumerate()
+                .filter(|(ri, _)| picks.contains(ri))
+                .map(|(_, s)| s)
+                .collect();
+            let mask = |s: &mut &mut Seq| {
+                s.mask = s
+                    .req
+                    .constraint
+                    .as_mut()
+                    .and_then(|m| m.compute_mask().ok());
+            };
+            if todo.len() > 2 {
+                todo.par_iter_mut().for_each(mask);
+            } else {
+                todo.iter_mut().for_each(mask);
+            }
+        }
         step.copies = std::mem::take(&mut self.pending_copies);
+        step.lora_loads = std::mem::take(&mut self.lora.loads);
+        step.lora_tiles = step
+            .rows
+            .iter()
+            .filter(|&&(ri, _)| self.running[ri].lora != 0)
+            .map(|&(_, n)| n.div_ceil(crate::lora::TILE))
+            .sum();
         Some(step)
     }
 
     /// A free snapshot slot for a new cache entry of `prefix`, evicting the
     /// least recently used entry if needed; None if the entry exists.
-    fn reserve_snap(&mut self, prefix: &[u32]) -> Option<usize> {
-        let h = *unit_hashes(prefix).last()?;
+    fn reserve_snap(&mut self, adapter: u32, prefix: &[u32]) -> Option<usize> {
+        let h = *unit_hashes(adapter, prefix).last()?;
         if self.prefixes.entries.contains_key(&h) {
             return None;
         }
@@ -780,7 +1043,8 @@ impl Scheduler {
     /// entry whose state is (or will be, before the next step) in `snap`.
     fn add_entry(&mut self, ri: usize, len: usize, snap: usize) {
         let s = &self.running[ri];
-        let Some(&h) = unit_hashes(&s.req.prompt[..len]).last() else {
+        let adapter = s.req.adapter;
+        let Some(&h) = unit_hashes(adapter, &s.req.prompt[..len]).last() else {
             self.prefixes.free_snaps.push(snap);
             return;
         };
@@ -793,6 +1057,7 @@ impl Scheduler {
         self.prefixes.entries.insert(
             h,
             Entry {
+                adapter,
                 tokens,
                 blocks,
                 snap,
@@ -803,10 +1068,19 @@ impl Scheduler {
 
     /// Writes the step's batch metadata (see [`Meta`]) into `m`, and the
     /// rows' logit adjustments into `pen`. Returns the number of adjustments.
-    pub fn fill(&self, step: &Step, m: &mut [i32], pen: &mut Pen) -> usize {
+    pub fn fill(
+        &self,
+        step: &Step,
+        m: &mut [i32],
+        pen: &mut Pen,
+        masks: &mut [u32],
+    ) -> (usize, usize) {
         let me = &self.meta;
         let mut t = 0;
         let mut e = 0;
+        let mut tiles = 0;
+        let mut nmask = 0;
+        let words = masks.len() / me.max_seqs.max(1);
         m[me.cu()] = 0;
         m[me.pen_cu()] = 0;
         m[me.ocu()] = 0;
@@ -819,6 +1093,15 @@ impl Scheduler {
                 (Some((start, _)), Some(&r)) if r >= 0 => start as i32 + r,
                 _ => -1,
             };
+            if s.lora != 0 {
+                for k in (0..n).step_by(crate::lora::TILE) {
+                    let at = me.lora() + 1 + 3 * tiles;
+                    m[at] = (t + k) as i32;
+                    m[at + 1] = (n - k).min(crate::lora::TILE) as i32;
+                    m[at + 2] = s.lora as i32;
+                    tiles += 1;
+                }
+            }
             for k in 0..n {
                 let p = s.fed + k;
                 m[me.ids() + t] = if verifies && k > 0 {
@@ -861,6 +1144,20 @@ impl Scheduler {
             }
             let nout = if verifies { n } else { 1 };
             m[me.ocu() + si + 1] = (o0 + nout) as i32;
+            for j in 0..nout {
+                m[me.masks() + o0 + j] = -1;
+            }
+            // A constrained sequence never verifies drafts: one output row.
+            if let Some(v) = &s.mask {
+                masks[nmask * words..(nmask + 1) * words].copy_from_slice(&v.as_slice()[..words]);
+                m[me.masks() + o0] = nmask as i32;
+                nmask += 1;
+            } else if s.req.constraint.is_some() && s.fed + n >= s.total() {
+                // The grammar failed: allow nothing; `finish` reports it.
+                masks[nmask * words..(nmask + 1) * words].fill(0);
+                m[me.masks() + o0] = nmask as i32;
+                nmask += 1;
+            }
             let sp = &s.req.sampling;
             for j in 0..nout {
                 let o = o0 + j;
@@ -889,7 +1186,31 @@ impl Scheduler {
                 *dst = b as i32;
             }
         }
-        e
+        m[me.lora()] = tiles as i32;
+        (e, nmask)
+    }
+
+    /// How many of `step`'s first rows feed one token or verify drafts:
+    /// the linear attention takes them token by token, the rest in chunks.
+    pub fn head_rows(&self, step: &Step) -> usize {
+        step.rows
+            .iter()
+            .take_while(|&&(ri, n)| n == 1 || self.running[ri].verifies(n))
+            .count()
+    }
+
+    /// Output rows of `step` whose requests want log-probabilities, and how
+    /// many top tokens each wants.
+    pub fn logprob_rows(&self, step: &Step) -> Vec<(usize, usize)> {
+        step.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(si, &(ri, n))| {
+                let s = &self.running[ri];
+                let k = s.req.logprobs?;
+                (s.fed + n >= s.total() && s.forced.is_none()).then_some((step.outs_at[si], k))
+            })
+            .collect()
     }
 
     /// Writes padding sequences [from, to) for a graph replay, of `n`
@@ -902,6 +1223,7 @@ impl Scheduler {
             m[me.cu()] = 0;
             m[me.pen_cu()] = 0;
             m[me.ocu()] = 0;
+            m[me.lora()] = 0;
         }
         for i in from..to {
             for k in 0..n {
@@ -918,6 +1240,7 @@ impl Scheduler {
                 m[me.mtp_ids() + t] = -(t as i32) - 1;
                 m[me.mtp_src() + t] = -1;
                 m[me.last() + t] = t as i32;
+                m[me.masks() + t] = -1;
                 m[me.temps() + t] = 0;
                 m[me.seeds() + t] = 0;
                 m[me.top_ks() + t] = 0;
@@ -958,6 +1281,7 @@ impl Scheduler {
         picked: &[u32],
         drafts: Option<&[i32]>,
         mut scored: Vec<Option<Scored>>,
+        logprobs: &mut [Option<TokenLogprobs>],
     ) -> Vec<Seq> {
         self.counters.steps += 1;
         for &(si, len, snap) in &step.snaps {
@@ -986,6 +1310,11 @@ impl Scheduler {
                     }
                 }
                 s.outs.clear();
+                if let Some(g) = s.ngrams.as_mut()
+                    && s.guessed
+                {
+                    g.hit = 0.7 * g.hit + 0.3 * j as f32;
+                }
                 (j + 1, picked[o0..=o0 + j].to_vec())
             } else {
                 (n, vec![picked[o0]])
@@ -1014,7 +1343,8 @@ impl Scheduler {
                 continue; // mid-prompt chunk: its pick is not a token yet
             }
             let mut finished = false;
-            for pick in toks {
+            s.mask = None;
+            for (j, pick) in toks.into_iter().enumerate() {
                 let tok = match &s.forced {
                     Some(f) => {
                         if let Some(sc) = scored.get_mut(si).and_then(Option::take) {
@@ -1024,13 +1354,40 @@ impl Scheduler {
                     }
                     None => pick,
                 };
-                let stop = s.forced.is_none() && self.eos.contains(&tok);
+                let mut stop = s.forced.is_none() && self.eos.contains(&tok);
+                if let Some(m) = s.req.constraint.as_mut() {
+                    if stop {
+                        // The end of text ends the grammar too; it must be complete.
+                        if !m.is_accepting().unwrap_or(false) {
+                            let _ = s.req.tx.send(Event::Error(
+                                "the output does not complete the requested format".into(),
+                            ));
+                            finished = true;
+                            break;
+                        }
+                    } else if m.consume_token(tok).is_err() {
+                        let _ = s.req.tx.send(Event::Error(format!(
+                            "structured output failed: {}",
+                            m.get_error().unwrap_or_default()
+                        )));
+                        finished = true;
+                        break;
+                    }
+                }
                 if !stop {
                     s.generated.push(tok);
+                    if let Some(g) = s.ngrams.as_mut() {
+                        g.push(tok);
+                    }
                     if s.req.sampling.adjusts_logits() {
                         *s.counts.entry(tok).or_default() += 1;
                     }
+                    if let Some(lp) = logprobs.get_mut(o0 + j).and_then(Option::take) {
+                        let _ = s.req.tx.send(Event::Logprobs(lp));
+                    }
                     let _ = s.req.tx.send(Event::Token(tok));
+                    // A grammar that admits nothing more ends the output.
+                    stop = s.req.constraint.as_ref().is_some_and(|m| m.is_stopped());
                 }
                 if stop || s.generated.len() >= s.req.max_new {
                     let _ = s.req.tx.send(Event::Done {
@@ -1044,14 +1401,44 @@ impl Scheduler {
             }
             if finished {
                 done.push(ri);
-            } else if let Some(d) = drafts
-                && self.meta.spec > 1
+            } else if self.meta.spec > 1
                 && s.forced.is_none()
                 && !s.req.sampling.adjusts_logits()
+                && s.req.logprobs.is_none()
+                && s.req.constraint.is_none()
             {
+                // A full prompt-lookup match first, then the draft layer's
+                // guesses; without either, the lookup's partial match or the
+                // last token stand in, so every row verifies a full set and
+                // the step can replay a graph.
+                let k = self.meta.spec - 1;
                 let n = step.rows.len();
-                s.drafts
-                    .extend((0..self.meta.spec - 1).map(|k| d[k * n + si] as u32));
+                let mtp = drafts.map(|d| (0..k).map(|j| d[j * n + si] as u32).collect::<Vec<_>>());
+                let mut found = if self.ngram { s.lookup(k) } else { Vec::new() };
+                if let Some(g) = s.ngrams.as_mut()
+                    && !found.is_empty()
+                {
+                    g.idle += 1;
+                    if g.hit < NGRAM_MIN_HIT && g.idle < NGRAM_RETRY {
+                        found.clear();
+                    } else {
+                        g.idle = 0;
+                    }
+                }
+                s.guessed = mtp.is_some() || !found.is_empty();
+                s.drafts = match mtp {
+                    Some(m) if found.len() < k => m,
+                    _ if self.ngram => {
+                        let mut d = found;
+                        let fill = d
+                            .last()
+                            .copied()
+                            .unwrap_or(*s.generated.last().unwrap_or(&0));
+                        d.resize(k, fill);
+                        d
+                    }
+                    _ => Vec::new(),
+                };
             }
         }
         done.sort_unstable_by(|a, b| b.cmp(a));
@@ -1069,7 +1456,7 @@ impl Scheduler {
     fn keep_prefix(&mut self, ri: usize) {
         let len = self.running[ri].fed;
         let prefix = self.running[ri].req.prompt[..len].to_vec();
-        if let Some(snap) = self.reserve_snap(&prefix) {
+        if let Some(snap) = self.reserve_snap(self.running[ri].req.adapter, &prefix) {
             self.pending_copies.push((self.running[ri].slot, snap));
             self.add_entry(ri, len, snap);
         }
@@ -1116,6 +1503,7 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 Event::Token(t) => out.push(t),
+                Event::Logprobs(_) => {}
                 Event::Done { finish: f, .. } => finish = Some(f),
                 Event::Error(e) => panic!("{e}"),
             }
@@ -1127,9 +1515,9 @@ mod tests {
     fn step(s: &mut Scheduler, pick: u32) -> (usize, usize, Vec<Seq>) {
         let step = s.plan().expect("work");
         let mut m = vec![0; s.meta.words()];
-        s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]), &mut []);
         let (t, n) = (step.tokens, step.seqs());
-        let done = s.finish(step, &vec![pick; n], None, Vec::new());
+        let done = s.finish(step, &vec![pick; n], None, Vec::new(), &mut []);
         (t, n, done)
     }
 
@@ -1159,10 +1547,10 @@ mod tests {
         let at: Vec<usize> = st.snaps.iter().map(|x| x.1).collect();
         assert_eq!(at, vec![192, 256]);
         let mut m = vec![0; s.meta.words()];
-        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]), &mut []);
         assert_eq!(m[s.meta.snaps()], 192);
         assert_eq!(m[s.meta.snaps() + 2], 256);
-        s.finish(st, &[7], None, Vec::new());
+        s.finish(st, &[7], None, Vec::new(), &mut []);
         let (tx, _rb) = unbounded_channel();
         s.submit(Request::text(ask(2000), 1, Sampling::default(), tx));
         let st = s.plan().expect("work");
@@ -1191,9 +1579,9 @@ mod tests {
         assert_eq!(st.tokens, 150);
         assert_eq!(st.snaps, vec![(0, 128, 5)]);
         let mut m = vec![0; s.meta.words()];
-        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]), &mut []);
         assert_eq!(&m[s.meta.snaps()..s.meta.snaps() + 4], &[128, 5, -1, -1]);
-        s.finish(st, &[7], None, Vec::new());
+        s.finish(st, &[7], None, Vec::new(), &mut []);
         step(&mut s, 7);
         assert_eq!(tokens(&mut ra).0, vec![7, 7]);
         // The finished request's blocks past the prefix are free again; the
@@ -1211,12 +1599,12 @@ mod tests {
         assert_eq!(st.snaps, vec![(0, 192, 6)], "keeping its own boundary");
         assert_eq!(s.counters.cached_tokens, 128);
         let mut m = vec![0; s.meta.words()];
-        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        s.fill(&st, &mut m, &mut Pen::split(&mut [0; 3 * 64]), &mut []);
         // Positions continue after the prefix, in the cache's blocks; the
         // snapshot is 64 tokens into this row.
         assert_eq!(m[s.meta.pos()], 128);
         assert_eq!(m[s.meta.snaps()], 64);
-        s.finish(st, &[3], None, Vec::new());
+        s.finish(st, &[3], None, Vec::new(), &mut []);
         assert_eq!(tokens(&mut rb).0, vec![3]);
         // Both entries hold blocks; the second shares the first's 8.
         assert_eq!(s.load().free_kv_blocks, 64 - 12);
@@ -1257,7 +1645,7 @@ mod tests {
         s.submit(a);
         let step = s.plan().unwrap();
         let mut m = vec![0; s.meta.words()];
-        s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]), &mut []);
         let me = s.meta;
         assert_eq!(step.tokens, 16);
         assert_eq!(&m[me.pos()..me.pos() + 3], &[0, 1, 2]);
@@ -1267,9 +1655,9 @@ mod tests {
         // Tokens 0..16 fill the sequence's first block exactly.
         let first = m[me.block_table()];
         assert_eq!(m[me.slot_map() + 15], first * BLOCK_SIZE as i32 + 15);
-        s.finish(step, &[0], None, Vec::new());
+        s.finish(step, &[0], None, Vec::new(), &mut []);
         let step = s.plan().unwrap();
-        s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        s.fill(&step, &mut m, &mut Pen::split(&mut [0; 3 * 64]), &mut []);
         assert_eq!(m[me.fresh()], 0, "second chunk continues the state");
         assert_eq!(m[me.pos()], 16);
         assert_eq!(
@@ -1331,12 +1719,12 @@ mod tests {
             argmax: 3,
             top: vec![],
         };
-        s.finish(step1, &[3], None, vec![Some(sc)]);
+        s.finish(step1, &[3], None, vec![Some(sc)], &mut []);
         let step2 = s.plan().unwrap();
         let mut m = vec![0; s.meta.words()];
-        s.fill(&step2, &mut m, &mut Pen::split(&mut [0; 3 * 64]));
+        s.fill(&step2, &mut m, &mut Pen::split(&mut [0; 3 * 64]), &mut []);
         assert_eq!(m[s.meta.ids()], 11, "the forced token, not the pick");
-        let done = s.finish(step2, &[4], None, vec![None]);
+        let done = s.finish(step2, &[4], None, vec![None], &mut []);
         assert_eq!(done[0].scored.len(), 1);
         assert_eq!(tokens(&mut ra), (vec![11, 12], Some(Finish::Length)));
     }
@@ -1357,12 +1745,12 @@ mod tests {
         for pick in [7, 7] {
             let step = s.plan().unwrap();
             let mut m = vec![0; s.meta.words()];
-            s.fill(&step, &mut m, &mut Pen::split(&mut words));
-            s.finish(step, &[pick], None, Vec::new());
+            s.fill(&step, &mut m, &mut Pen::split(&mut words), &mut []);
+            s.finish(step, &[pick], None, Vec::new(), &mut []);
         }
         let step = s.plan().unwrap();
         let mut m = vec![0; s.meta.words()];
-        let n = s.fill(&step, &mut m, &mut Pen::split(&mut words));
+        let (n, _) = s.fill(&step, &mut m, &mut Pen::split(&mut words), &mut []);
         // Prompt tokens 1..=3, generated 7 (twice) and the biased 42.
         assert_eq!(n, 5);
         assert_eq!(m[s.meta.pen_cu() + 1], 5);

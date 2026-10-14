@@ -38,6 +38,8 @@ pub struct Linear {
     pub cols: usize,
     /// May take int8 activations (`--int8`).
     pub int8: bool,
+    /// This layer's LoRA descriptor table, when adapters are enabled.
+    pub lora: Option<crate::lora::Hook>,
 }
 
 /// Rows an FP8 matmul runs: Hopper's block-scaled FP8 needs a multiple of 4.
@@ -57,6 +59,8 @@ pub struct Input {
     pub bf16: u64,
     pub fp8: u64,
     pub scales: u64,
+    /// The step's adapter tiles, for layers with a LoRA hook.
+    pub lora: Option<crate::lora::StepLora>,
 }
 
 impl Input {
@@ -65,7 +69,12 @@ impl Input {
             bf16: ptr,
             fp8: 0,
             scales: 0,
+            lora: None,
         }
+    }
+
+    pub fn with_lora(self, lora: Option<crate::lora::StepLora>) -> Self {
+        Self { lora, ..self }
     }
 }
 
@@ -88,9 +97,17 @@ pub struct TiledKernels {
     pub tile: Kernel,
     pub dequant: Kernel,
     pub mma: [Kernel; 4],
-    /// The same tiles against int8 activations, and the most rows they beat
-    /// the bf16 paths at.
-    pub mma8: Option<([Kernel; 4], usize)>,
+    /// The same tiles against int8 activations.
+    pub mma8: Option<Int8Kernels>,
+}
+
+#[derive(Clone)]
+pub struct Int8Kernels {
+    pub tiles: [Kernel; 4],
+    /// The most rows int8 beats the bf16 paths at.
+    pub most: usize,
+    /// 128 x 64 blocks for large batches, their shared memory and threads.
+    pub big: Option<(Kernel, usize, usize)>,
 }
 
 const MMA_TILES: [usize; 4] = [8, 16, 32, 64];
@@ -118,9 +135,7 @@ fn gemv_rows() -> usize {
 }
 /// Rows from which `--int8` takes the int8 path; below, weights dominate and
 /// bf16 is as fast.
-/// On AMD the bf16 tile kernels emulate NVIDIA's mma.sync while the int8 ones
-/// run natively on MFMA, so int8 takes every batch there.
-const INT8_ROWS: usize = if cfg!(feature = "rocm") { 1 } else { 16 };
+const INT8_ROWS: usize = 16;
 pub fn int8_rows() -> usize {
     env_usize("POCKET_INT8_ROWS", INT8_ROWS).max(1)
 }
@@ -152,6 +167,8 @@ pub struct Quants {
     /// kernels before dequantizing to bf16 for cuBLAS.
     int8_max: usize,
     dense_rows: usize,
+    /// Rows from which int8 takes the 128 x 64 block kernels.
+    big_rows: usize,
 }
 
 /// Widest input the int8 activation buffer holds.
@@ -175,15 +192,21 @@ impl Quants {
     fn tune(&mut self, arch: u32) {
         if arch == 94 {
             // AMD gfx942 (bench-linear on an MI325X, 9B's Q4_K and Q6_K
-            // matrices): the int8 MFMA tiles lead below 16 rows; from 16 on,
-            // dequantizing to bf16 for hipBLASLt is faster (at 256 rows 109
-            // against 288 us), and the bf16 tiles emulate mma.sync.
-            self.int8_max = env_usize("POCKET_INT8_MAX_ROWS", 15);
-            self.dense_rows = env_usize("POCKET_DENSE_ROWS", 15);
+            // matrices): dequantizing to bf16 for hipBLASLt (or the skinny
+            // kernel) wins from 16 rows (at 256, 109 against the int8 MFMA
+            // tiles' 288 us) and ties below (47 against 50 us at one row);
+            // the bf16 tiles emulate mma.sync. One path for every batch also
+            // keeps activations bf16 throughout, as the prefix cache's
+            // differently split runs need.
+            self.int8_max = env_usize("POCKET_INT8_MAX_ROWS", 0);
+            self.dense_rows = env_usize("POCKET_DENSE_ROWS", 0);
+            // qbig8 has no native AMD version yet.
+            self.big_rows = usize::MAX;
             return;
         }
         let dc = datacenter(arch);
         self.int8_max = env_usize("POCKET_INT8_MAX_ROWS", if dc { 48 } else { 4096 });
+        self.big_rows = env_usize("POCKET_INT8_BIG_ROWS", 128);
         self.dense_rows = env_usize("POCKET_DENSE_ROWS", if dc { 112 } else { DENSE_ROWS });
     }
 
@@ -231,7 +254,28 @@ impl Quants {
                                 k.push(gpu.kernel(&format!("qtile8_{name}_{t}"))?);
                             }
                             let most = if name == "q6_k" { 640 } else { usize::MAX };
-                            Some((k.try_into().unwrap_or_else(|_| unreachable!()), most))
+                            let big = match name {
+                                "q6_k" => None,
+                                _ => {
+                                    // Formats with more decoding per weight do better
+                                    // with 4 warps of 64 tokens than 8 of 32.
+                                    let wm = match name {
+                                        "q4_0" | "q4_k" => 2,
+                                        _ => 1,
+                                    };
+                                    let wm = env_usize("POCKET_QBIG_WM", wm);
+                                    let k = gpu.kernel(&format!("qbig8_{name}_{wm}"))?;
+                                    let chunk = ty.tile_chunk().expect("tiled");
+                                    let smem = 2 * (8 * chunk + 64 * 320 + (10 + 8) * 64 * 4);
+                                    gpu.set_smem(k, smem)?;
+                                    Some((k, smem, 128 * wm))
+                                }
+                            };
+                            Some(Int8Kernels {
+                                tiles: k.try_into().unwrap_or_else(|_| unreachable!()),
+                                most,
+                                big,
+                            })
                         }
                         _ => None,
                     },
@@ -279,7 +323,7 @@ impl Quants {
             .kernels
             .values()
             .any(|k| k.tiled.as_ref().is_some_and(|t| t.mma8.is_some()));
-        if self.int8_rows > 0 && int8 && self.act8.is_none() {
+        if self.int8_rows > 0 && self.int8_max > 0 && int8 && self.act8.is_none() {
             let rows = self.int8_max.next_multiple_of(64);
             let bytes = rows * ACT8_COLS + ACT8_COLS / 32 * rows * 8;
             self.act8 = Some((gpu.kernel("quant_act8")?, gpu.alloc(bytes)?));
@@ -330,6 +374,9 @@ impl Linear {
         use Arg::{I, P};
         let x = input.bf16;
         let elem = if f32_out { 4 } else { 2 };
+        if let (Some(h), Some(l)) = (self.lora, input.lora) {
+            self.lora_shrink(gpu, h, l, x, rows)?;
+        }
         // int8 activations, quantized once for all of this layer's parts.
         let int8 = self.int8
             && q.act8.is_some()
@@ -341,8 +388,7 @@ impl Linear {
                 .loaded(ty)
                 .and_then(|k| k.tiled.as_ref())
                 .and_then(|t| t.mma8.as_ref())
-                .filter(|(_, most)| rows <= *most)
-                .map(|(k, _)| k),
+                .filter(|k| rows <= k.most),
             _ => None,
         };
         let act8 = match &q.act8 {
@@ -584,6 +630,31 @@ impl Linear {
                             )?;
                             r0 += n;
                         }
+                    } else if let Some(((xq, xs, mp), k8)) = mma8
+                        && rows >= q.big_rows
+                        // At least three blocks for every four SMs.
+                        && 4 * rows.div_ceil(64) * p.rows.div_ceil(128) >= 3 * q.sms
+                        && let Some((big, smem, threads)) = k8.big
+                    {
+                        gpu.launch(
+                            big,
+                            (rows.div_ceil(64) as u32, p.rows.div_ceil(128) as u32, 1),
+                            threads as u32,
+                            smem as u32,
+                            &[
+                                P(p.buf.ptr),
+                                I(p.rows as i32),
+                                I(self.cols as i32),
+                                P(xq),
+                                P(xs),
+                                I(mp as i32),
+                                I(rows as i32),
+                                P(y),
+                                I(ldy as i32),
+                                I(p.off as i32),
+                                I(f32_out as i32),
+                            ],
+                        )?;
                     } else if tiled.is_none() && rows <= gemv_rows() {
                         gpu.launch(
                             k.gemv[rows - 1],
@@ -614,7 +685,7 @@ impl Linear {
                         let ws = q.workspace.as_ref().map_or(0, |b| b.ptr);
                         let (kernel, margs) = match mma8 {
                             Some(((xq, xs, mp), k8)) => (
-                                k8[ti],
+                                k8.tiles[ti],
                                 vec![
                                     P(p.buf.ptr),
                                     I(p.rows as i32),
@@ -667,6 +738,82 @@ impl Linear {
                 }
             }
         }
+        if let (Some(h), Some(l)) = (self.lora, input.lora) {
+            gpu.join()?;
+            self.lora_expand(gpu, h, l, rows, y, ldy, f32_out)?;
+        }
         Ok(())
+    }
+
+    /// The adapters' S = x A^T, on the side stream so it overlaps the
+    /// layer's own matrix multiply.
+    fn lora_shrink(
+        &self,
+        gpu: &Gpu,
+        h: crate::lora::Hook,
+        l: crate::lora::StepLora,
+        x: u64,
+        rows: usize,
+    ) -> Result<()> {
+        use Arg::{I, P};
+        let tiles = l.max_tiles.min(rows) as u32;
+        let rank = h.parts * (l.lds / crate::lora::MAX_PARTS);
+        let s = l.s + h.parity as u64 * l.s_stride;
+        gpu.fork()?;
+        gpu.launch_side(
+            l.shrink,
+            (
+                tiles,
+                rank.div_ceil(32) as u32,
+                self.cols.div_ceil(256) as u32,
+            ),
+            128,
+            0,
+            &[
+                P(x),
+                I(self.cols as i32),
+                I(self.cols as i32),
+                P(l.tiles),
+                P(h.table),
+                P(s),
+                I(l.lds as i32),
+            ],
+        )
+    }
+
+    /// Adds the adapters' S B^T into `y`.
+    #[allow(clippy::too_many_arguments)]
+    fn lora_expand(
+        &self,
+        gpu: &Gpu,
+        h: crate::lora::Hook,
+        l: crate::lora::StepLora,
+        rows: usize,
+        y: u64,
+        ldy: usize,
+        f32_out: bool,
+    ) -> Result<()> {
+        use Arg::{I, P};
+        let tiles = l.max_tiles.min(rows) as u32;
+        let (s, next) = (
+            l.s + h.parity as u64 * l.s_stride,
+            l.s + (1 - h.parity) as u64 * l.s_stride,
+        );
+        gpu.launch(
+            l.expand,
+            (tiles, h.max_rows.div_ceil(128) as u32, h.parts as u32),
+            128,
+            0,
+            &[
+                P(s),
+                I(l.lds as i32),
+                P(next),
+                P(l.tiles),
+                P(h.table),
+                P(y),
+                I(ldy as i32),
+                I(f32_out as i32),
+            ],
+        )
     }
 }

@@ -46,7 +46,7 @@ fn fixture<T: serde::de::DeserializeOwned>(name: &str) -> T {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 struct Pair {
     prompt: Vec<u32>,
     forced: Vec<u32>,
@@ -93,6 +93,7 @@ fn matches_transformers_teacher_forced() {
                     forced: p.forced,
                     images: vec![],
                     rope: None,
+                    adapter: 0,
                 })
                 .collect(),
         )
@@ -232,6 +233,7 @@ fn images_match_transformers() {
             forced: p.forced,
             images,
             rope,
+            adapter: 0,
         });
     }
     let mut e = Engine::new(config(dir)).unwrap();
@@ -307,6 +309,7 @@ fn batching_does_not_change_predictions() {
                 forced: p.forced.clone(),
                 images: vec![],
                 rope: None,
+                adapter: 0,
             })
             .collect()
     };
@@ -381,6 +384,7 @@ fn drafts_keep_the_models_greedy_choices() {
                     forced: o.clone(),
                     images: vec![],
                     rope: None,
+                    adapter: 0,
                 })
                 .collect(),
         )
@@ -469,6 +473,7 @@ fn prefix_cache_reuses_without_changing_output() {
         forced: forced.clone(),
         images: vec![],
         rope: None,
+        adapter: 0,
     };
     let mut plain = Engine::new(big(Some(0))).unwrap();
     let cont = generate(&mut plain, std::slice::from_ref(&second), 16).remove(0);
@@ -540,6 +545,7 @@ fn samplers_follow_the_model_distribution() {
             forced: vec![0],
             images: vec![],
             rope: None,
+            adapter: 0,
         }])
         .unwrap()[0][0]
         .top
@@ -557,6 +563,7 @@ fn samplers_follow_the_model_distribution() {
                     forced: vec![0],
                     images: vec![],
                     rope: None,
+                    adapter: 0,
                 })
                 .collect(),
         )
@@ -718,7 +725,7 @@ fn penalties_reduce_repetition() {
 fn serves_chat_completions() {
     let Some(dir) = model() else { return };
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
-    let (tx, info, health) = engine::spawn(config(dir.clone())).unwrap();
+    let (tx, info, health, _) = engine::spawn(config(dir.clone())).unwrap();
     let tok = ChatTokenizer::load(&dir).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -729,6 +736,7 @@ fn serves_chat_completions() {
             tx,
             info,
             health,
+            None,
             "test".into(),
             bind,
         ));
@@ -787,4 +795,469 @@ fn serves_chat_completions() {
         assert_eq!(usage, Some(8.into()));
         assert!(sse.trim_end().ends_with("data: [DONE]"));
     });
+}
+
+/// Writes a PEFT adapter of rank `r` for every linear layer of the model at
+/// `dir`, with A ~ N(0, 1/cols) and B ~ N(0, `b_std`) from `seed`.
+fn synthetic_adapter(
+    dir: &std::path::Path,
+    out: &std::path::Path,
+    r: usize,
+    b_std: f32,
+    seed: u64,
+) {
+    use pocket_engine::model::{Config, GDN_DIM, HEAD_DIM};
+    let c = Config::for_model(dir).unwrap();
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut normal = move || {
+        // Sum of uniforms: close enough to normal for a test.
+        let mut s = 0.0f32;
+        for _ in 0..4 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            s += (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+        }
+        s * 1.732
+    };
+    let (hk, hv) = (c.lin_k_heads, c.lin_v_heads);
+    let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+    for l in 0..c.layers {
+        let mut mods: Vec<(String, usize, usize)> = if c.attn_layers[l] {
+            vec![
+                ("self_attn.q_proj".into(), c.hidden, 2 * c.hq * HEAD_DIM),
+                ("self_attn.k_proj".into(), c.hidden, c.hkv * HEAD_DIM),
+                ("self_attn.v_proj".into(), c.hidden, c.hkv * HEAD_DIM),
+                ("self_attn.o_proj".into(), c.hq * HEAD_DIM, c.hidden),
+            ]
+        } else {
+            vec![
+                (
+                    "linear_attn.in_proj_qkv".into(),
+                    c.hidden,
+                    (2 * hk + hv) * GDN_DIM,
+                ),
+                ("linear_attn.in_proj_z".into(), c.hidden, hv * GDN_DIM),
+                ("linear_attn.in_proj_b".into(), c.hidden, hv),
+                ("linear_attn.in_proj_a".into(), c.hidden, hv),
+                ("linear_attn.out_proj".into(), hv * GDN_DIM, c.hidden),
+            ]
+        };
+        mods.push(("mlp.gate_proj".into(), c.hidden, c.inter));
+        mods.push(("mlp.up_proj".into(), c.hidden, c.inter));
+        mods.push(("mlp.down_proj".into(), c.inter, c.hidden));
+        for (m, cols, rows) in mods {
+            let k = format!("base_model.model.model.language_model.layers.{l}.{m}");
+            let a: Vec<u8> = (0..r * cols)
+                .flat_map(|_| (normal() / (cols as f32).sqrt()).to_le_bytes())
+                .collect();
+            let b: Vec<u8> = (0..rows * r)
+                .flat_map(|_| (normal() * b_std).to_le_bytes())
+                .collect();
+            tensors.push((format!("{k}.lora_A.weight"), vec![r, cols], a));
+            tensors.push((format!("{k}.lora_B.weight"), vec![rows, r], b));
+        }
+    }
+    std::fs::create_dir_all(out).unwrap();
+    let views: Vec<(String, safetensors::tensor::TensorView)> = tensors
+        .iter()
+        .map(|(n, s, d)| {
+            (
+                n.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, s.clone(), d)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    safetensors::serialize_to_file(views, None, &out.join("adapter_model.safetensors")).unwrap();
+    std::fs::write(
+        out.join("adapter_config.json"),
+        serde_json::json!({ "r": r, "lora_alpha": r, "peft_type": "LORA", "bias": "none" })
+            .to_string(),
+    )
+    .unwrap();
+}
+
+fn scorings(pairs: &[Pair], adapters: &[u32]) -> Vec<Scoring> {
+    pairs
+        .iter()
+        .zip(adapters.iter().cycle())
+        .map(|(p, &adapter)| Scoring {
+            prompt: p.prompt.clone(),
+            forced: p.forced.clone(),
+            images: vec![],
+            rope: None,
+            adapter,
+        })
+        .collect()
+}
+
+fn as_reference(scored: Vec<Vec<pocket_engine::sched::Scored>>) -> Vec<Vec<Reference>> {
+    scored
+        .into_iter()
+        .map(|seq| {
+            seq.into_iter()
+                .map(|s| Reference {
+                    argmax: s.argmax,
+                    top: s.top,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// An adapter whose B is zero leaves every output as the base model's.
+#[test]
+fn lora_zero_adapter_matches_base() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = std::env::temp_dir().join(format!("pocket-lora-zero-{}", std::process::id()));
+    synthetic_adapter(&dir, &tmp, 16, 0.0, 1);
+    let pairs: Vec<Pair> = fixture(&format!("{}.pairs.json", size(&dir)));
+    let mut e = Engine::new(EngineConfig {
+        prefix_cache: Some(0),
+        max_loras: 1,
+        ..config(dir)
+    })
+    .unwrap();
+    let id = e.load_adapter("zero", &tmp).unwrap();
+    let base = e.score(scorings(&pairs, &[0])).unwrap();
+    let zero = e.score(scorings(&pairs, &[id])).unwrap();
+    for (b, z) in base.iter().zip(&zero) {
+        for (x, y) in b.iter().zip(z) {
+            assert_eq!(x.argmax, y.argmax);
+            assert_eq!(x.top, y.top);
+        }
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// Requests for different adapters and the base model in one batch, with
+/// more adapters than GPU slots, score as each does alone; and the adapters
+/// change the outputs.
+#[test]
+fn lora_mixed_batches_match_alone() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = std::env::temp_dir().join(format!("pocket-lora-mix-{}", std::process::id()));
+    for k in 0..3 {
+        synthetic_adapter(&dir, &tmp.join(format!("a{k}")), 8, 0.02, 10 + k);
+    }
+    let pairs: Vec<Pair> = fixture(&format!("{}.pairs.json", size(&dir)));
+    let mut e = Engine::new(EngineConfig {
+        prefix_cache: Some(0),
+        max_loras: 2,
+        max_lora_rank: 8,
+        ..config(dir.clone())
+    })
+    .unwrap();
+    let ids: Vec<u32> = (0..3)
+        .map(|k| {
+            e.load_adapter(&format!("a{k}"), &tmp.join(format!("a{k}")))
+                .unwrap()
+        })
+        .collect();
+    // Each prompt with each choice, alone, then all of them in one batch.
+    let choices = [ids[0], ids[1], 0, ids[2]];
+    let mut alone = Vec::new();
+    let mut mixed = Vec::new();
+    for (i, p) in pairs.iter().enumerate() {
+        let a = choices[i % choices.len()];
+        alone.extend(as_reference(
+            e.score(scorings(std::slice::from_ref(p), &[a])).unwrap(),
+        ));
+        mixed.push(a);
+    }
+    let together = e.score(scorings(&pairs, &mixed)).unwrap();
+    if fp8() || fp4() || kv_fp8() || (quantized(&dir) && int8()) {
+        close_enough(&alone, &together, 90, 0.03);
+    } else {
+        assert!(agree(&alone, &together) < 0.01);
+    }
+    let base = as_reference(e.score(scorings(&pairs, &[0])).unwrap());
+    let adapted = e.score(scorings(&pairs, &[ids[0]])).unwrap();
+    let moved = base
+        .iter()
+        .zip(&adapted)
+        .flat_map(|(b, a)| b.iter().zip(a))
+        .filter(|(b, a)| b.argmax != a.argmax || (b.top[0].1 - a.top[0].1).abs() > 0.05)
+        .count();
+    assert!(moved > 10, "the adapter moved only {moved} positions");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// With POCKET_ENGINE_LORA naming a PEFT adapter of the model under test and
+/// fixtures `<size>.lora.{pairs,ref}.json` from `scripts/accuracy.py
+/// reference ... --adapter`, outputs match Transformers with the adapter
+/// merged into the weights.
+#[test]
+fn lora_matches_merged_reference() {
+    let Some(dir) = model() else { return };
+    let Some(adapter) = std::env::var_os("POCKET_ENGINE_LORA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    else {
+        eprintln!("POCKET_ENGINE_LORA is not set: skipping");
+        return;
+    };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let pairs: Vec<Pair> = fixture(&format!("{}.lora.pairs.json", size(&dir)));
+    let reference: Vec<Vec<Reference>> = fixture(&format!("{}.lora.ref.json", size(&dir)));
+    let mut e = Engine::new(EngineConfig {
+        max_loras: 1,
+        max_lora_rank: 64,
+        ..config(dir.clone())
+    })
+    .unwrap();
+    let id = e.load_adapter("under-test", &adapter).unwrap();
+    let got = e.score(scorings(&pairs, &[id])).unwrap();
+    if quantized(&dir) || fp4() {
+        close_enough(&reference, &got, 85, 0.1);
+    } else if fp8() || kv_fp8() {
+        close_enough(&reference, &got, 93, 0.03);
+    } else {
+        assert!(agree(&reference, &got) < 0.01);
+    }
+}
+
+/// vLLM's adapter API: load at runtime, list, route by `model`, reject
+/// unknown names, refuse nothing in use, unload.
+#[test]
+fn serves_adapters() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = std::env::temp_dir().join(format!("pocket-lora-http-{}", std::process::id()));
+    // Strong enough to change even a greeting's first tokens.
+    synthetic_adapter(&dir, &tmp, 8, 0.2, 3);
+    let (tx, info, health, adapters) = engine::spawn(EngineConfig {
+        max_loras: 1,
+        ..config(dir.clone())
+    })
+    .unwrap();
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let bind = "127.0.0.1:18198";
+        tokio::spawn(server::serve(
+            tok,
+            None,
+            tx,
+            info,
+            health,
+            Some(adapters),
+            "base".into(),
+            bind,
+        ));
+        let client = reqwest::Client::new();
+        let url = format!("http://{bind}");
+        for _ in 0..100 {
+            if client.get(format!("{url}/health")).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let post = |path: &str, body: serde_json::Value| {
+            client.post(format!("{url}{path}")).json(&body).send()
+        };
+        let r = post(
+            "/v1/load_lora_adapter",
+            serde_json::json!({ "lora_name": "syn", "lora_path": tmp }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+        let models: serde_json::Value = client
+            .get(format!("{url}/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ids: Vec<&str> = models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["base", "syn"]);
+        assert_eq!(models["data"][1]["parent"], "base");
+        let chat = |model: &str| {
+            post(
+                "/v1/chat/completions",
+                serde_json::json!({ "model": model, "max_tokens": 8, "temperature": 0,
+                    "messages": [{ "role": "user", "content": "Hello!" }] }),
+            )
+        };
+        let a: serde_json::Value = chat("syn").await.unwrap().json().await.unwrap();
+        assert_eq!(a["model"], "syn");
+        let b: serde_json::Value = chat("base").await.unwrap().json().await.unwrap();
+        assert_eq!(b["model"], "base");
+        assert_ne!(
+            a["choices"][0]["message"]["content"],
+            b["choices"][0]["message"]["content"]
+        );
+        assert_eq!(chat("nope").await.unwrap().status(), 404);
+        let r = post(
+            "/v1/unload_lora_adapter",
+            serde_json::json!({ "lora_name": "syn" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(chat("syn").await.unwrap().status(), 404);
+    });
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// Log-probabilities streamed with generated tokens match teacher-forced
+/// scoring of the same tokens.
+#[test]
+fn logprobs_match_scoring() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let pairs: Vec<Pair> = fixture(&format!("{}.pairs.json", size(&dir)));
+    let mut e = Engine::new(EngineConfig {
+        prefix_cache: Some(0),
+        ..config(dir)
+    })
+    .unwrap();
+    let prompt = pairs[0].prompt.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut req = Request::text(prompt.clone(), 12, Sampling::default(), tx);
+    req.logprobs = Some(5);
+    e.sched.submit(req);
+    while !e.sched.idle() {
+        e.step().unwrap();
+    }
+    let (mut toks, mut lps) = (Vec::new(), Vec::new());
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            Event::Logprobs(lp) => lps.push(lp),
+            Event::Token(t) => toks.push(t),
+            _ => {}
+        }
+    }
+    assert_eq!(toks.len(), lps.len());
+    let scored = e
+        .score(scorings(
+            &[Pair {
+                prompt,
+                forced: toks.clone(),
+            }],
+            &[0],
+        ))
+        .unwrap();
+    for ((t, lp), sc) in toks.iter().zip(&lps).zip(&scored[0]) {
+        // Greedy: the pick is the most likely token.
+        assert_eq!(lp.top[0].0, *t);
+        assert!((lp.logprob - lp.top[0].1).abs() < 1e-6);
+        assert_eq!(lp.top.len(), 5);
+        assert!(lp.top.windows(2).all(|w| w[0].1 >= w[1].1));
+        // Scoring runs the same continuation in one prompt step.
+        let want = sc.top.iter().find(|x| x.0 == *t).map(|x| x.1).unwrap();
+        assert!((lp.logprob - want).abs() < 0.05, "{} vs {want}", lp.logprob);
+    }
+}
+
+/// OpenAI's structured output and log-probabilities over HTTP.
+#[test]
+fn serves_structured_output() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let (tx, info, health, _) = engine::spawn(config(dir.clone())).unwrap();
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let bind = "127.0.0.1:18199";
+        tokio::spawn(server::serve(tok, None, tx, info, health, None, "m".into(), bind));
+        let client = reqwest::Client::new();
+        let url = format!("http://{bind}");
+        for _ in 0..100 {
+            if client.get(format!("{url}/health")).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let chat = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({ "max_tokens": 160, "temperature": 0.7, "seed": 1,
+                "messages": [{ "role": "user", "content": "Extract the receipt: Joe's Diner, burger and fries, total $14.50." }] });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            client.post(format!("{url}/v1/chat/completions")).json(&body).send()
+        };
+        let schema = serde_json::json!({ "type": "object", "required": ["merchant", "total"],
+            "properties": { "merchant": { "type": "string" }, "total": { "type": "number" } },
+            "additionalProperties": false });
+        let r: serde_json::Value = chat(serde_json::json!({ "response_format":
+            { "type": "json_schema", "json_schema": { "name": "receipt", "schema": schema } } }))
+            .await.unwrap().json().await.unwrap();
+        let out: serde_json::Value = serde_json::from_str(r["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+        assert!(out["merchant"].is_string() && out["total"].is_number(), "{out}");
+        assert_eq!(out.as_object().unwrap().len(), 2);
+        let r: serde_json::Value = chat(serde_json::json!({ "guided_choice": ["cash", "card"] }))
+            .await.unwrap().json().await.unwrap();
+        let c = r["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(c == "cash" || c == "card", "{c}");
+        let r: serde_json::Value = chat(serde_json::json!({ "max_tokens": 4, "logprobs": true, "top_logprobs": 2 }))
+            .await.unwrap().json().await.unwrap();
+        let lp = r["choices"][0]["logprobs"]["content"].as_array().unwrap();
+        assert_eq!(lp.len(), 4);
+        assert_eq!(lp[0]["top_logprobs"].as_array().unwrap().len(), 2);
+        let text: String = lp.iter().map(|e| e["token"].as_str().unwrap()).collect();
+        assert_eq!(text, r["choices"][0]["message"]["content"].as_str().unwrap());
+        let bad = chat(serde_json::json!({ "response_format": { "type": "json_schema", "json_schema": { "schema": { "type": 3 } } } }))
+            .await.unwrap();
+        assert_eq!(bad.status(), 400);
+    });
+}
+
+/// Prompt-lookup drafts on a prompt the output copies from are mostly
+/// accepted, and greedy output stays the model's own.
+#[test]
+fn ngram_drafts_keep_the_models_greedy_choices() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let text = "The quick brown fox jumps over the lazy dog near the riverbank at dawn, while three herons wait in the reeds and a fisherman counts his nets. ".repeat(3);
+    let (prompt, _) = tok
+        .chat(&[serde_json::json!({ "role": "user", "content": format!("Repeat this exactly:\\n\\n{text}") })])
+        .unwrap();
+    let mut e = Engine::new(EngineConfig {
+        ngram: 4,
+        ..config(dir.clone())
+    })
+    .unwrap();
+    let out = generate(&mut e, std::slice::from_ref(&prompt), 64).remove(0);
+    let c = e.sched.counters.clone();
+    assert!(
+        c.accepted * 2 > c.drafted && c.accepted > 20,
+        "{} of {} drafts accepted",
+        c.accepted,
+        c.drafted
+    );
+    let scored = e
+        .score(scorings(
+            &[Pair {
+                prompt,
+                forced: out.clone(),
+            }],
+            &[0],
+        ))
+        .unwrap();
+    let worst = out
+        .iter()
+        .zip(&scored[0])
+        .filter(|(t, s)| **t != s.argmax)
+        .map(|(t, s)| {
+            let lp = |x: u32| s.top.iter().find(|y| y.0 == x).map(|y| y.1);
+            lp(s.argmax).unwrap() - lp(*t).unwrap_or(f32::INFINITY)
+        })
+        .fold(0.0f32, f32::max);
+    if fp8() || fp4() || kv_fp8() || (quantized(&dir) && int8()) {
+        assert!(worst < 0.5, "worst departure {worst}");
+    } else {
+        assert!(worst < 0.15, "worst departure {worst}");
+    }
 }

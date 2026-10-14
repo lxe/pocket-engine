@@ -6,7 +6,8 @@
 // (m, n = lane % 16, k = 8 (lane / 16)) and C[m..m+3][n] (m = 4 (lane / 16)).
 // A lane's 8 inputs of a weight row at one step are one nibble word of the
 // tiled layout (tile_word), which unmasks to bytes in the order 0 4 1 5 2 6 3
-// 7: the order quant_act8 stores activations in, so B is a plain 8-byte load.
+// 7: the order quant_act8 stores activations in, so B is a plain 8-byte load
+// (at quant_act8's [step pair][lane][step & 1] place in the chunk).
 // The block's two waves take two 16-row tiles each of its 64 rows; tokens
 // go in tiles of 16.
 __device__ __forceinline__ int4 mfma_i8(long a, long b) {
@@ -16,8 +17,9 @@ __device__ __forceinline__ int4 mfma_i8(long a, long b) {
 }
 template <int T, int MT>
 __device__ void qtile8_mfma(const uint8_t* __restrict__ W, int N, int K, const int8_t* __restrict__ Xq,
-                            const float2* __restrict__ Xs, int Mp, int M, void* __restrict__ Y, int ldy, int off,
+                            const float* __restrict__ Xd, int Mp, int M, void* __restrict__ Y, int ldy, int off,
                             int f32_out, float* __restrict__ acc_ws, int ksplit) {
+    const float* Xsum = Xd + (size_t)(K / 32) * Mp;
     constexpr int CH = Tiled<T>::CHUNK, TT = (MT + 15) / 16;
     constexpr bool Q6 = T == T_Q6_K, Q5 = T == T_Q5_K;
     const int wave = threadIdx.x >> 6, lane = threadIdx.x & 63, lr = lane & 15, lq = lane >> 4;
@@ -46,7 +48,7 @@ __device__ void qtile8_mfma(const uint8_t* __restrict__ W, int N, int K, const i
         const int m = m0 + 16 * tt + lr;
         xok[tt] = m < M && 16 * tt + lr < MT;
         xm[tt] = xok[tt] ? m : m0;
-        xr[tt] = Xq + (size_t)xm[tt] * K + 8 * lq;
+        xr[tt] = Xq + (size_t)xm[tt] * K + 16 * lq;
     }
     const int g = lr & 7, half = lr >> 3;
     for (int kb = b0; kb < b1; kb++) {
@@ -65,8 +67,10 @@ __device__ void qtile8_mfma(const uint8_t* __restrict__ W, int N, int K, const i
             float2 ds[TT];
 #pragma unroll
             for (int tt = 0; tt < TT; tt++) {
-                b[tt] = xok[tt] ? *reinterpret_cast<const long*>(xr[tt] + 32 * gs) : 0;
-                ds[tt] = Xs[(size_t)gs * Mp + xm[tt]];
+                const int m = xm[tt];
+                b[tt] = xok[tt] ? *reinterpret_cast<const long*>(xr[tt] + 256 * kb + 64 * (s >> 1) + 8 * (s & 1)) : 0;
+                ds[tt] = make_float2(Xd[(((size_t)kb * (Mp / 2) + m / 2) * 4 + (s >> 1)) * 4 + (s & 1) * 2 + (m & 1)],
+                                     Xsum[(size_t)gs * Mp + m]);
             }
 #pragma unroll
             for (int rt = 0; rt < 2; rt++) {

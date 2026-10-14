@@ -132,6 +132,8 @@ pub mod cu {
         fn hipEventRecord(e: CUevent, s: CUstream) -> CUresult;
         fn hipEventSynchronize(e: CUevent) -> CUresult;
         fn hipEventDestroy(e: CUevent) -> CUresult;
+        fn hipEventElapsedTime(ms: *mut f32, a: CUevent, b: CUevent) -> CUresult;
+        fn hipStreamWaitEvent(s: CUstream, e: CUevent, flags: c_uint) -> CUresult;
         fn hipStreamBeginCapture(s: CUstream, mode: CUstreamCaptureMode) -> CUresult;
         fn hipStreamEndCapture(s: CUstream, g: *mut CUgraph) -> CUresult;
         fn hipGraphInstantiateWithFlags(e: *mut CUgraphExec, g: CUgraph, flags: u64) -> CUresult;
@@ -265,6 +267,12 @@ pub mod cu {
     }
     pub unsafe fn cuEventDestroy_v2(e: CUevent) -> CUresult {
         unsafe { hipEventDestroy(e) }
+    }
+    pub unsafe fn cuEventElapsedTime_v2(ms: *mut f32, a: CUevent, b: CUevent) -> CUresult {
+        unsafe { hipEventElapsedTime(ms, a, b) }
+    }
+    pub unsafe fn cuStreamWaitEvent(s: CUstream, e: CUevent, flags: c_uint) -> CUresult {
+        unsafe { hipStreamWaitEvent(s, e, flags) }
     }
     pub unsafe fn cuStreamBeginCapture_v2(s: CUstream, mode: CUstreamCaptureMode) -> CUresult {
         unsafe { hipStreamBeginCapture(s, mode) }

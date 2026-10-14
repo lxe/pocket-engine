@@ -245,6 +245,17 @@ struct LtPlan {
     algo: lt::cublasLtMatmulAlgo_t,
 }
 
+/// GPU time by kernel, from events around each launch (POCKET_PROFILE=1).
+/// Graph replays show as one entry, so profile with graphs off.
+#[derive(Default)]
+struct Profiler {
+    names: HashMap<usize, String>,
+    pending: Vec<(String, cu::CUevent, cu::CUevent)>,
+    spare: Vec<cu::CUevent>,
+    totals: HashMap<String, (u64, f64)>,
+    capturing: bool,
+}
+
 pub struct Gpu {
     /// Streaming multiprocessors on the device.
     pub sms: usize,
@@ -256,10 +267,16 @@ pub struct Gpu {
     lt_ws: Buf,
     lt_plans: RefCell<HashMap<PlanKey, LtPlan>>,
     stream: cu::CUstream,
+    /// A second stream for work that overlaps the main one between `fork`
+    /// and `join`, and the events ordering the two.
+    side: cu::CUstream,
+    fork_ev: cu::CUevent,
+    join_ev: cu::CUevent,
     blas: cb::cublasHandle_t,
     module: cu::CUmodule,
     _workspace: Buf,
     staging: RefCell<Option<Staging>>,
+    prof: Option<RefCell<Profiler>>,
     pub name: String,
     /// AMD: matrix-vector kernels for products of 1 to 4 rows (skinny_bf16_r*).
     #[cfg(feature = "rocm")]
@@ -335,6 +352,18 @@ impl Gpu {
                 ),
                 "cuStreamCreate",
             )?;
+            let mut side = std::ptr::null_mut();
+            check(
+                cu::cuStreamCreate(&mut side, cu::CUstream_flags::CU_STREAM_NON_BLOCKING as u32),
+                "cuStreamCreate",
+            )?;
+            let (mut fork_ev, mut join_ev) = (std::ptr::null_mut(), std::ptr::null_mut());
+            for ev in [&mut fork_ev, &mut join_ev] {
+                check(
+                    cu::cuEventCreate(ev, cu::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32),
+                    "cuEventCreate",
+                )?;
+            }
             let mut module = std::ptr::null_mut();
             // POCKET_KERNELS names a cubin or fatbin to load in place of the
             // built-in image, for timing kernel variants without a rebuild.
@@ -404,10 +433,14 @@ impl Gpu {
                 },
                 lt_plans: RefCell::new(HashMap::new()),
                 stream,
+                side,
+                fork_ev,
+                join_ev,
                 blas,
                 module,
                 _workspace: workspace,
                 staging: RefCell::new(None),
+                prof: std::env::var_os("POCKET_PROFILE").map(|_| RefCell::new(Profiler::default())),
                 name,
                 #[cfg(feature = "rocm")]
                 skinny,
@@ -423,6 +456,9 @@ impl Gpu {
             unsafe { cu::cuModuleGetFunction(&mut f, self.module, cname.as_ptr()) },
             "cuModuleGetFunction",
         )?;
+        if let Some(p) = &self.prof {
+            p.borrow_mut().names.insert(f as usize, name.to_string());
+        }
         Ok(Kernel(f))
     }
 
@@ -663,7 +699,22 @@ impl Gpu {
         check(
             unsafe { cu::cuStreamSynchronize(self.stream) },
             "cuStreamSynchronize",
-        )
+        )?;
+        if let Some(p) = &self.prof {
+            let mut p = p.borrow_mut();
+            let pending = std::mem::take(&mut p.pending);
+            for (name, a, b) in pending {
+                let mut ms = 0f32;
+                // SAFETY: both events were recorded before the sync above.
+                unsafe { cu::cuEventElapsedTime_v2(&mut ms, a, b) };
+                let e = p.totals.entry(name).or_default();
+                e.0 += 1;
+                e.1 += ms as f64;
+                p.spare.push(a);
+                p.spare.push(b);
+            }
+        }
+        Ok(())
     }
 
     pub fn mem_info(&self) -> Result<(usize, usize)> {
@@ -678,6 +729,58 @@ impl Gpu {
 
     pub fn launch(
         &self,
+        k: Kernel,
+        grid: (u32, u32, u32),
+        block: u32,
+        smem: u32,
+        args: &[Arg],
+    ) -> Result<()> {
+        self.launch_in(self.stream, k, grid, block, smem, args)
+    }
+
+    /// Lets the side stream start work ordered after everything issued on
+    /// the main stream so far.
+    pub fn fork(&self) -> Result<()> {
+        // SAFETY: the event and streams are owned by self.
+        unsafe {
+            check(
+                cu::cuEventRecord(self.fork_ev, self.stream),
+                "cuEventRecord",
+            )?;
+            check(
+                cu::cuStreamWaitEvent(self.side, self.fork_ev, 0),
+                "cuStreamWaitEvent",
+            )
+        }
+    }
+
+    /// Orders later main-stream work after everything issued on the side stream.
+    pub fn join(&self) -> Result<()> {
+        // SAFETY: the event and streams are owned by self.
+        unsafe {
+            check(cu::cuEventRecord(self.join_ev, self.side), "cuEventRecord")?;
+            check(
+                cu::cuStreamWaitEvent(self.stream, self.join_ev, 0),
+                "cuStreamWaitEvent",
+            )
+        }
+    }
+
+    /// `launch` on the side stream (between `fork` and `join`).
+    pub fn launch_side(
+        &self,
+        k: Kernel,
+        grid: (u32, u32, u32),
+        block: u32,
+        smem: u32,
+        args: &[Arg],
+    ) -> Result<()> {
+        self.launch_in(self.side, k, grid, block, smem, args)
+    }
+
+    fn launch_in(
+        &self,
+        stream: cu::CUstream,
         k: Kernel,
         grid: (u32, u32, u32),
         block: u32,
@@ -701,9 +804,10 @@ impl Gpu {
                 _ => (&mut vals[i] as *mut u64).cast(),
             };
         }
+        let start = self.timed_start(stream);
         // SAFETY: argument count and types match the kernel signatures in
         // qwen35.cu; the driver copies the values at launch.
-        check(
+        let r = check(
             unsafe {
                 cu::cuLaunchKernel(
                     k.0,
@@ -714,13 +818,21 @@ impl Gpu {
                     1,
                     1,
                     smem,
-                    self.stream,
+                    stream,
                     ptrs.as_mut_ptr(),
                     std::ptr::null_mut(),
                 )
             },
             "cuLaunchKernel",
-        )
+        );
+        if start.is_some() {
+            let name = self
+                .prof
+                .as_ref()
+                .and_then(|p| p.borrow().names.get(&(k.0 as usize)).cloned());
+            self.timed_end(stream, start, name.as_deref().unwrap_or("?"));
+        }
+        r
     }
 
     /// y[rows, out] = x[rows, inp] . w[out, inp]^T, bf16 inputs, f32
@@ -741,7 +853,26 @@ impl Gpu {
 
     /// As [`Gpu::gemm`], with output rows `ldy` elements apart.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_ld(
+        &self,
+        x: u64,
+        w: u64,
+        y: u64,
+        rows: usize,
+        inp: usize,
+        out: usize,
+        ldy: usize,
+        f32_out: bool,
+    ) -> Result<()> {
+        let start = self.timed_start(self.stream);
+        let r = self.gemm_ld_inner(x, w, y, rows, inp, out, ldy, f32_out);
+        self.timed_end(self.stream, start, "cublas gemm");
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_ld_inner(
         &self,
         x: u64,
         w: u64,
@@ -811,7 +942,25 @@ impl Gpu {
     /// Column-major strided batched GEMM, C = op(A) . op(B), with f32
     /// accumulation: C is m x n, op(A) m x k, op(B) k x n.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_batched(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: Mat,
+        b: Mat,
+        c: Mat,
+        batch: usize,
+    ) -> Result<()> {
+        let start = self.timed_start(self.stream);
+        let r = self.gemm_batched_inner(m, n, k, a, b, c, batch);
+        self.timed_end(self.stream, start, "cublas gemm batched");
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_batched_inner(
         &self,
         m: usize,
         n: usize,
@@ -884,7 +1033,29 @@ impl Gpu {
     /// Plans (descriptor, layouts, algorithm) are cached per shape and
     /// operands, so replays and graph captures issue only the matmul.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn fp8_matmul(
+        &self,
+        mode: Fp8Mode,
+        w: u64,
+        w_scale: u64,
+        x: u64,
+        x_scale: u64,
+        y: u64,
+        n: usize,
+        k: usize,
+        rows: usize,
+        ldy: usize,
+        f32_out: bool,
+    ) -> Result<()> {
+        let start = self.timed_start(self.stream);
+        let r = self.fp8_matmul_inner(mode, w, w_scale, x, x_scale, y, n, k, rows, ldy, f32_out);
+        self.timed_end(self.stream, start, "cublaslt fp8");
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fp8_matmul_inner(
         &self,
         mode: Fp8Mode,
         w: u64,
@@ -1069,7 +1240,61 @@ impl Gpu {
         }
     }
 
+    /// Starts timing `name` on `stream` when profiling; pass the result to `timed_end`.
+    fn timed_start(&self, stream: cu::CUstream) -> Option<cu::CUevent> {
+        let p = self.prof.as_ref()?;
+        let mut p = p.borrow_mut();
+        if p.capturing {
+            return None;
+        }
+        let ev = p.spare.pop().unwrap_or_else(|| {
+            let mut e = std::ptr::null_mut();
+            // SAFETY: plain driver call with an out-parameter.
+            unsafe { cu::cuEventCreate(&mut e, 0) };
+            e
+        });
+        // SAFETY: the event and stream belong to this context.
+        unsafe { cu::cuEventRecord(ev, stream) };
+        Some(ev)
+    }
+
+    fn timed_end(&self, stream: cu::CUstream, start: Option<cu::CUevent>, name: &str) {
+        let (Some(start), Some(p)) = (start, &self.prof) else {
+            return;
+        };
+        let mut p = p.borrow_mut();
+        let end = p.spare.pop().unwrap_or_else(|| {
+            let mut e = std::ptr::null_mut();
+            // SAFETY: plain driver call with an out-parameter.
+            unsafe { cu::cuEventCreate(&mut e, 0) };
+            e
+        });
+        // SAFETY: the event and stream belong to this context.
+        unsafe { cu::cuEventRecord(end, stream) };
+        p.pending.push((name.to_string(), start, end));
+    }
+
+    /// GPU time by kernel since the last report, most first, when profiling.
+    pub fn profile_report(&self) -> Option<String> {
+        let p = self.prof.as_ref()?;
+        let mut p = p.borrow_mut();
+        let total: f64 = p.totals.values().map(|v| v.1).sum();
+        let mut v: Vec<_> = p.totals.drain().collect();
+        v.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+        let mut out = format!("GPU time {total:.1} ms:");
+        for (name, (n, ms)) in v.iter().take(16) {
+            out += &format!(
+                "\n  {:5.1}% {ms:9.2} ms {n:7}x  {name}",
+                100.0 * ms / total.max(1e-9)
+            );
+        }
+        Some(out)
+    }
+
     pub fn begin_capture(&self) -> Result<()> {
+        if let Some(p) = &self.prof {
+            p.borrow_mut().capturing = true;
+        }
         // SAFETY: the stream is owned by self.
         check(
             unsafe {
@@ -1083,6 +1308,9 @@ impl Gpu {
     }
 
     pub fn end_capture(&self) -> Result<Graph> {
+        if let Some(p) = &self.prof {
+            p.borrow_mut().capturing = false;
+        }
         let mut graph = std::ptr::null_mut();
         let mut exec = std::ptr::null_mut();
         // SAFETY: ends the capture begun on this stream; handles move into Graph.

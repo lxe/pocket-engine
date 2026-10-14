@@ -87,3 +87,15 @@ __device__ __forceinline__ void mma_s8(int* c, const uint32_t* a, uint32_t b0, u
                  : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
 }
+
+__device__ __forceinline__ uint32_t tf32(float x) {
+    uint32_t r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+    return r;
+}
+__device__ __forceinline__ void mma_tf32(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}

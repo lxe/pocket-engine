@@ -86,6 +86,26 @@ impl Checkpoint {
         self.index.contains_key(full)
     }
 
+    /// Every tensor's full name.
+    pub(crate) fn names(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.index.keys().map(String::as_str).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// A tensor's shape, by its full name.
+    pub(crate) fn shape(&self, full: &str) -> Result<Vec<usize>> {
+        self.index
+            .get(full)
+            .map(|e| e.shape.clone())
+            .ok_or_else(|| Error::Config(format!("missing tensor {full}")))
+    }
+
+    /// A tensor as f32, by its full name.
+    pub(crate) fn f32_full(&self, full: &str, numel: usize) -> Result<Vec<f32>> {
+        self.f32(&format!("/{full}"), numel)
+    }
+
     fn entry(&self, name: &str) -> Result<&Entry> {
         let full = match name.strip_prefix('/') {
             Some(full) => full.to_string(),
@@ -410,7 +430,7 @@ pub fn gguf_path(path: &Path) -> Option<PathBuf> {
 /// The GGUF name of a text-model tensor. The multi-token-prediction layer
 /// (`mtp.*`) is block `nextn` of the file, with its own names for the
 /// projection and norms that join the embedding and the hidden state.
-fn gguf_name(g: &Gguf, name: &str) -> String {
+pub(crate) fn gguf_name(g: &Gguf, name: &str) -> String {
     match name {
         "embed_tokens.weight" => return "token_embd.weight".into(),
         "norm.weight" => return "output_norm.weight".into(),
@@ -462,7 +482,7 @@ fn gguf_name(g: &Gguf, name: &str) -> String {
     format!("blk.{layer}.{mapped}")
 }
 
-fn to_f32(ty: GgmlType, data: &[u8]) -> Option<Vec<f32>> {
+pub(crate) fn to_f32(ty: GgmlType, data: &[u8]) -> Option<Vec<f32>> {
     Some(match ty {
         GgmlType::F32 => data
             .as_chunks::<4>()
@@ -783,6 +803,7 @@ impl Source {
             parts: out,
             cols,
             int8: true,
+            lora: None,
         })
     }
 

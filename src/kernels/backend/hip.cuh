@@ -224,3 +224,26 @@ __device__ __forceinline__ uint4 ld_stream(const uint8_t* p) {
 __device__ __forceinline__ void mma_s8(int* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
     pe::mma_16832_s8(c, a, b0, b1);
 }
+
+// TF32 rounding (nearest, ties away from zero) of an f32, as its bits.
+__device__ __forceinline__ uint32_t tf32(float x) {
+    return (__float_as_uint(x) + 0x1000u) & 0xFFFFE000u;
+}
+// mma.sync m16n8k8 tf32 x tf32 + f32: a0 = A[g][t], a1 = A[g+8][t], a2 =
+// A[g][t+4], a3 = A[g+8][t+4]; b0 = B[t][g], b1 = B[t+4][g]; C as in
+// pe::mma_16816_bf16. Emulated with shuffles, in f32.
+__device__ __forceinline__ void mma_tf32(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+        const int la = 4 * g + u, l0 = 8 * t + u, l1 = 8 * t + 4 + u;
+        const float A0 = __uint_as_float(__shfl(a[0], la, 32)), A1 = __uint_as_float(__shfl(a[1], la, 32));
+        const float A2 = __uint_as_float(__shfl(a[2], la, 32)), A3 = __uint_as_float(__shfl(a[3], la, 32));
+        const float B00 = __uint_as_float(__shfl(b0, l0, 32)), B01 = __uint_as_float(__shfl(b1, l0, 32));
+        const float B10 = __uint_as_float(__shfl(b0, l1, 32)), B11 = __uint_as_float(__shfl(b1, l1, 32));
+        d[0] += A0 * B00 + A2 * B01;
+        d[1] += A0 * B10 + A2 * B11;
+        d[2] += A1 * B00 + A3 * B01;
+        d[3] += A1 * B10 + A3 * B11;
+    }
+}

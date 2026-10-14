@@ -9,6 +9,7 @@ pub mod gpu;
 mod hip;
 pub mod image;
 pub mod linear;
+pub mod lora;
 pub mod model;
 pub mod sched;
 pub mod server;

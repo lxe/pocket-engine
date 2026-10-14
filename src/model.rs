@@ -13,6 +13,10 @@ pub const GDN_DIM: usize = 128;
 pub const HEAD_DIM: usize = 256;
 pub const ROPE_DIM: usize = 64;
 pub const BLOCK_SIZE: usize = 16;
+/// Most top tokens a log-probability request returns (LOGPROBS_TOP in the kernels).
+pub const LOGPROBS_TOP: usize = 20;
+/// f32 per output row of the `logprobs` kernel: the pick's, then (id, logprob) pairs.
+const LOGPROBS_ROW: usize = 1 + 2 * LOGPROBS_TOP;
 /// Tokens drafts pick from (see Mtp::head): on Qwen3.5-9B, 65,536 keep
 /// almost every accepted draft of the full 248,320 at a quarter of the cost.
 const DRAFT_VOCAB: usize = 65_536;
@@ -502,6 +506,7 @@ struct Kernels {
     /// Combines split decode attention's key ranges.
     attn_merge: Kernel,
     penalize: Kernel,
+    logprobs: Kernel,
     sample: Kernel,
 }
 
@@ -519,6 +524,8 @@ pub struct Model {
     pub weight_bytes: usize,
     /// The FP8 layout of the model's FP8 layers, if any.
     pub fp8: Option<Fp8Mode>,
+    /// Loaded from a GGUF file (linear-attention value heads tiled).
+    pub gguf: bool,
 }
 
 pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -534,6 +541,155 @@ impl Model {
             gpu.end_uploads()?;
         }
         m
+    }
+
+    /// Queues log-probabilities for the step's output rows in `rows` (row,
+    /// top count) and their download; read them with `Act::logprobs` after
+    /// the step's sync.
+    pub fn logprobs(&self, gpu: &Gpu, a: &mut Act, rows: &[(usize, usize)]) -> Result<()> {
+        use Arg::{I, P};
+        let n = rows.len();
+        let req = a.lp_req_host.as_mut_slice::<i32>();
+        for (i, &(r, k)) in rows.iter().enumerate() {
+            req[i] = r as i32;
+            req[n + i] = k.min(LOGPROBS_TOP) as i32;
+        }
+        gpu.htod(a.lp_req.ptr, &a.lp_req_host, 0, 2 * n * 4)?;
+        gpu.launch(
+            self.k.logprobs,
+            (n as u32, 1, 1),
+            1024,
+            0,
+            &[
+                P(a.logits.ptr),
+                I(self.cfg.vocab as i32),
+                P(a.lp_req.ptr),
+                P(a.lp_req.ptr + 4 * n as u64),
+                P(a.ids_out.ptr),
+                P(a.lp_out.ptr),
+            ],
+        )?;
+        gpu.dtoh(&mut a.lp_out_host, a.lp_out.ptr, n * LOGPROBS_ROW * 4)
+    }
+
+    /// The linear layers adapters may target, in the order `attach_lora` takes.
+    pub fn lora_sites(&self) -> Vec<crate::lora::Site> {
+        use crate::lora::{Heads, Site, SitePart};
+        let c = &self.cfg;
+        let (hk, hv) = (c.lin_k_heads, c.lin_v_heads);
+        let site = |layer: usize, cols: usize, parts: &[(&str, usize, Heads)], col_heads: Heads| {
+            let mut off = 0;
+            Site {
+                layer,
+                cols,
+                parts: parts
+                    .iter()
+                    .map(|&(m, rows, heads)| {
+                        let p = SitePart {
+                            module: m.to_string(),
+                            rows,
+                            off,
+                            heads,
+                        };
+                        off += rows;
+                        p
+                    })
+                    .collect(),
+                col_heads,
+            }
+        };
+        let mut out = Vec::new();
+        for (l, layer) in self.layers.iter().enumerate() {
+            match layer.mixer {
+                Mixer::Gdn { .. } => {
+                    let v = Heads::From {
+                        start: 0,
+                        block: GDN_DIM,
+                    };
+                    out.push(site(
+                        l,
+                        c.hidden,
+                        &[
+                            (
+                                "linear_attn.in_proj_qkv",
+                                c.conv_dim(),
+                                Heads::From {
+                                    start: 2 * hk * GDN_DIM,
+                                    block: GDN_DIM,
+                                },
+                            ),
+                            ("linear_attn.in_proj_z", hv * GDN_DIM, v),
+                            (
+                                "linear_attn.in_proj_b",
+                                hv,
+                                Heads::From { start: 0, block: 1 },
+                            ),
+                            (
+                                "linear_attn.in_proj_a",
+                                hv,
+                                Heads::From { start: 0, block: 1 },
+                            ),
+                        ],
+                        Heads::None,
+                    ));
+                    out.push(site(
+                        l,
+                        hv * GDN_DIM,
+                        &[("linear_attn.out_proj", c.hidden, Heads::None)],
+                        v,
+                    ));
+                }
+                Mixer::Attn { .. } => {
+                    out.push(site(
+                        l,
+                        c.hidden,
+                        &[
+                            ("self_attn.q_proj", 2 * c.hq * HEAD_DIM, Heads::None),
+                            ("self_attn.k_proj", c.hkv * HEAD_DIM, Heads::None),
+                            ("self_attn.v_proj", c.hkv * HEAD_DIM, Heads::None),
+                        ],
+                        Heads::None,
+                    ));
+                    out.push(site(
+                        l,
+                        c.hq * HEAD_DIM,
+                        &[("self_attn.o_proj", c.hidden, Heads::None)],
+                        Heads::None,
+                    ));
+                }
+            }
+            out.push(site(
+                l,
+                c.hidden,
+                &[
+                    ("mlp.gate_proj", c.inter, Heads::None),
+                    ("mlp.up_proj", c.inter, Heads::None),
+                ],
+                Heads::None,
+            ));
+            out.push(site(
+                l,
+                c.inter,
+                &[("mlp.down_proj", c.hidden, Heads::None)],
+                Heads::None,
+            ));
+        }
+        out
+    }
+
+    /// Points each decoder linear layer at its LoRA descriptor table.
+    pub fn attach_lora(&mut self, loras: &crate::lora::Loras) {
+        let mut i = 0;
+        for layer in &mut self.layers {
+            let (a, b) = match &mut layer.mixer {
+                Mixer::Gdn { w_in, w_out, .. } => (w_in, w_out),
+                Mixer::Attn { w_qkv, w_o, .. } => (w_qkv, w_o),
+            };
+            for w in [a, b, &mut layer.w_gu, &mut layer.w_down] {
+                w.lora = Some(loras.hook(i));
+                i += 1;
+            }
+        }
     }
 
     fn load_weights(gpu: &Gpu, path: &Path, load: Load) -> Result<Self> {
@@ -692,6 +848,7 @@ impl Model {
                 }],
                 cols: h,
                 int8: true,
+                lora: None,
             }
         };
         let mtp = match mtp {
@@ -715,6 +872,7 @@ impl Model {
                         .collect(),
                     cols: lm_head.cols,
                     int8: lm_head.int8,
+                    lora: None,
                 };
                 Some(Mtp {
                     fc,
@@ -794,6 +952,7 @@ impl Model {
             fp8_rows: gpu.kernel("fp8_activations")?,
             attn_merge: gpu.kernel("attn_merge")?,
             penalize: gpu.kernel("penalize")?,
+            logprobs: gpu.kernel("logprobs")?,
             sample: gpu.kernel("sample")?,
         };
         let largest = layers
@@ -827,6 +986,7 @@ impl Model {
         let fp8 = layers.iter().find_map(|l| l.w_gu.fp8().or(l.w_down.fp8()));
         Ok(Self {
             fp8,
+            gguf: matches!(src, Source::Gguf(_)),
             final_norm: up(&src.norm("norm.weight", h)?)?,
             inv_freq: up(&inv_freq)?,
             embed,
@@ -1051,8 +1211,19 @@ impl Meta {
     pub fn block_table(&self) -> usize {
         self.snaps() + 4 * self.max_seqs
     }
-    pub fn words(&self) -> usize {
+    /// Adapter tiles: [count, (first token, tokens, slot) x max_lora_tiles()].
+    pub fn lora(&self) -> usize {
         self.block_table() + self.max_seqs * self.max_blocks
+    }
+    pub fn max_lora_tiles(&self) -> usize {
+        self.max_tokens / crate::lora::TILE + self.max_seqs
+    }
+    /// Per output row, the index of its grammar mask in the step's masks, or -1.
+    pub fn masks(&self) -> usize {
+        self.lora() + 1 + 3 * self.max_lora_tiles()
+    }
+    pub fn words(&self) -> usize {
+        self.masks() + self.max_outs()
     }
 }
 
@@ -1085,6 +1256,17 @@ pub struct Act {
     pen_dev: Buf,
     pub pen_staging: Pinned,
     pub pen_capacity: usize,
+    /// Grammar masks of the step's constrained rows: a bit per vocabulary
+    /// entry, `mask_words` u32 per row, up to one row per sequence.
+    mask_dev: Buf,
+    pub mask_staging: Pinned,
+    pub mask_words: usize,
+    /// Log-probability requests: output rows then top counts (i32), and
+    /// the kernel's results (see the `logprobs` kernel).
+    lp_req: Buf,
+    pub lp_req_host: Pinned,
+    lp_out: Buf,
+    pub lp_out_host: Pinned,
     /// FP8 copies of the projections' inputs, when the model has FP8 layers.
     fp8: Option<Fp8Acts>,
     /// The draft layer's buffers, with multi-token prediction.
@@ -1206,6 +1388,13 @@ impl Act {
             pen_dev: gpu.alloc_zeroed(3 * pen_capacity * 4)?,
             pen_staging: gpu.pinned(3 * pen_capacity * 4)?,
             pen_capacity,
+            mask_dev: gpu.alloc_zeroed(meta.max_seqs * cfg.vocab.div_ceil(32) * 4)?,
+            mask_staging: gpu.pinned(meta.max_seqs * cfg.vocab.div_ceil(32) * 4)?,
+            mask_words: cfg.vocab.div_ceil(32),
+            lp_req: gpu.alloc_zeroed(2 * outs * 4)?,
+            lp_req_host: gpu.pinned(2 * outs * 4)?,
+            lp_out: gpu.alloc_zeroed(outs * LOGPROBS_ROW * 4)?,
+            lp_out_host: gpu.pinned(outs * LOGPROBS_ROW * 4)?,
             fp8,
             gdn: {
                 let rows = t * cfg.lin_v_heads;
@@ -1274,9 +1463,24 @@ impl Act {
                     bf16: bf16.ptr,
                     fp8: q.ptr,
                     scales: s.ptr,
+                    lora: None,
                 }
             }
             None => Input::bf16(bf16.ptr),
+        }
+    }
+
+    /// The step's LoRA work for the linear layers: `max_tiles` bounds the
+    /// tiles the step's metadata lists.
+    pub fn lora_step(&self, l: &crate::lora::Loras, max_tiles: usize) -> crate::lora::StepLora {
+        crate::lora::StepLora {
+            tiles: self.m(self.meta.lora()),
+            max_tiles,
+            s: l.s.ptr,
+            s_stride: (self.meta.max_tokens * l.lds * 4) as u64,
+            lds: l.lds,
+            shrink: l.shrink,
+            expand: l.expand,
         }
     }
 
@@ -1290,6 +1494,38 @@ impl Act {
     }
 
     /// Copies the first `n` staged penalty entries to the device.
+    /// The results of `Model::logprobs` for its `rows`, by output row.
+    pub fn logprobs(
+        &self,
+        rows: &[(usize, usize)],
+        outs: usize,
+    ) -> Vec<Option<crate::sched::TokenLogprobs>> {
+        let mut v = vec![None; outs];
+        let o = self.lp_out_host.as_slice::<f32>();
+        for (i, &(r, k)) in rows.iter().enumerate() {
+            let e = &o[i * LOGPROBS_ROW..(i + 1) * LOGPROBS_ROW];
+            let top = (0..k.min(LOGPROBS_TOP))
+                .map(|j| (e[1 + 2 * j].to_bits(), e[2 + 2 * j]))
+                .filter(|&(id, _)| id as i32 >= 0)
+                .collect();
+            v[r] = Some(crate::sched::TokenLogprobs { logprob: e[0], top });
+        }
+        v
+    }
+
+    /// Uploads the step's first `n` grammar masks.
+    pub fn upload_masks(&self, gpu: &Gpu, n: usize) -> Result<()> {
+        if n > 0 {
+            gpu.htod(
+                self.mask_dev.ptr,
+                &self.mask_staging,
+                0,
+                n * self.mask_words * 4,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn upload_pen(&self, gpu: &Gpu, n: usize) -> Result<()> {
         let cap = 4 * self.pen_capacity;
         for region in 0..3 {
@@ -1336,6 +1572,11 @@ struct View {
     block_table: u64,
     /// Prefix-cache snapshots to write in the step (Meta::snaps), or 0.
     snaps: u64,
+    /// The step's adapters, for the decoder layers.
+    lora: Option<crate::lora::StepLora>,
+    /// Leading sequences of one token or verifying drafts, which a prompt
+    /// step runs through gdn_recurrent rather than the chunked kernels.
+    head: usize,
 }
 
 impl View {
@@ -1353,6 +1594,8 @@ impl View {
             outs: a.m(me.outs()),
             block_table: a.m(me.block_table()),
             snaps: a.m(me.snaps()),
+            lora: None,
+            head: 0,
         }
     }
 }
@@ -1363,6 +1606,9 @@ impl Model {
     /// sequence, or one per token of a sequence verifying drafts) and, with
     /// multi-token prediction, one draft per sequence. Issues no host
     /// synchronization and no allocation, so it can be captured.
+    /// One step over `t` tokens of `s` sequences with `r` output rows.
+    /// `lora` holds the step's adapter work, when any sequence has one.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         gpu: &Gpu,
@@ -1371,6 +1617,8 @@ impl Model {
         t: usize,
         s: usize,
         r: usize,
+        lora: Option<crate::lora::StepLora>,
+        head: usize,
     ) -> Result<()> {
         use Arg::{F, I, P};
         let c = &self.cfg;
@@ -1392,7 +1640,11 @@ impl Model {
                 I(h as i32),
             ],
         )?;
-        let v = View::of(a);
+        let v = View {
+            lora,
+            head,
+            ..View::of(a)
+        };
         for (li, layer) in self.layers.iter().enumerate() {
             self.layer(gpu, st, a, &v, layer, li > 0, t, s)?;
         }
@@ -1438,6 +1690,9 @@ impl Model {
                 P(a.pen_dev.ptr),
                 P(a.pen_dev.ptr + cap),
                 P(a.pen_dev.ptr + 2 * cap),
+                P(a.m(me.masks())),
+                P(a.mask_dev.ptr),
+                I(a.mask_words as i32),
             ],
         )?;
         gpu.launch(
@@ -1611,6 +1866,8 @@ impl Model {
             outs: ma.neg.ptr,
             block_table: a.m(me.block_table()),
             snaps: 0,
+            lora: None,
+            head: 0,
         };
         for d in 1..me.spec - 1 {
             gpu.launch(
@@ -1746,7 +2003,7 @@ impl Model {
         let (h, eps) = (c.hidden, c.eps);
         let (ti, si) = (t as u32, s as u32);
         let outs = [P(v.outs), I(me.spec as i32)];
-        let xn_in = a.input(&a.xn, |f| &f.xn);
+        let xn_in = a.input(&a.xn, |f| &f.xn).with_lora(v.lora);
         let norm = |x: u64, w: &Buf, add: bool| -> Result<()> {
             let mut args = vec![
                 P(x),
@@ -1846,21 +2103,42 @@ impl Model {
                             ]
                             .concat(),
                         )?;
-                        let split = gdn_split(s, hv, gpu);
-                        gpu.launch(
-                            k.gdn_scan[split.trailing_zeros() as usize],
-                            (si, hv as u32, split as u32),
-                            2 * GDN_DIM as u32,
-                            gdn_scan_smem(split) as u32,
-                            &[
-                                args.as_slice(),
-                                &a.fp8_args(|f| &f.core, t),
-                                &outs,
-                                &scratch,
-                                &[P(v.snaps)],
-                            ]
-                            .concat(),
-                        )?;
+                        // The step's leading one-token and verifying rows take
+                        // the recurrent kernel (its blocks need no shared
+                        // memory, so many more run at once); the chunked scan
+                        // takes the rest, from sequence `d` on.
+                        let d = v.head.min(s);
+                        if d > 0 {
+                            gpu.launch(
+                                k.gdn_recurrent,
+                                (d as u32, hv as u32, 1),
+                                2 * GDN_DIM as u32,
+                                0,
+                                &[args.as_slice(), &a.fp8_args(|f| &f.core, t), &outs].concat(),
+                            )?;
+                        }
+                        if d < s {
+                            let at = |p: u64, per: usize| P(p + (4 * per * d) as u64);
+                            let mut tail = args;
+                            tail[11] = at(v.cu, 1);
+                            tail[12] = at(v.slots, 1);
+                            tail[13] = at(v.fresh, 1);
+                            let split = gdn_split(s - d, hv, gpu);
+                            gpu.launch(
+                                k.gdn_scan[split.trailing_zeros() as usize],
+                                ((s - d) as u32, hv as u32, split as u32),
+                                2 * GDN_DIM as u32,
+                                gdn_scan_smem(split) as u32,
+                                &[
+                                    tail.as_slice(),
+                                    &a.fp8_args(|f| &f.core, t),
+                                    &[at(v.outs, me.spec), outs[1]],
+                                    &scratch,
+                                    &[if v.snaps == 0 { P(0) } else { at(v.snaps, 4) }],
+                                ]
+                                .concat(),
+                            )?;
+                        }
                         gpu.launch(
                             k.gdn_norm,
                             (t as u32, 1, 1),
@@ -1894,7 +2172,15 @@ impl Model {
                             &[args.as_slice(), &a.fp8_args(|f| &f.core, t), &outs].concat(),
                         )?;
                     }
-                    w_out.forward(gpu, q, a.input(&a.core, |f| &f.core), t, a.h.ptr, h, false)?;
+                    w_out.forward(
+                        gpu,
+                        q,
+                        a.input(&a.core, |f| &f.core).with_lora(v.lora),
+                        t,
+                        a.h.ptr,
+                        h,
+                        false,
+                    )?;
                 }
                 Mixer::Attn {
                     w_qkv,
@@ -2079,7 +2365,15 @@ impl Model {
                             )?;
                         }
                     }
-                    w_o.forward(gpu, q, a.input(&a.ao, |f| &f.ao), t, a.h.ptr, h, false)?;
+                    w_o.forward(
+                        gpu,
+                        q,
+                        a.input(&a.ao, |f| &f.ao).with_lora(v.lora),
+                        t,
+                        a.h.ptr,
+                        h,
+                        false,
+                    )?;
                 }
             }
             norm(a.h.ptr, &layer.post_norm, true)?;
@@ -2098,9 +2392,15 @@ impl Model {
                 ]
                 .concat(),
             )?;
-            layer
-                .w_down
-                .forward(gpu, q, a.input(&a.act, |f| &f.act), t, a.h.ptr, h, false)?;
+            layer.w_down.forward(
+                gpu,
+                q,
+                a.input(&a.act, |f| &f.act).with_lora(v.lora),
+                t,
+                a.h.ptr,
+                h,
+                false,
+            )?;
         }
         Ok(())
     }

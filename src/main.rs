@@ -6,7 +6,7 @@ use pocket_engine::server::{self, ChatTokenizer};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "Qwen3.5 inference on hand-written CUDA kernels")]
+#[command(about = "Qwen3.5 and Qwen3.8 inference server")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -14,59 +14,57 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct EngineArgs {
-    /// Model directory: config.json, safetensors, tokenizer.json, chat_template.jinja.
+    /// Model directory or GGUF file.
     #[arg(long)]
     model: PathBuf,
+    /// GPU index.
     #[arg(long, default_value_t = 0)]
     device: i32,
+    /// Most requests at once (lowered to fit memory).
     #[arg(long, default_value_t = 256)]
     max_seqs: usize,
+    /// Most tokens per step.
     #[arg(long, default_value_t = 4096)]
     max_batch_tokens: usize,
+    /// Longest prompt plus output, in tokens.
     #[arg(long, default_value_t = 4096)]
     max_context: usize,
+    /// Share of GPU memory to use.
     #[arg(long, default_value_t = 0.9)]
     memory_fraction: f64,
-    /// Run every step eagerly instead of replaying captured decode graphs.
+    /// Disable CUDA graphs.
     #[arg(long)]
     no_graphs: bool,
-    /// Set up the GPU, then wait for this path to exist before reading the
-    /// model (for example a file a downloader creates when it finishes).
+    /// Wait for this path to exist before loading, so GPU setup overlaps a
+    /// download.
     #[arg(long)]
     wait_for: Option<PathBuf>,
-    /// Serve text only, without loading the vision encoder.
+    /// Text only.
     #[arg(long)]
     no_vision: bool,
-    /// Largest image after resizing, in pixels (each 32 x 32 pixels becomes
-    /// one prompt token).
+    /// Largest image after resizing, in pixels.
     #[arg(long, default_value_t = 4 << 20)]
     max_image_pixels: usize,
-    /// Image embeddings that can wait at once for their prompt steps.
+    /// Image embeddings waiting at once.
     #[arg(long, default_value_t = 16_384)]
     image_pool: usize,
-    /// Quantize bf16 weights to FP8 at load (Hopper and Blackwell). FP8
-    /// checkpoints load as FP8 without it.
+    /// Quantize a bf16 checkpoint to FP8.
     #[arg(long)]
     fp8: bool,
-    /// Quantize bf16 MLP weights to FP4 (MXFP4) at load and the other
-    /// projections to FP8 (RTX 50-series). NVFP4 checkpoints need no flag.
+    /// Quantize a bf16 checkpoint to FP4 (RTX 50-series).
     #[arg(long)]
     fp4: bool,
-    /// Store the KV cache as FP8 (E4M3, a scale per token and head): about
-    /// twice the tokens in the same memory.
+    /// FP8 KV cache (about twice the tokens).
     #[arg(long)]
     kv_fp8: bool,
-    /// Store the linear-attention state as f32 instead of bf16 (the math is
-    /// f32 either way): twice the memory per request.
+    /// f32 linear-attention state (twice the memory).
     #[arg(long)]
     state_f32: bool,
-    /// Prompt prefixes to keep for reuse (each holds a copy of the
-    /// recurrent state); 0 turns the prefix cache off. Default: a quarter
-    /// of --max-seqs, 2 to 64.
+    /// Prompt prefixes to keep; 0 turns caching off [default: --max-seqs / 4].
     #[arg(long)]
     prefix_cache: Option<usize>,
-    /// Speculative decoding with the checkpoint's multi-token-prediction
-    /// layer: each step verifies this many drafted tokens (2 without a value).
+    /// Draft N tokens a step with the multi-token-prediction layer (2 if N is
+    /// omitted).
     #[arg(long, num_args = 0..=1, default_missing_value = "2")]
     mtp: Option<usize>,
 }
@@ -97,18 +95,21 @@ impl EngineArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve /v1/chat/completions.
+    /// Serve the OpenAI-compatible API.
     Serve {
         #[command(flatten)]
         engine: EngineArgs,
+        /// Listen address.
         #[arg(long, default_value = "127.0.0.1:8190")]
         bind: String,
-        /// Model name reported by the API.
+        /// Model name in the API.
         #[arg(long, default_value = "qwen3.5")]
         name: String,
     },
-    /// Dequantizes rows of a GGUF tensor on the GPU and writes them as
-    /// little-endian f32, for checking the quantized formats.
+    /// Dump dequantized rows of a GGUF tensor.
+    ///
+    /// Dequantizes on the GPU and writes little-endian f32, for checking the
+    /// quantized formats.
     Dequant {
         #[arg(long)]
         model: PathBuf,
@@ -118,8 +119,10 @@ enum Cmd {
         rows: usize,
         output: PathBuf,
     },
-    /// Times a quantized GGUF matrix against the same matrix in bf16 on cuBLAS,
-    /// for several batch sizes, and checks that their outputs agree.
+    /// Time a quantized matrix against bf16.
+    ///
+    /// Times a GGUF matrix against the same matrix in bf16 on cuBLAS, for
+    /// several batch sizes, and checks that their outputs agree.
     BenchLinear {
         #[arg(long)]
         model: PathBuf,
@@ -128,8 +131,10 @@ enum Cmd {
         #[arg(long, value_delimiter = ',', default_value = "1,4,8,16,32,64,128,512")]
         rows: Vec<usize>,
     },
-    /// Times the gated-delta-rule kernel alone: `seqs` sequences of `tokens`
-    /// tokens each, with 27B's head layout by default.
+    /// Time the linear-attention kernels.
+    ///
+    /// `seqs` sequences of `tokens` tokens each, with 27B's head layout by
+    /// default.
     BenchGdn {
         #[arg(long, default_value_t = 48)]
         heads: usize,
@@ -150,9 +155,11 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         split: usize,
     },
-    /// Times flash attention for prompts alone: `seqs` prompts of `tokens`
-    /// new tokens after `context` cached ones, `group` query heads per key
-    /// and value head (9B: 4 kv heads, group 4; 27B: 4, 6).
+    /// Time prompt attention.
+    ///
+    /// `seqs` prompts of `tokens` new tokens after `context` cached ones,
+    /// `group` query heads per key and value head (9B: 4 kv heads, group 4;
+    /// 27B: 4, 6).
     BenchAttn {
         #[arg(long, default_value_t = 4)]
         kv_heads: usize,
@@ -175,6 +182,8 @@ enum Cmd {
         #[arg(long)]
         wg: bool,
     },
+    /// Time an FP8 matrix against bf16.
+    ///
     /// Quantizes a bf16 weight matrix to FP8 on the GPU (in the layout this
     /// device's cuBLASLt runs) and times cuBLASLt FP8 against bf16 cuBLAS.
     BenchFp8 {
@@ -190,17 +199,18 @@ enum Cmd {
         )]
         rows: Vec<usize>,
     },
-    /// Prints the token ids of a chat message, for checking tokenizers.
+    /// Print the token ids of a chat message.
     Tokenize {
         #[arg(long)]
         model: PathBuf,
         text: String,
     },
-    /// Teacher-forced scoring for accuracy checks. Reads JSON
-    /// [{"prompt": [ids] | "messages": [...], "forced": [ids]}, ...] (images
-    /// in messages as data URLs) and writes, per item and position, the
-    /// model's pick and top log-probabilities. Prompts built from messages
-    /// go to OUTPUT.prompts.json.
+    /// Score fixed continuations, for accuracy checks.
+    ///
+    /// Reads JSON [{"prompt": [ids] | "messages": [...], "forced": [ids]},
+    /// ...] (images in messages as data URLs) and writes, per item and
+    /// position, the model's pick and top log-probabilities. Prompts built
+    /// from messages go to OUTPUT.prompts.json.
     Score {
         #[command(flatten)]
         engine: EngineArgs,

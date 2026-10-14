@@ -244,6 +244,8 @@ struct LtPlan {
 /// Graph replays show as one entry, so profile with graphs off.
 #[derive(Default)]
 struct Profiler {
+    /// POCKET_PROFILE=shapes: matmuls by shape.
+    shapes: bool,
     names: HashMap<usize, String>,
     pending: Vec<(String, cu::CUevent, cu::CUevent)>,
     spare: Vec<cu::CUevent>,
@@ -419,7 +421,12 @@ impl Gpu {
                 module,
                 _workspace: workspace,
                 staging: RefCell::new(None),
-                prof: std::env::var_os("POCKET_PROFILE").map(|_| RefCell::new(Profiler::default())),
+                prof: std::env::var("POCKET_PROFILE").ok().map(|v| {
+                    RefCell::new(Profiler {
+                        shapes: v == "shapes",
+                        ..Profiler::default()
+                    })
+                }),
                 name,
             })
         }
@@ -844,7 +851,16 @@ impl Gpu {
     ) -> Result<()> {
         let start = self.timed_start(self.stream);
         let r = self.gemm_ld_inner(x, w, y, rows, inp, out, ldy, f32_out);
-        self.timed_end(self.stream, start, "cublas gemm");
+        if start.is_some() && self.prof.as_ref().is_some_and(|p| p.borrow().shapes) {
+            let name = format!(
+                "cublas gemm {out}x{inp}, {}+ rows{}",
+                1 << rows.ilog2(),
+                if f32_out { ", f32" } else { "" }
+            );
+            self.timed_end(self.stream, start, &name);
+        } else {
+            self.timed_end(self.stream, start, "cublas gemm");
+        }
         r
     }
 
@@ -1239,7 +1255,8 @@ impl Gpu {
         let mut v: Vec<_> = p.totals.drain().collect();
         v.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
         let mut out = format!("GPU time {total:.1} ms:");
-        for (name, (n, ms)) in v.iter().take(16) {
+        let rows = if p.shapes { 40 } else { 16 };
+        for (name, (n, ms)) in v.iter().take(rows) {
             out += &format!(
                 "\n  {:5.1}% {ms:9.2} ms {n:7}x  {name}",
                 100.0 * ms / total.max(1e-9)

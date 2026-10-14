@@ -554,6 +554,9 @@ extern "C" __global__ void repack_blocks(const uint8_t* __restrict__ src, uint8_
 //   Q4_0 (2304 bytes): 2048 of nibbles, then per row 8 halves, d per step.
 //   Q4_K (2368 bytes): 2048 of nibbles, then per row 16 bytes (the 8 steps'
 //   6-bit scales, then their mins), then per row (d, dmin) as two halves.
+//   IQ4_NL (2304 bytes): Q4_0's layout; weights are d * kvalues_iq4nl[q].
+//   IQ4_XS (2368 bytes): 2048 of nibbles, then per row 16 bytes (the 8
+//   steps' scales less 32, as int8), then per row d as a half and 2 spare.
 //   Q5_K (2880 bytes): 2048 of low nibbles; 512 of high bits, 16 bytes per
 //   lane, a 16-bit half per step with row g in its low byte and row g + 8 in
 //   its high byte, inputs in the order 0 4 1 5 2 6 3 7; then Q4_K's scales,
@@ -568,6 +571,20 @@ template <int T> struct Tiled;
 template <> struct Tiled<T_Q4_0> { static constexpr int CHUNK = 2304; };
 template <> struct Tiled<T_Q4_K> { static constexpr int CHUNK = 2368; };
 template <> struct Tiled<T_Q5_K> { static constexpr int CHUNK = 2880; };
+template <> struct Tiled<T_IQ4_NL> { static constexpr int CHUNK = 2304; };
+template <> struct Tiled<T_IQ4_XS> { static constexpr int CHUNK = 2368; };
+template <int T> constexpr bool IQ4 = T == T_IQ4_NL || T == T_IQ4_XS;
+
+// kvalues_iq4nl[q] for each byte q (0 to 15) of n, as signed bytes: two
+// 8-entry lookups by the low 3 bits, then a pick by bit 3. Byte selectors
+// are nibbles, so the four indices are packed first.
+__device__ __forceinline__ uint32_t iq4_bytes(uint32_t n) {
+    const uint32_t sel = __byte_perm(n | (n >> 4), 0, 0x0020);
+    // The table, four bytes to a word: -127 -104 -83 -65 | -49 -35 -22 -10 | 1 13 25 38 | 53 69 89 113.
+    const uint32_t lo = __byte_perm(0xBFAD9881u, 0xF6EADDCFu, sel & 0x7777u);
+    const uint32_t hi = __byte_perm(0x26190D01u, 0x71594535u, sel & 0x7777u);
+    return __byte_perm(lo, hi, 0x3210u | ((sel & 0x8888u) >> 1));
+}
 template <> struct Tiled<T_Q6_K> { static constexpr int CHUNK = 3392; };
 
 // Byte offset of the nibble word for (row r of the tile, step s, lane t).
@@ -586,6 +603,17 @@ __device__ __forceinline__ float nibf(uint32_t w, int sh) {
 // Q6_K: (q - 32) * scale, with q's two high bits from `hi` (input i at bit 2i).
 template <int T>
 __device__ __forceinline__ void tile_dec8(uint32_t w, float sc, float mn, float* o, uint32_t hi = 0) {
+    if constexpr (IQ4<T>) {
+        // Inputs 0 4 1 5, then 2 6 3 7, as the nibble masks give them.
+        const uint32_t a = iq4_bytes(w & 0x0F0F0F0Fu), b = iq4_bytes((w >> 4) & 0x0F0F0F0Fu);
+        constexpr int AT[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int k = AT[i];
+            o[i] = (float)(int8_t)(((k < 4 ? a : b) >> (8 * (k & 3))) & 0xFF) * sc;
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < 8; i++) {
         const int sh = (i & 1) * 16 + (i >> 1) * 4;
@@ -614,7 +642,7 @@ __device__ __forceinline__ TileRow tile_row(const uint8_t* c, int r) {
     constexpr int SC = T == T_Q6_K ? 3072 : T == T_Q5_K ? 2560 : 2048;
     constexpr int D = T == T_Q6_K ? 3328 : T == T_Q5_K ? 2816 : 2304;
     x.a = *reinterpret_cast<const uint4*>(c + SC + 16 * r);
-    x.b = T == T_Q4_0 ? 0u : *reinterpret_cast<const uint32_t*>(c + D + 4 * r);
+    x.b = T == T_Q4_0 || T == T_IQ4_NL ? 0u : *reinterpret_cast<const uint32_t*>(c + D + 4 * r);
     return x;
 }
 __device__ __forceinline__ uint32_t word_of(uint4 v, int i) {
@@ -627,6 +655,10 @@ __device__ __forceinline__ void tile_scale(const TileRow& x, int s, int t, float
         const int8_t q = (int8_t)((word_of(x.a, k >> 2) >> (8 * (k & 3))) & 0xFF);
         sc = __half2float(__ushort_as_half((unsigned short)x.b)) * q;
         mn = 0.f;
+    } else if constexpr (T == T_IQ4_XS) {
+        const int8_t q = (int8_t)((word_of(x.a, s >> 2) >> (8 * (s & 3))) & 0xFF);
+        sc = __half2float(__ushort_as_half((unsigned short)x.b)) * q;
+        mn = 0.f;
     } else if constexpr (T == T_Q4_K || T == T_Q5_K) {
         const float2 dm = __half22float2(*reinterpret_cast<const half2*>(&x.b));
         sc = dm.x * (float)((word_of(x.a, s >> 2) >> (8 * (s & 3))) & 0xFF);
@@ -634,7 +666,7 @@ __device__ __forceinline__ void tile_scale(const TileRow& x, int s, int t, float
     } else {
         const uint32_t h = word_of(x.a, s >> 1) >> (16 * (s & 1));
         sc = __half2float(__ushort_as_half((unsigned short)h));
-        mn = 8.f * sc;
+        mn = T == T_IQ4_NL ? 0.f : 8.f * sc;
     }
 }
 
@@ -666,6 +698,12 @@ __device__ void tile_rewrite(const uint8_t* __restrict__ src, int N, int K, uint
                 for (int i = 0; i < 16; i++) c[3072 + 16 * r + i] = (uint8_t)b->scales[i];
                 *reinterpret_cast<half*>(c + 3328 + 4 * r) = b->d;
             }
+        } else if constexpr (T == T_IQ4_XS) {
+            const block_iq4_xs* b = reinterpret_cast<const block_iq4_xs*>(src) + (size_t)row * (K / 256) + kb;
+            for (int i = 0; i < 32; i++) q[i] = (b->qs[16 * s + (i & 15)] >> (4 * (i >> 4))) & 0xF;
+            const int ls = ((b->scales_l[s / 2] >> 4 * (s % 2)) & 0xF) | (((b->scales_h >> 2 * s) & 3) << 4);
+            c[2048 + 16 * r + s] = (uint8_t)(int8_t)(ls - 32);
+            if (s == 0) *reinterpret_cast<half*>(c + 2304 + 4 * r) = b->d;
         } else if constexpr (T == T_Q5_K) {
             const block_q5_K* b = reinterpret_cast<const block_q5_K*>(src) + (size_t)row * (K / 256) + kb;
             const int il = s / 2, hi = s & 1;
@@ -1007,6 +1045,10 @@ __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t
                 }
                 continue;
             }
+            if constexpr (IQ4<T>) {
+#pragma unroll
+                for (int k = 0; k < 4; k++) a[k] = iq4_bytes(a[k]);
+            }
             if constexpr (Q5) {
                 const uint32_t hw = word_of(ch.h[0], s >> 1) >> (16 * (s & 1));
                 a[0] |= hi1_bytes(hw);
@@ -1021,10 +1063,17 @@ __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t
             for (int j = 0; j < MT / 8; j++) {
                 int c[4];
                 mma_s8(c, a, xv[j].x, xv[j].y);
-                acc[j][0] = fmaf(-ma, ds[j].y, fmaf((float)c[0], sa * ds[j].x, acc[j][0]));
-                acc[j][1] = fmaf(-ma, ds[j].w, fmaf((float)c[1], sa * ds[j].z, acc[j][1]));
-                acc[j][2] = fmaf(-mb, ds[j].y, fmaf((float)c[2], sb_ * ds[j].x, acc[j][2]));
-                acc[j][3] = fmaf(-mb, ds[j].w, fmaf((float)c[3], sb_ * ds[j].z, acc[j][3]));
+                if constexpr (IQ4<T>) {
+                    acc[j][0] = fmaf((float)c[0], sa * ds[j].x, acc[j][0]);
+                    acc[j][1] = fmaf((float)c[1], sa * ds[j].z, acc[j][1]);
+                    acc[j][2] = fmaf((float)c[2], sb_ * ds[j].x, acc[j][2]);
+                    acc[j][3] = fmaf((float)c[3], sb_ * ds[j].z, acc[j][3]);
+                } else {
+                    acc[j][0] = fmaf(-ma, ds[j].y, fmaf((float)c[0], sa * ds[j].x, acc[j][0]));
+                    acc[j][1] = fmaf(-ma, ds[j].w, fmaf((float)c[1], sa * ds[j].z, acc[j][1]));
+                    acc[j][2] = fmaf(-mb, ds[j].y, fmaf((float)c[2], sb_ * ds[j].x, acc[j][2]));
+                    acc[j][3] = fmaf(-mb, ds[j].w, fmaf((float)c[3], sb_ * ds[j].z, acc[j][3]));
+                }
             }
         }
     };
@@ -1077,6 +1126,8 @@ __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t
 QTILE8(T_Q4_0, q4_0, 8) QTILE8(T_Q4_0, q4_0, 16) QTILE8(T_Q4_0, q4_0, 32) QTILE8(T_Q4_0, q4_0, 64)
 QTILE8(T_Q4_K, q4_k, 8) QTILE8(T_Q4_K, q4_k, 16) QTILE8(T_Q4_K, q4_k, 32) QTILE8(T_Q4_K, q4_k, 64)
 QTILE8(T_Q5_K, q5_k, 8) QTILE8(T_Q5_K, q5_k, 16) QTILE8(T_Q5_K, q5_k, 32) QTILE8(T_Q5_K, q5_k, 64)
+QTILE8(T_IQ4_NL, iq4_nl, 8) QTILE8(T_IQ4_NL, iq4_nl, 16) QTILE8(T_IQ4_NL, iq4_nl, 32) QTILE8(T_IQ4_NL, iq4_nl, 64)
+QTILE8(T_IQ4_XS, iq4_xs, 8) QTILE8(T_IQ4_XS, iq4_xs, 16) QTILE8(T_IQ4_XS, iq4_xs, 32) QTILE8(T_IQ4_XS, iq4_xs, 64)
 QTILE8(T_Q6_K, q6_k, 8) QTILE8(T_Q6_K, q6_k, 16) QTILE8(T_Q6_K, q6_k, 32) QTILE8(T_Q6_K, q6_k, 64)
 
 #define QTILE(T, name, MT)                                                                             \
@@ -1097,6 +1148,8 @@ QTILE8(T_Q6_K, q6_k, 8) QTILE8(T_Q6_K, q6_k, 16) QTILE8(T_Q6_K, q6_k, 32) QTILE8
 TILED_KERNELS(T_Q4_0, q4_0)
 TILED_KERNELS(T_Q4_K, q4_k)
 TILED_KERNELS(T_Q5_K, q5_k)
+TILED_KERNELS(T_IQ4_NL, iq4_nl)
+TILED_KERNELS(T_IQ4_XS, iq4_xs)
 TILED_KERNELS(T_Q6_K, q6_k)
 
 #define QUANT_KERNELS(T, name)                                                                         \

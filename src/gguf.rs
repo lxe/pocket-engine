@@ -101,6 +101,8 @@ impl GgmlType {
             2 => Some(2304),
             12 => Some(2368),
             13 => Some(2880),
+            20 => Some(2304),
+            23 => Some(2368),
             14 => Some(3392),
             _ => None,
         }

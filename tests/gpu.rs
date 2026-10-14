@@ -36,7 +36,7 @@ fn config(model: PathBuf) -> EngineConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
-        int8: !std::env::var("POCKET_ENGINE_NO_INT8").is_ok_and(|v| v == "1"),
+        int8: int8(),
         ..EngineConfig::new(model)
     }
 }
@@ -144,6 +144,11 @@ fn fp8() -> bool {
 /// load and the other projections to FP8 (Blackwell).
 fn fp4() -> bool {
     std::env::var("POCKET_ENGINE_FP4").is_ok_and(|v| v == "1")
+}
+
+/// POCKET_ENGINE_NO_INT8=1 keeps GGUF activations in bf16.
+fn int8() -> bool {
+    !std::env::var("POCKET_ENGINE_NO_INT8").is_ok_and(|v| v == "1")
 }
 
 /// POCKET_ENGINE_KV_FP8=1 runs the suite with an FP8 KV cache.
@@ -353,7 +358,7 @@ fn drafts_keep_the_models_greedy_choices() {
     let pairs: Vec<Pair> = fixture(&format!("{}.pairs.json", size(&dir)));
     let mut e = Engine::new(EngineConfig {
         mtp: 3,
-        ..config(dir)
+        ..config(dir.clone())
     })
     .unwrap();
     let prompts: Vec<Vec<u32>> = pairs.into_iter().map(|p| p.prompt).collect();
@@ -398,9 +403,9 @@ fn drafts_keep_the_models_greedy_choices() {
             }
         }
     }
-    if fp8() || fp4() || kv_fp8() {
+    if fp8() || fp4() || kv_fp8() || (quantized(&dir) && int8()) {
         // Verification runs several rows per sequence, so its matmuls take
-        // other kernels, and FP8 activations magnify the last-bit
+        // other kernels, and FP8 or int8 activations magnify the last-bit
         // differences (see batching_does_not_change_predictions).
         assert!(
             departures * 20 <= positions,

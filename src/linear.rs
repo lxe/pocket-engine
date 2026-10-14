@@ -214,7 +214,7 @@ impl Quants {
                     mma8: match name {
                         // Q6_K takes two products a step, so dequantizing
                         // to bf16 wins sooner.
-                        "q4_0" | "q4_k" | "q5_k" | "q6_k" => {
+                        "q4_0" | "q4_k" | "q5_k" | "q6_k" | "iq4_nl" | "iq4_xs" => {
                             let mut k = Vec::with_capacity(4);
                             for t in MMA_TILES {
                                 k.push(gpu.kernel(&format!("qtile8_{name}_{t}"))?);

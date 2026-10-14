@@ -37,6 +37,7 @@ Add one of these to the command above to run the same checks with that option on
 | `POCKET_ENGINE_STATE_F32=1` | `--state-f32` |
 | `POCKET_ENGINE_MTP=3` | `--mtp 3` |
 | `POCKET_ENGINE_NO_INT8=1` | `--no-int8` |
+| `POCKET_ENGINE_LORA=DIR` | checks that adapter against `tests/fixtures/<size>.lora.*.json` |
 
 Quantized runs allow slightly larger differences from Transformers.
 

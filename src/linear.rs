@@ -38,6 +38,8 @@ pub struct Linear {
     pub cols: usize,
     /// May take int8 activations (`--int8`).
     pub int8: bool,
+    /// This layer's LoRA descriptor table, when adapters are enabled.
+    pub lora: Option<crate::lora::Hook>,
 }
 
 /// Rows an FP8 matmul runs: Hopper's block-scaled FP8 needs a multiple of 4.
@@ -57,6 +59,8 @@ pub struct Input {
     pub bf16: u64,
     pub fp8: u64,
     pub scales: u64,
+    /// The step's adapter tiles, for layers with a LoRA hook.
+    pub lora: Option<crate::lora::StepLora>,
 }
 
 impl Input {
@@ -65,7 +69,12 @@ impl Input {
             bf16: ptr,
             fp8: 0,
             scales: 0,
+            lora: None,
         }
+    }
+
+    pub fn with_lora(self, lora: Option<crate::lora::StepLora>) -> Self {
+        Self { lora, ..self }
     }
 }
 
@@ -351,6 +360,9 @@ impl Linear {
         use Arg::{I, P};
         let x = input.bf16;
         let elem = if f32_out { 4 } else { 2 };
+        if let (Some(h), Some(l)) = (self.lora, input.lora) {
+            self.lora_shrink(gpu, h, l, x, rows)?;
+        }
         // int8 activations, quantized once for all of this layer's parts.
         let int8 = self.int8
             && q.act8.is_some()
@@ -712,6 +724,82 @@ impl Linear {
                 }
             }
         }
+        if let (Some(h), Some(l)) = (self.lora, input.lora) {
+            gpu.join()?;
+            self.lora_expand(gpu, h, l, rows, y, ldy, f32_out)?;
+        }
         Ok(())
+    }
+
+    /// The adapters' S = x A^T, on the side stream so it overlaps the
+    /// layer's own matrix multiply.
+    fn lora_shrink(
+        &self,
+        gpu: &Gpu,
+        h: crate::lora::Hook,
+        l: crate::lora::StepLora,
+        x: u64,
+        rows: usize,
+    ) -> Result<()> {
+        use Arg::{I, P};
+        let tiles = l.max_tiles.min(rows) as u32;
+        let rank = h.parts * (l.lds / crate::lora::MAX_PARTS);
+        let s = l.s + h.parity as u64 * l.s_stride;
+        gpu.fork()?;
+        gpu.launch_side(
+            l.shrink,
+            (
+                tiles,
+                rank.div_ceil(32) as u32,
+                self.cols.div_ceil(256) as u32,
+            ),
+            128,
+            0,
+            &[
+                P(x),
+                I(self.cols as i32),
+                I(self.cols as i32),
+                P(l.tiles),
+                P(h.table),
+                P(s),
+                I(l.lds as i32),
+            ],
+        )
+    }
+
+    /// Adds the adapters' S B^T into `y`.
+    #[allow(clippy::too_many_arguments)]
+    fn lora_expand(
+        &self,
+        gpu: &Gpu,
+        h: crate::lora::Hook,
+        l: crate::lora::StepLora,
+        rows: usize,
+        y: u64,
+        ldy: usize,
+        f32_out: bool,
+    ) -> Result<()> {
+        use Arg::{I, P};
+        let tiles = l.max_tiles.min(rows) as u32;
+        let (s, next) = (
+            l.s + h.parity as u64 * l.s_stride,
+            l.s + (1 - h.parity) as u64 * l.s_stride,
+        );
+        gpu.launch(
+            l.expand,
+            (tiles, h.max_rows.div_ceil(128) as u32, h.parts as u32),
+            128,
+            0,
+            &[
+                P(s),
+                I(l.lds as i32),
+                P(next),
+                P(l.tiles),
+                P(h.table),
+                P(y),
+                I(ldy as i32),
+                I(f32_out as i32),
+            ],
+        )
     }
 }

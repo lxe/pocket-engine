@@ -2330,3 +2330,4 @@ extern "C" __global__ void vit_bias(const float* __restrict__ y, const float* __
 
 #include "quant.cuh"
 #include "fp4.cuh"
+#include "lora.cuh"

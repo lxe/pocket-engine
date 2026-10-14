@@ -6,6 +6,7 @@ fn main() {
         "quant.cuh",
         "fp8.cuh",
         "fp4.cuh",
+        "lora.cuh",
         "ggml-common.h",
     ] {
         println!("cargo:rerun-if-changed=src/kernels/{f}");

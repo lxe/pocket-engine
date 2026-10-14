@@ -474,6 +474,8 @@ pub struct Model {
     pub weight_bytes: usize,
     /// The FP8 layout of the model's FP8 layers, if any.
     pub fp8: Option<Fp8Mode>,
+    /// Loaded from a GGUF file (linear-attention value heads tiled).
+    pub gguf: bool,
 }
 
 pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -489,6 +491,126 @@ impl Model {
             gpu.end_uploads()?;
         }
         m
+    }
+
+    /// The linear layers adapters may target, in the order `attach_lora` takes.
+    pub fn lora_sites(&self) -> Vec<crate::lora::Site> {
+        use crate::lora::{Heads, Site, SitePart};
+        let c = &self.cfg;
+        let (hk, hv) = (c.lin_k_heads, c.lin_v_heads);
+        let site = |layer: usize, cols: usize, parts: &[(&str, usize, Heads)], col_heads: Heads| {
+            let mut off = 0;
+            Site {
+                layer,
+                cols,
+                parts: parts
+                    .iter()
+                    .map(|&(m, rows, heads)| {
+                        let p = SitePart {
+                            module: m.to_string(),
+                            rows,
+                            off,
+                            heads,
+                        };
+                        off += rows;
+                        p
+                    })
+                    .collect(),
+                col_heads,
+            }
+        };
+        let mut out = Vec::new();
+        for (l, layer) in self.layers.iter().enumerate() {
+            match layer.mixer {
+                Mixer::Gdn { .. } => {
+                    let v = Heads::From {
+                        start: 0,
+                        block: GDN_DIM,
+                    };
+                    out.push(site(
+                        l,
+                        c.hidden,
+                        &[
+                            (
+                                "linear_attn.in_proj_qkv",
+                                c.conv_dim(),
+                                Heads::From {
+                                    start: 2 * hk * GDN_DIM,
+                                    block: GDN_DIM,
+                                },
+                            ),
+                            ("linear_attn.in_proj_z", hv * GDN_DIM, v),
+                            (
+                                "linear_attn.in_proj_b",
+                                hv,
+                                Heads::From { start: 0, block: 1 },
+                            ),
+                            (
+                                "linear_attn.in_proj_a",
+                                hv,
+                                Heads::From { start: 0, block: 1 },
+                            ),
+                        ],
+                        Heads::None,
+                    ));
+                    out.push(site(
+                        l,
+                        hv * GDN_DIM,
+                        &[("linear_attn.out_proj", c.hidden, Heads::None)],
+                        v,
+                    ));
+                }
+                Mixer::Attn { .. } => {
+                    out.push(site(
+                        l,
+                        c.hidden,
+                        &[
+                            ("self_attn.q_proj", 2 * c.hq * HEAD_DIM, Heads::None),
+                            ("self_attn.k_proj", c.hkv * HEAD_DIM, Heads::None),
+                            ("self_attn.v_proj", c.hkv * HEAD_DIM, Heads::None),
+                        ],
+                        Heads::None,
+                    ));
+                    out.push(site(
+                        l,
+                        c.hq * HEAD_DIM,
+                        &[("self_attn.o_proj", c.hidden, Heads::None)],
+                        Heads::None,
+                    ));
+                }
+            }
+            out.push(site(
+                l,
+                c.hidden,
+                &[
+                    ("mlp.gate_proj", c.inter, Heads::None),
+                    ("mlp.up_proj", c.inter, Heads::None),
+                ],
+                Heads::None,
+            ));
+            out.push(site(
+                l,
+                c.inter,
+                &[("mlp.down_proj", c.hidden, Heads::None)],
+                Heads::None,
+            ));
+        }
+        out
+    }
+
+    /// Points each decoder linear layer at its LoRA descriptor table.
+    pub fn attach_lora(&mut self, loras: &crate::lora::Loras) {
+        let mut i = 0;
+        for layer in &mut self.layers {
+            let (a, b) = match &mut layer.mixer {
+                Mixer::Gdn { w_in, w_out, .. } => (w_in, w_out),
+                Mixer::Attn { w_qkv, w_o, .. } => (w_qkv, w_o),
+            };
+            for w in [a, b, &mut layer.w_gu, &mut layer.w_down] {
+                w.lora = Some(loras.hook(i));
+                i += 1;
+            }
+        }
     }
 
     fn load_weights(gpu: &Gpu, path: &Path, load: Load) -> Result<Self> {
@@ -647,6 +769,7 @@ impl Model {
                 }],
                 cols: h,
                 int8: true,
+                lora: None,
             }
         };
         let mtp = match mtp {
@@ -670,6 +793,7 @@ impl Model {
                         .collect(),
                     cols: lm_head.cols,
                     int8: lm_head.int8,
+                    lora: None,
                 };
                 Some(Mtp {
                     fc,
@@ -782,6 +906,7 @@ impl Model {
         let fp8 = layers.iter().find_map(|l| l.w_gu.fp8().or(l.w_down.fp8()));
         Ok(Self {
             fp8,
+            gguf: matches!(src, Source::Gguf(_)),
             final_norm: up(&src.norm("norm.weight", h)?)?,
             inv_freq: up(&inv_freq)?,
             embed,
@@ -1006,8 +1131,15 @@ impl Meta {
     pub fn block_table(&self) -> usize {
         self.snaps() + 4 * self.max_seqs
     }
-    pub fn words(&self) -> usize {
+    /// Adapter tiles: [count, (first token, tokens, slot) x max_lora_tiles()].
+    pub fn lora(&self) -> usize {
         self.block_table() + self.max_seqs * self.max_blocks
+    }
+    pub fn max_lora_tiles(&self) -> usize {
+        self.max_tokens / crate::lora::TILE + self.max_seqs
+    }
+    pub fn words(&self) -> usize {
+        self.lora() + 1 + 3 * self.max_lora_tiles()
     }
 }
 
@@ -1229,9 +1361,24 @@ impl Act {
                     bf16: bf16.ptr,
                     fp8: q.ptr,
                     scales: s.ptr,
+                    lora: None,
                 }
             }
             None => Input::bf16(bf16.ptr),
+        }
+    }
+
+    /// The step's LoRA work for the linear layers: `max_tiles` bounds the
+    /// tiles the step's metadata lists.
+    pub fn lora_step(&self, l: &crate::lora::Loras, max_tiles: usize) -> crate::lora::StepLora {
+        crate::lora::StepLora {
+            tiles: self.m(self.meta.lora()),
+            max_tiles,
+            s: l.s.ptr,
+            s_stride: (self.meta.max_tokens * l.lds * 4) as u64,
+            lds: l.lds,
+            shrink: l.shrink,
+            expand: l.expand,
         }
     }
 
@@ -1291,6 +1438,8 @@ struct View {
     block_table: u64,
     /// Prefix-cache snapshots to write in the step (Meta::snaps), or 0.
     snaps: u64,
+    /// The step's adapters, for the decoder layers.
+    lora: Option<crate::lora::StepLora>,
 }
 
 impl View {
@@ -1308,6 +1457,7 @@ impl View {
             outs: a.m(me.outs()),
             block_table: a.m(me.block_table()),
             snaps: a.m(me.snaps()),
+            lora: None,
         }
     }
 }
@@ -1318,6 +1468,9 @@ impl Model {
     /// sequence, or one per token of a sequence verifying drafts) and, with
     /// multi-token prediction, one draft per sequence. Issues no host
     /// synchronization and no allocation, so it can be captured.
+    /// One step over `t` tokens of `s` sequences with `r` output rows.
+    /// `lora` holds the step's adapter work, when any sequence has one.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         gpu: &Gpu,
@@ -1326,6 +1479,7 @@ impl Model {
         t: usize,
         s: usize,
         r: usize,
+        lora: Option<crate::lora::StepLora>,
     ) -> Result<()> {
         use Arg::{F, I, P};
         let c = &self.cfg;
@@ -1347,7 +1501,10 @@ impl Model {
                 I(h as i32),
             ],
         )?;
-        let v = View::of(a);
+        let v = View {
+            lora,
+            ..View::of(a)
+        };
         for (li, layer) in self.layers.iter().enumerate() {
             self.layer(gpu, st, a, &v, layer, li > 0, t, s)?;
         }
@@ -1566,6 +1723,7 @@ impl Model {
             outs: ma.neg.ptr,
             block_table: a.m(me.block_table()),
             snaps: 0,
+            lora: None,
         };
         for d in 1..me.spec - 1 {
             gpu.launch(
@@ -1701,7 +1859,7 @@ impl Model {
         let (h, eps) = (c.hidden, c.eps);
         let (ti, si) = (t as u32, s as u32);
         let outs = [P(v.outs), I(me.spec as i32)];
-        let xn_in = a.input(&a.xn, |f| &f.xn);
+        let xn_in = a.input(&a.xn, |f| &f.xn).with_lora(v.lora);
         let norm = |x: u64, w: &Buf, add: bool| -> Result<()> {
             let mut args = vec![
                 P(x),
@@ -1849,7 +2007,15 @@ impl Model {
                             &[args.as_slice(), &a.fp8_args(|f| &f.core, t), &outs].concat(),
                         )?;
                     }
-                    w_out.forward(gpu, q, a.input(&a.core, |f| &f.core), t, a.h.ptr, h, false)?;
+                    w_out.forward(
+                        gpu,
+                        q,
+                        a.input(&a.core, |f| &f.core).with_lora(v.lora),
+                        t,
+                        a.h.ptr,
+                        h,
+                        false,
+                    )?;
                 }
                 Mixer::Attn {
                     w_qkv,
@@ -2034,7 +2200,15 @@ impl Model {
                             )?;
                         }
                     }
-                    w_o.forward(gpu, q, a.input(&a.ao, |f| &f.ao), t, a.h.ptr, h, false)?;
+                    w_o.forward(
+                        gpu,
+                        q,
+                        a.input(&a.ao, |f| &f.ao).with_lora(v.lora),
+                        t,
+                        a.h.ptr,
+                        h,
+                        false,
+                    )?;
                 }
             }
             norm(a.h.ptr, &layer.post_norm, true)?;
@@ -2053,9 +2227,15 @@ impl Model {
                 ]
                 .concat(),
             )?;
-            layer
-                .w_down
-                .forward(gpu, q, a.input(&a.act, |f| &f.act), t, a.h.ptr, h, false)?;
+            layer.w_down.forward(
+                gpu,
+                q,
+                a.input(&a.act, |f| &f.act).with_lora(v.lora),
+                t,
+                a.h.ptr,
+                h,
+                false,
+            )?;
         }
         Ok(())
     }

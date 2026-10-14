@@ -70,6 +70,17 @@ struct EngineArgs {
     /// bf16 activations for GGUF weights, instead of int8 in batches.
     #[arg(long)]
     no_int8: bool,
+    /// Serve a LoRA adapter as NAME (a PEFT directory or a llama.cpp GGUF
+    /// adapter); repeat for more.
+    #[arg(long, value_name = "NAME=PATH")]
+    lora: Vec<String>,
+    /// Adapters on the GPU at once; also allows loading adapters at runtime
+    /// [default: 4 with --lora, else off].
+    #[arg(long)]
+    max_loras: Option<usize>,
+    /// Largest adapter rank.
+    #[arg(long, default_value_t = 16)]
+    max_lora_rank: usize,
 }
 
 impl EngineArgs {
@@ -92,6 +103,24 @@ impl EngineArgs {
             prefix_cache: self.prefix_cache,
             mtp: self.mtp.unwrap_or(0),
             int8: !self.no_int8,
+            loras: self
+                .lora
+                .iter()
+                .map(|s| match s.split_once('=') {
+                    Some((n, p)) => (n.to_string(), p.into()),
+                    None => {
+                        let p = std::path::PathBuf::from(s);
+                        let n = p
+                            .file_stem()
+                            .map_or(s.clone(), |f| f.to_string_lossy().into_owned());
+                        (n, p)
+                    }
+                })
+                .collect(),
+            max_loras: self
+                .max_loras
+                .unwrap_or(if self.lora.is_empty() { 0 } else { 4 }),
+            max_lora_rank: self.max_lora_rank,
             ..EngineConfig::new(self.model.clone())
         }
     }
@@ -218,6 +247,9 @@ enum Cmd {
     Score {
         #[command(flatten)]
         engine: EngineArgs,
+        /// Score with this adapter (loaded with --lora).
+        #[arg(long)]
+        adapter: Option<String>,
         input: PathBuf,
         output: PathBuf,
     },
@@ -248,7 +280,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 stem.map_or("qwen".into(), |s| s.to_string_lossy().into_owned())
             });
-            let (tx, info, health) = engine::spawn(args.config())?;
+            let cfg = args.config();
+            let lora_on = cfg.max_loras > 0;
+            let (tx, info, health, adapters) = engine::spawn(cfg)?;
             let tok = ChatTokenizer::load(&args.model)?;
             let spec = if info.vision {
                 Some(Spec::load(&args.model, args.max_image_pixels)?)
@@ -262,7 +296,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(server::serve(tok, spec, tx, info, health, name, &bind))?;
+                .block_on(server::serve(
+                    tok,
+                    spec,
+                    tx,
+                    info,
+                    health,
+                    lora_on.then_some(adapters),
+                    name,
+                    &bind,
+                ))?;
         }
         Cmd::Dequant {
             model,
@@ -379,6 +422,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }],
                 cols: k,
                 int8: true,
+                lora: None,
             };
             let mut quant = Vec::new();
             for _ in 0..copies(data.len()) {
@@ -1049,6 +1093,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Score {
             engine: args,
+            adapter,
             input,
             output,
         } => {
@@ -1065,6 +1110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         forced: p.forced,
                         images: vec![],
                         rope: None,
+                        adapter: 0,
                     }
                 } else {
                     let (ids, urls) = tok.chat(&p.messages)?;
@@ -1086,11 +1132,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         forced: p.forced,
                         images,
                         rope,
+                        adapter: 0,
                     }
                 };
                 items.push(item);
             }
             let mut e = Engine::new(args.config())?;
+            if let Some(name) = adapter {
+                let id = *e.adapters.lock().unwrap().get(&name).ok_or(format!(
+                    "no adapter {name}; load it with --lora {name}=PATH"
+                ))?;
+                items.iter_mut().for_each(|i| i.adapter = id);
+            }
             let out = e.score(items)?;
             std::fs::write(&output, serde_json::to_string(&out)?)?;
             if !prompts.is_empty() {

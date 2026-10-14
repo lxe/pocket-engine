@@ -251,6 +251,11 @@ pub struct Gpu {
     lt_ws: Buf,
     lt_plans: RefCell<HashMap<PlanKey, LtPlan>>,
     stream: cu::CUstream,
+    /// A second stream for work that overlaps the main one between `fork`
+    /// and `join`, and the events ordering the two.
+    side: cu::CUstream,
+    fork_ev: cu::CUevent,
+    join_ev: cu::CUevent,
     blas: cb::cublasHandle_t,
     module: cu::CUmodule,
     _workspace: Buf,
@@ -327,6 +332,18 @@ impl Gpu {
                 ),
                 "cuStreamCreate",
             )?;
+            let mut side = std::ptr::null_mut();
+            check(
+                cu::cuStreamCreate(&mut side, cu::CUstream_flags::CU_STREAM_NON_BLOCKING as u32),
+                "cuStreamCreate",
+            )?;
+            let (mut fork_ev, mut join_ev) = (std::ptr::null_mut(), std::ptr::null_mut());
+            for ev in [&mut fork_ev, &mut join_ev] {
+                check(
+                    cu::cuEventCreate(ev, cu::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32),
+                    "cuEventCreate",
+                )?;
+            }
             let mut module = std::ptr::null_mut();
             // POCKET_KERNELS names a cubin or fatbin to load in place of the
             // built-in image, for timing kernel variants without a rebuild.
@@ -383,6 +400,9 @@ impl Gpu {
                 },
                 lt_plans: RefCell::new(HashMap::new()),
                 stream,
+                side,
+                fork_ev,
+                join_ev,
                 blas,
                 module,
                 _workspace: workspace,
@@ -661,6 +681,58 @@ impl Gpu {
         smem: u32,
         args: &[Arg],
     ) -> Result<()> {
+        self.launch_in(self.stream, k, grid, block, smem, args)
+    }
+
+    /// Lets the side stream start work ordered after everything issued on
+    /// the main stream so far.
+    pub fn fork(&self) -> Result<()> {
+        // SAFETY: the event and streams are owned by self.
+        unsafe {
+            check(
+                cu::cuEventRecord(self.fork_ev, self.stream),
+                "cuEventRecord",
+            )?;
+            check(
+                cu::cuStreamWaitEvent(self.side, self.fork_ev, 0),
+                "cuStreamWaitEvent",
+            )
+        }
+    }
+
+    /// Orders later main-stream work after everything issued on the side stream.
+    pub fn join(&self) -> Result<()> {
+        // SAFETY: the event and streams are owned by self.
+        unsafe {
+            check(cu::cuEventRecord(self.join_ev, self.side), "cuEventRecord")?;
+            check(
+                cu::cuStreamWaitEvent(self.stream, self.join_ev, 0),
+                "cuStreamWaitEvent",
+            )
+        }
+    }
+
+    /// `launch` on the side stream (between `fork` and `join`).
+    pub fn launch_side(
+        &self,
+        k: Kernel,
+        grid: (u32, u32, u32),
+        block: u32,
+        smem: u32,
+        args: &[Arg],
+    ) -> Result<()> {
+        self.launch_in(self.side, k, grid, block, smem, args)
+    }
+
+    fn launch_in(
+        &self,
+        stream: cu::CUstream,
+        k: Kernel,
+        grid: (u32, u32, u32),
+        block: u32,
+        smem: u32,
+        args: &[Arg],
+    ) -> Result<()> {
         let mut vals = [0u64; 32];
         let mut ptrs = [std::ptr::null_mut::<c_void>(); 32];
         for (i, a) in args.iter().enumerate() {
@@ -691,7 +763,7 @@ impl Gpu {
                     1,
                     1,
                     smem,
-                    self.stream,
+                    stream,
                     ptrs.as_mut_ptr(),
                     std::ptr::null_mut(),
                 )

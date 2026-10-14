@@ -55,6 +55,10 @@ The checkpoints carry one extra layer trained to predict the token after next. W
 - When checking drafts, the linear-attention state after each draft goes into a spare state slot, so a rejected draft needs no recomputation and drafting reserves no memory.
 - Drafting turns itself off when a step gets too large to profit, or when spare slots run out under heavy load.
 
+## LoRA adapters
+
+Each adapter is prepared once on the host in the layout the kernels read (bf16, scale folded in, ranks padded to 16, value heads reordered for GGUF bases) and copied into one of a fixed set of GPU slots when a request needs it. Per step, the scheduler lists tiles of up to 16 tokens that share an adapter. After each linear layer's own matrix multiply, two kernels add the low-rank update: one computes x Aᵀ for all of the layer's fused projections at once, on a second stream so it overlaps the main matrix multiply; the other adds its product with Bᵀ into the output. Swapping an adapter changes only a table the kernels read, so steps with adapters replay CUDA graphs too. Prefix-cache entries are kept per adapter.
+
 ## Images
 
 1. The CPU resizes each image to multiples of 32 pixels and cuts it into patches.

@@ -1,6 +1,6 @@
 //! OpenAI-compatible chat completions over the engine thread.
 
-use crate::engine::{Health, Info};
+use crate::engine::{Adapters, Health, Info, Msg};
 use crate::sched::{Event, Finish, Request, Sampling};
 use crate::{Error, Result};
 use axum::extract::State;
@@ -250,8 +250,10 @@ struct App {
     /// Image preprocessing, when the engine accepts images.
     spec: Option<crate::image::Spec>,
     http: reqwest::Client,
-    engine: Mutex<mpsc::Sender<Request>>,
+    engine: Mutex<mpsc::Sender<Msg>>,
     model: String,
+    /// Adapter names routable through `model`, when adapters are on.
+    adapters: Option<Adapters>,
     info: Info,
     health: Arc<Mutex<Health>>,
     next: AtomicU64,
@@ -259,6 +261,8 @@ struct App {
 
 #[derive(Deserialize)]
 struct ChatRequest {
+    #[serde(default)]
+    model: Option<String>,
     messages: Vec<Value>,
     #[serde(default)]
     max_tokens: Option<usize>,
@@ -420,6 +424,20 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
     if req.n.is_some_and(|n| n != 1) {
         return err(StatusCode::BAD_REQUEST, "only n = 1 is supported");
     }
+    // `model` names the base or an adapter. Without adapters any name means
+    // the base, as before.
+    let (served, adapter) = match (&req.model, &app.adapters) {
+        (Some(m), Some(a)) if *m != app.model => match a.lock().unwrap().get(m) {
+            Some(&id) => (m.clone(), id),
+            None => {
+                return err(
+                    StatusCode::NOT_FOUND,
+                    format!("The model `{m}` does not exist."),
+                );
+            }
+        },
+        _ => (app.model.clone(), 0),
+    };
     let n = app.next.fetch_add(1, Ordering::Relaxed);
     let sampling = match req.sampling(app.info.cfg.vocab, n.wrapping_mul(0x2545_f491_4f6c_dd1d)) {
         Ok(s) => s,
@@ -475,7 +493,7 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         .or(req.max_tokens)
         .unwrap_or(app.info.max_context);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let out = Output::new(stops, prompt.len());
+    let out = Output::new(served, stops, prompt.len());
     let request = Request {
         prompt,
         max_new,
@@ -483,8 +501,15 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         tx,
         images,
         rope,
+        adapter,
     };
-    if app.engine.lock().unwrap().send(request).is_err() {
+    if app
+        .engine
+        .lock()
+        .unwrap()
+        .send(Msg::Request(request))
+        .is_err()
+    {
         return err(StatusCode::SERVICE_UNAVAILABLE, "engine stopped");
     }
     if req.stream {
@@ -503,6 +528,8 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
 /// string. Finding a stop string ends the response; dropping the event
 /// receiver then cancels the request in the engine.
 struct Output {
+    /// The model name to answer with: the base's or the adapter's.
+    model: String,
     detok: Detok,
     text: String,
     sent: usize,
@@ -512,8 +539,9 @@ struct Output {
 }
 
 impl Output {
-    fn new(stops: Vec<String>, prompt_tokens: usize) -> Self {
+    fn new(model: String, stops: Vec<String>, prompt_tokens: usize) -> Self {
         Self {
+            model,
             prompt_tokens,
             detok: Detok {
                 ids: Vec::new(),
@@ -620,7 +648,7 @@ async fn whole_response(
     };
     drop(rx);
     Json(json!({
-        "id": id, "object": "chat.completion", "created": now(), "model": app.model,
+        "id": id, "object": "chat.completion", "created": now(), "model": out.model,
         "choices": [{ "index": 0, "finish_reason": finish,
             "message": { "role": "assistant", "content": content } }],
         "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
@@ -639,20 +667,20 @@ fn stream_response(
     impl futures_util::Stream<Item = std::result::Result<Sse, std::convert::Infallible>>,
 > {
     let created = now();
-    let chunk = move |app: &App, id: &str, delta: Value, finish: Option<&str>| {
+    let chunk = move |model: &str, id: &str, delta: Value, finish: Option<&str>| {
         Sse::default().data(
-            json!({ "id": id, "object": "chat.completion.chunk", "created": created, "model": app.model,
+            json!({ "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }] })
             .to_string(),
         )
     };
-    let closing = move |app: &App, id: &str, finish: &str, prompt: usize, completion: usize| {
-        let mut events = vec![chunk(app, id, json!({}), Some(finish))];
+    let closing = move |model: &str, id: &str, finish: &str, prompt: usize, completion: usize| {
+        let mut events = vec![chunk(model, id, json!({}), Some(finish))];
         if usage {
             events.push(
                 Sse::default().data(
                     json!({ "id": id, "object": "chat.completion.chunk", "created": created,
-                    "model": app.model, "choices": [],
+                    "model": model, "choices": [],
                     "usage": { "prompt_tokens": prompt, "completion_tokens": completion,
                         "total_tokens": prompt + completion } })
                     .to_string(),
@@ -675,7 +703,7 @@ fn stream_response(
                 Phase::End => return None,
                 Phase::Start => {
                     events.push(chunk(
-                        &app,
+                        &out.model,
                         &id,
                         json!({ "role": "assistant", "content": "" }),
                         None,
@@ -686,12 +714,12 @@ fn stream_response(
                     Some(Event::Token(t)) => {
                         let (text, stopped) = out.push(&app.tok, t);
                         if !text.is_empty() {
-                            events.push(chunk(&app, &id, json!({ "content": text }), None));
+                            events.push(chunk(&out.model, &id, json!({ "content": text }), None));
                         }
                         if stopped {
                             rx = None; // cancels the request in the engine
                             events.extend(closing(
-                                &app,
+                                &out.model,
                                 &id,
                                 "stop",
                                 out.prompt_tokens,
@@ -709,10 +737,16 @@ fn stream_response(
                     }) => {
                         let (text, stopped) = out.end(&app.tok);
                         if !text.is_empty() {
-                            events.push(chunk(&app, &id, json!({ "content": text }), None));
+                            events.push(chunk(&out.model, &id, json!({ "content": text }), None));
                         }
                         let finish = if stopped { "stop" } else { finish_name(finish) };
-                        events.extend(closing(&app, &id, finish, prompt_tokens, completion_tokens));
+                        events.extend(closing(
+                            &out.model,
+                            &id,
+                            finish,
+                            prompt_tokens,
+                            completion_tokens,
+                        ));
                         Phase::End
                     }
                     Some(Event::Error(e)) => {
@@ -735,10 +769,88 @@ fn stream_response(
 }
 
 async fn models(State(app): State<Arc<App>>) -> Json<Value> {
-    Json(
-        json!({ "object": "list", "data": [{ "id": app.model, "object": "model", "owned_by": "pocket-engine",
-        "max_model_len": app.info.max_context }] }),
-    )
+    let mut data = vec![
+        json!({ "id": app.model, "object": "model", "owned_by": "pocket-engine",
+        "root": app.model, "parent": null, "max_model_len": app.info.max_context }),
+    ];
+    if let Some(a) = &app.adapters {
+        let mut names: Vec<String> = a.lock().unwrap().keys().cloned().collect();
+        names.sort();
+        for n in names {
+            data.push(
+                json!({ "id": n, "object": "model", "owned_by": "pocket-engine",
+                "root": n, "parent": app.model, "max_model_len": app.info.max_context }),
+            );
+        }
+    }
+    Json(json!({ "object": "list", "data": data }))
+}
+
+/// vLLM's runtime adapter endpoints.
+#[derive(Deserialize)]
+struct AdapterRequest {
+    lora_name: String,
+    #[serde(default)]
+    lora_path: Option<String>,
+}
+
+async fn adapter_call(
+    app: &App,
+    msg: impl FnOnce(tokio::sync::oneshot::Sender<std::result::Result<(), String>>) -> Msg,
+) -> Response {
+    if app.adapters.is_none() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "adapters are off; start with --max-loras or --lora",
+        );
+    }
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    if app.engine.lock().unwrap().send(msg(reply)).is_err() {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "engine stopped");
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => err(StatusCode::BAD_REQUEST, e),
+        Err(_) => err(StatusCode::SERVICE_UNAVAILABLE, "engine stopped"),
+    }
+}
+
+async fn load_adapter(State(app): State<Arc<App>>, Json(req): Json<AdapterRequest>) -> Response {
+    let Some(path) = req.lora_path else {
+        return err(StatusCode::BAD_REQUEST, "lora_path is required");
+    };
+    let name = req.lora_name;
+    let r = adapter_call(&app, |reply| Msg::LoadAdapter {
+        name: name.clone(),
+        path: path.into(),
+        reply,
+    })
+    .await;
+    if r.status() == StatusCode::OK {
+        return (
+            StatusCode::OK,
+            format!("Success: LoRA adapter '{name}' added successfully."),
+        )
+            .into_response();
+    }
+    r
+}
+
+async fn unload_adapter(State(app): State<Arc<App>>, Json(req): Json<AdapterRequest>) -> Response {
+    let name = req.lora_name;
+    let r = adapter_call(&app, |reply| Msg::UnloadAdapter {
+        name: name.clone(),
+        reply,
+    })
+    .await;
+    if r.status() == StatusCode::OK {
+        return (
+            StatusCode::OK,
+            format!("Success: LoRA adapter '{name}' removed successfully."),
+        )
+            .into_response();
+    }
+    r
 }
 
 async fn health_report(State(app): State<Arc<App>>) -> Response {
@@ -757,9 +869,10 @@ async fn health_report(State(app): State<Arc<App>>) -> Response {
 pub async fn serve(
     tok: ChatTokenizer,
     spec: Option<crate::image::Spec>,
-    engine: mpsc::Sender<Request>,
+    engine: mpsc::Sender<Msg>,
     info: Info,
     health: Arc<Mutex<Health>>,
+    adapters: Option<Adapters>,
     model: String,
     bind: &str,
 ) -> Result<()> {
@@ -773,6 +886,7 @@ pub async fn serve(
         http,
         engine: Mutex::new(engine),
         model,
+        adapters,
         info,
         health,
         next: AtomicU64::new(0),
@@ -780,6 +894,8 @@ pub async fn serve(
     let router = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/models", get(models))
+        .route("/v1/load_lora_adapter", post(load_adapter))
+        .route("/v1/unload_lora_adapter", post(unload_adapter))
         .route("/health", get(health_report))
         .with_state(app);
     // Tokens are small writes: without TCP_NODELAY, Nagle's algorithm holds one
@@ -818,12 +934,12 @@ mod tests {
 
     #[test]
     fn stop_strings_end_the_text_even_across_tokens() {
-        let mut out = Output::new(vec!["</a>".into(), "STOP".into()], 0);
+        let mut out = Output::new(String::new(), vec!["</a>".into(), "STOP".into()], 0);
         assert_eq!(
             feed(&mut out, &["one <", "/a", "> two"]),
             ("one ".into(), true)
         );
-        let mut out = Output::new(vec!["STOP".into()], 0);
+        let mut out = Output::new(String::new(), vec!["STOP".into()], 0);
         assert_eq!(
             feed(&mut out, &["no stop ", "here"]),
             ("no stop here".into(), false)
@@ -832,7 +948,7 @@ mod tests {
 
     #[test]
     fn held_back_text_is_released_whole_and_on_char_boundaries() {
-        let mut out = Output::new(vec!["xyz".into()], 0);
+        let mut out = Output::new(String::new(), vec!["xyz".into()], 0);
         out.text.push_str("caf\u{e9}s");
         let (first, _) = out.release(false);
         assert!(first.len() <= out.text.len() - 2 && out.text.starts_with(&first));

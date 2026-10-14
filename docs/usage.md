@@ -43,8 +43,20 @@ pocket-engine serve --model models/Qwen3.5-9B-Q4_K_M.gguf --bind 0.0.0.0:8000
 | Path | |
 |---|---|
 | `POST /v1/chat/completions` | Chat, streamed or not. Images go in `image_url` content parts. |
-| `GET /v1/models` | The served model. |
+| `GET /v1/models` | The served model and its adapters. |
+| `POST /v1/load_lora_adapter` | Load an adapter: `{"lora_name": ..., "lora_path": ...}`. |
+| `POST /v1/unload_lora_adapter` | Unload one no request is using: `{"lora_name": ...}`. |
 | `GET /health` | Running and waiting requests, free KV blocks. |
+
+## LoRA adapters
+
+Serve fine-tuned adapters over one base model, as vLLM does: requests pick one with `"model": "<adapter name>"`, and requests for different adapters and the base run in the same batches.
+
+```sh
+pocket-engine serve --model models/Qwen3.5-9B-Q4_K_M.gguf --lora support=adapters/support --lora billing=adapters/billing.gguf
+```
+
+Adapters are PEFT directories (`adapter_config.json` and `adapter_model.safetensors`) or llama.cpp GGUF adapters, over any base format. `--max-loras` adapters sit on the GPU at once; others wait on the host and swap in when a slot frees. On an RTX 5090, adapters cost 7% at one request on 9B Q4_K_M and about 25% at 16 to 64. Without adapters there is no cost.
 
 Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`) plus vLLM's `top_k`, `min_p` and `repetition_penalty`. The default temperature is 1.0. Prompts that share a beginning reuse its cache.
 
@@ -66,7 +78,10 @@ Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `sto
 | `--fp4` | off | Quantize a bf16 checkpoint to FP4 (RTX 50-series) |
 | `--kv-fp8` | off | FP8 KV cache |
 | `--state-f32` | off | f32 linear-attention state (twice the memory) |
-| `--no-int8` | off | bf16 activations for GGUF weights (see below) |
+| `--no-int8` | off | bf16 activations for GGUF weights (see above) |
+| `--lora NAME=PATH` | none | Serve an adapter; repeat for more |
+| `--max-loras N` | 4 with `--lora`, else off | Adapters on the GPU at once; also allows loading them at runtime |
+| `--max-lora-rank N` | 16 | Largest adapter rank |
 | `--no-vision` | off | Text only |
 | `--max-image-pixels N` | 4194304 | Largest image after resizing |
 | `--image-pool N` | 16384 | Image embeddings waiting at once |

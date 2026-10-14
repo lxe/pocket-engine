@@ -50,6 +50,12 @@ pub struct EngineConfig {
     pub mtp: usize,
     /// Quantize activations to int8 for 4- to 6-bit GGUF matrices in batches.
     pub int8: bool,
+    /// LoRA adapters to load at startup: (name, PEFT directory or GGUF file).
+    pub loras: Vec<(String, PathBuf)>,
+    /// Adapters on the GPU at once; 0 turns adapters off.
+    pub max_loras: usize,
+    /// Largest adapter rank.
+    pub max_lora_rank: usize,
 }
 
 impl EngineConfig {
@@ -73,6 +79,9 @@ impl EngineConfig {
             prefix_cache: None,
             mtp: 0,
             int8: true,
+            loras: Vec::new(),
+            max_loras: 0,
+            max_lora_rank: 16,
         }
     }
 }
@@ -84,7 +93,27 @@ pub struct Scoring {
     pub forced: Vec<u32>,
     pub images: Vec<Image>,
     pub rope: Option<crate::image::Rope>,
+    /// The adapter to score with (an id from `Engine::load_adapter`), or 0.
+    pub adapter: u32,
 }
+
+/// What the server sends the engine.
+pub enum Msg {
+    Request(Request),
+    /// Loads an adapter under a name; the reply carries an error, if any.
+    LoadAdapter {
+        name: String,
+        path: PathBuf,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+    UnloadAdapter {
+        name: String,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+}
+
+/// Adapter names the server may route requests to, by id.
+pub type Adapters = Arc<Mutex<HashMap<String, u32>>>;
 
 #[derive(Debug, Clone)]
 pub struct Info {
@@ -123,6 +152,11 @@ pub struct Engine {
     graphs: HashMap<usize, Graph>,
     /// Steps where every sequence verifies drafts, by padded sequence count.
     verify_graphs: HashMap<usize, Graph>,
+    /// The same with the LoRA kernels, for steps where a sequence has an adapter.
+    lora_graphs: HashMap<usize, Graph>,
+    lora_verify_graphs: HashMap<usize, Graph>,
+    lora: Option<crate::lora::Loras>,
+    pub adapters: Adapters,
     vision: Option<Vision>,
     pub sched: Scheduler,
     pub stats: Stats,
@@ -225,6 +259,33 @@ impl Engine {
             spec,
         };
         let act = Act::new(&gpu, &mc, meta, pool_rows, model.fp8)?;
+        let mut model = model;
+        let lora = if cfg.max_loras > 0 || !cfg.loras.is_empty() {
+            if spec > crate::lora::TILE {
+                return Err(Error::Config(
+                    "adapters take at most 15 drafts per step".into(),
+                ));
+            }
+            let slots = cfg.max_loras.max(1);
+            let l = crate::lora::Loras::new(
+                &gpu,
+                model.lora_sites(),
+                model.gguf,
+                (mc.lin_k_heads, mc.lin_v_heads),
+                slots,
+                cfg.max_lora_rank,
+                meta.max_tokens,
+            )?;
+            model.attach_lora(&l);
+            eprintln!(
+                "adapters: {slots} GPU slots up to rank {} ({} MB)",
+                l.max_rank,
+                l.bytes() >> 20
+            );
+            Some(l)
+        } else {
+            None
+        };
         // One extra slot absorbs the padding rows of graph replays; the
         // prefix cache's snapshots follow it.
         let snaps = snapshots(&cfg, cfg.max_seqs);
@@ -259,6 +320,9 @@ impl Engine {
             sched =
                 sched.with_prefix_cache(cfg.max_seqs + 1..cfg.max_seqs + 1 + snaps, mc.turn_token);
         }
+        if let Some(l) = &lora {
+            sched = sched.with_lora_slots(l.max_slots);
+        }
         let mut e = Self {
             gpu,
             model,
@@ -266,11 +330,18 @@ impl Engine {
             act,
             graphs: HashMap::new(),
             verify_graphs: HashMap::new(),
+            lora_graphs: HashMap::new(),
+            lora_verify_graphs: HashMap::new(),
+            lora,
+            adapters: Arc::default(),
             vision,
             sched,
             stats: Stats::default(),
             cfg,
         };
+        for (name, path) in e.cfg.loras.clone() {
+            e.load_adapter(&name, &path)?;
+        }
         let t_alloc = started.elapsed().as_secs_f64();
         if e.cfg.graphs {
             e.capture()?;
@@ -303,35 +374,117 @@ impl Engine {
         let max = self.cfg.max_seqs;
         let spec = self.act.meta.spec;
         let shapes = if spec > 1 { vec![1, spec] } else { vec![1] };
-        for n in shapes {
-            for &b in BUCKETS.iter().filter(|&&b| b <= max) {
-                self.sched.pad(self.act.staging.as_mut_slice(), 0, b, n);
-                self.act.upload_meta(&self.gpu)?;
-                let t = b * n;
-                // A plain run first, so cuBLAS settles its kernels outside capture.
-                self.model
-                    .forward(&self.gpu, &self.state, &self.act, t, b, t)?;
-                self.gpu.sync()?;
-                self.gpu.begin_capture()?;
-                let r = self
-                    .model
-                    .forward(&self.gpu, &self.state, &self.act, t, b, t);
-                let g = self.gpu.end_capture();
-                r?;
-                if n == 1 {
-                    self.graphs.insert(b, g?);
-                } else {
-                    self.verify_graphs.insert(b, g?);
+        let lora_sets = if self.lora.is_some() {
+            vec![false, true]
+        } else {
+            vec![false]
+        };
+        for with_lora in lora_sets {
+            for &n in &shapes {
+                for &b in BUCKETS.iter().filter(|&&b| b <= max) {
+                    self.sched.pad(self.act.staging.as_mut_slice(), 0, b, n);
+                    self.act.upload_meta(&self.gpu)?;
+                    let t = b * n;
+                    // A sequence's tokens fit one tile, so b bounds the tiles.
+                    let lora = match (&self.lora, with_lora) {
+                        (Some(l), true) => Some(self.act.lora_step(l, b)),
+                        _ => None,
+                    };
+                    // A plain run first, so cuBLAS settles its kernels outside capture.
+                    self.model
+                        .forward(&self.gpu, &self.state, &self.act, t, b, t, lora)?;
+                    self.gpu.sync()?;
+                    self.gpu.begin_capture()?;
+                    let r = self
+                        .model
+                        .forward(&self.gpu, &self.state, &self.act, t, b, t, lora);
+                    let g = self.gpu.end_capture();
+                    r?;
+                    let set = match (with_lora, n == 1) {
+                        (false, true) => &mut self.graphs,
+                        (false, false) => &mut self.verify_graphs,
+                        (true, true) => &mut self.lora_graphs,
+                        (true, false) => &mut self.lora_verify_graphs,
+                    };
+                    set.insert(b, g?);
                 }
             }
         }
         self.gpu.sync()?;
         eprintln!(
             "captured {} decode graphs in {:.2}s",
-            self.graphs.len() + self.verify_graphs.len(),
+            self.graphs.len()
+                + self.verify_graphs.len()
+                + self.lora_graphs.len()
+                + self.lora_verify_graphs.len(),
             t0.elapsed().as_secs_f64()
         );
         Ok(())
+    }
+
+    /// Loads an adapter and makes it routable by name; returns its id.
+    pub fn load_adapter(&mut self, name: &str, path: &std::path::Path) -> Result<u32> {
+        let l = self.lora.as_mut().ok_or_else(|| {
+            Error::Config("adapters are off; start with --max-loras or --lora".into())
+        })?;
+        let id = l.load(&self.gpu, name, path)?;
+        self.adapters.lock().unwrap().insert(name.to_string(), id);
+        eprintln!(
+            "adapter {name}: rank {} from {}",
+            l.adapter(id).map_or(0, |a| a.rank),
+            path.display()
+        );
+        Ok(id)
+    }
+
+    /// Unloads an adapter no request is using.
+    pub fn unload_adapter(&mut self, name: &str) -> Result<()> {
+        let l = self
+            .lora
+            .as_mut()
+            .ok_or_else(|| Error::Config(format!("no adapter named {name}")))?;
+        let id = l
+            .id(name)
+            .ok_or_else(|| Error::Config(format!("no adapter named {name}")))?;
+        if self.sched.uses_adapter(id) {
+            return Err(Error::Config(format!("adapter {name} is in use")));
+        }
+        l.unload(name);
+        self.sched.forget_adapter(id);
+        self.adapters.lock().unwrap().remove(name);
+        Ok(())
+    }
+
+    /// Queues a request, answering at once if its adapter is gone.
+    pub fn submit(&mut self, r: Request) {
+        if r.adapter != 0
+            && self
+                .lora
+                .as_ref()
+                .is_none_or(|l| l.adapter(r.adapter).is_none())
+        {
+            let _ = r.tx.send(crate::sched::Event::Error(
+                "the adapter was unloaded".into(),
+            ));
+            return;
+        }
+        self.sched.submit(r);
+    }
+
+    fn handle(&mut self, msg: Msg) {
+        match msg {
+            Msg::Request(r) => self.submit(r),
+            Msg::LoadAdapter { name, path, reply } => {
+                let _ = reply.send(
+                    self.load_adapter(&name, &path)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                );
+            }
+            Msg::UnloadAdapter { name, reply } => {
+                let _ = reply.send(self.unload_adapter(&name).map_err(|e| e.to_string()));
+            }
+        }
     }
 
     /// Runs one step if there is work. Returns sequences that finished.
@@ -343,6 +496,12 @@ impl Engine {
         for &(from, to) in &step.copies {
             self.state.copy_slot(&self.gpu, from, to)?;
         }
+        if let Some(l) = self.lora.as_mut() {
+            for &(slot, id) in &step.lora_loads {
+                l.upload(&self.gpu, slot, id)?;
+            }
+        }
+        let tiles = step.lora_tiles;
         let (t, s, r) = (step.tokens, step.seqs(), step.outs);
         let pens = self.sched.fill(
             &step,
@@ -350,10 +509,11 @@ impl Engine {
             &mut Pen::split(self.act.pen_staging.as_mut_slice()),
         );
         let spec = self.act.meta.spec;
-        let (graphs, n) = if step.verify_only(spec) {
-            (&self.verify_graphs, spec)
-        } else {
-            (&self.graphs, 1)
+        let (graphs, n) = match (step.verify_only(spec), tiles > 0) {
+            (true, false) => (&self.verify_graphs, spec),
+            (false, false) => (&self.graphs, 1),
+            (true, true) => (&self.lora_verify_graphs, spec),
+            (false, true) => (&self.lora_graphs, 1),
         };
         let bucket = if (step.decode_only() || n > 1) && self.cfg.graphs {
             BUCKETS
@@ -375,8 +535,12 @@ impl Engine {
             None => {
                 self.act.upload_pen(&self.gpu, pens)?;
                 self.act.upload_meta(&self.gpu)?;
+                let lora = match &self.lora {
+                    Some(l) if tiles > 0 => Some(self.act.lora_step(l, tiles)),
+                    _ => None,
+                };
                 self.model
-                    .forward(&self.gpu, &self.state, &self.act, t, s, r)?;
+                    .forward(&self.gpu, &self.state, &self.act, t, s, r, lora)?;
             }
         }
         self.act.download_ids(&self.gpu, r, s)?;
@@ -467,6 +631,7 @@ impl Engine {
             let mut req = Request::text(item.prompt, item.forced.len(), sampling, tx);
             req.images = item.images;
             req.rope = item.rope;
+            req.adapter = item.adapter;
             self.sched.submit_forced(req, item.forced);
         }
         let mut out: Vec<Vec<Scored>> = vec![Vec::new(); n];
@@ -504,8 +669,12 @@ fn score(argmax: u32, logits: &[f32]) -> Scored {
 
 /// Runs the engine on its own thread. Returns once the model is loaded, with
 /// the request channel and the shared health report.
-pub fn spawn(cfg: EngineConfig) -> Result<(mpsc::Sender<Request>, Info, Arc<Mutex<Health>>)> {
-    let (tx, rx) = mpsc::channel::<Request>();
+/// What `spawn` hands the server: the message channel, the model's
+/// description, the shared health report and the routable adapter names.
+pub type Spawned = (mpsc::Sender<Msg>, Info, Arc<Mutex<Health>>, Adapters);
+
+pub fn spawn(cfg: EngineConfig) -> Result<Spawned> {
+    let (tx, rx) = mpsc::channel::<Msg>();
     let (ready_tx, ready_rx) = mpsc::channel();
     let health = Arc::new(Mutex::new(Health::default()));
     let shared = health.clone();
@@ -514,7 +683,7 @@ pub fn spawn(cfg: EngineConfig) -> Result<(mpsc::Sender<Request>, Info, Arc<Mute
         .spawn(move || {
             let mut engine = match Engine::new(cfg) {
                 Ok(e) => {
-                    let _ = ready_tx.send(Ok(e.info()));
+                    let _ = ready_tx.send(Ok((e.info(), e.adapters.clone())));
                     e
                 }
                 Err(e) => {
@@ -535,20 +704,27 @@ pub fn spawn(cfg: EngineConfig) -> Result<(mpsc::Sender<Request>, Info, Arc<Mute
                 if engine.sched.idle() {
                     publish(&engine, None);
                     match rx.recv() {
-                        Ok(r) => engine.sched.submit(r),
+                        Ok(m) => engine.handle(m),
                         Err(_) => return,
                     }
                 }
-                while let Ok(r) = rx.try_recv() {
-                    engine.sched.submit(r);
+                while let Ok(m) = rx.try_recv() {
+                    engine.handle(m);
                 }
                 if let Err(e) = engine.step() {
                     eprintln!("engine step failed: {e}");
                     engine.sched.fail_all(&e.to_string());
                     publish(&engine, Some(e.to_string()));
                     // Answer later requests with the failure instead of hanging.
-                    while let Ok(r) = rx.recv() {
-                        let _ = r.tx.send(crate::sched::Event::Error(e.to_string()));
+                    while let Ok(m) = rx.recv() {
+                        match m {
+                            Msg::Request(r) => {
+                                let _ = r.tx.send(crate::sched::Event::Error(e.to_string()));
+                            }
+                            Msg::LoadAdapter { reply, .. } | Msg::UnloadAdapter { reply, .. } => {
+                                let _ = reply.send(Err(e.to_string()));
+                            }
+                        }
                     }
                     return;
                 }
@@ -580,8 +756,8 @@ pub fn spawn(cfg: EngineConfig) -> Result<(mpsc::Sender<Request>, Info, Arc<Mute
                 }
             }
         })?;
-    let info = ready_rx
+    let (info, adapters) = ready_rx
         .recv()
         .map_err(|_| Error::Config("engine thread exited".into()))??;
-    Ok((tx, info, health))
+    Ok((tx, info, health, adapters))
 }

@@ -78,6 +78,8 @@ pub struct Request {
     /// Rotary positions of the prompt's tokens and the offset after it, when
     /// they differ from the token index (prompts with images).
     pub rope: Option<crate::image::Rope>,
+    /// The LoRA adapter to run with (an id from `Loras`), or 0.
+    pub adapter: u32,
 }
 
 impl Request {
@@ -94,6 +96,7 @@ impl Request {
             tx,
             images: Vec::new(),
             rope: None,
+            adapter: 0,
         }
     }
 }
@@ -115,6 +118,8 @@ pub struct Scored {
 pub struct Seq {
     pub req: Request,
     slot: usize,
+    /// The GPU slot holding its adapter, or 0.
+    lora: usize,
     /// Draft tokens to verify next step (multi-token prediction).
     drafts: Vec<u32>,
     /// While verifying drafts: the slot to keep the state in after each fed
@@ -230,6 +235,10 @@ pub struct Step {
     /// state slot). The recurrence keeps its state at the prefix's end, which
     /// falls on its chunk grid, so the prompt need not stop there.
     snaps: Vec<(usize, usize, usize)>,
+    /// Adapters to copy into GPU slots before the step: (slot, adapter).
+    pub lora_loads: Vec<(usize, u32)>,
+    /// Kernel tiles of the step's tokens that have adapters.
+    pub lora_tiles: usize,
 }
 
 impl Step {
@@ -280,6 +289,7 @@ pub const CACHE_UNIT: usize = 64;
 /// A cached prompt prefix: its tokens, the KV blocks that hold their keys
 /// and values, and a state slot holding the recurrent state after them.
 struct Entry {
+    adapter: u32,
     tokens: Vec<u32>,
     blocks: Vec<u32>,
     snap: usize,
@@ -297,11 +307,11 @@ struct Prefixes {
 }
 
 /// Chained hashes of a prompt's whole units: element k covers tokens
-/// [0, (k + 1) * CACHE_UNIT).
-fn unit_hashes(tokens: &[u32]) -> Vec<u64> {
+/// [0, (k + 1) * CACHE_UNIT). Prompts for different adapters never share.
+fn unit_hashes(adapter: u32, tokens: &[u32]) -> Vec<u64> {
     use std::hash::{Hash, Hasher};
     let mut out = Vec::with_capacity(tokens.len() / CACHE_UNIT);
-    let mut h = 0u64;
+    let mut h = adapter as u64;
     for unit in tokens.as_chunks::<CACHE_UNIT>().0 {
         let mut st = std::collections::hash_map::DefaultHasher::new();
         h.hash(&mut st);
@@ -312,8 +322,50 @@ fn unit_hashes(tokens: &[u32]) -> Vec<u64> {
     out
 }
 
+/// Which adapter each GPU slot holds (index 0 unused), how many running
+/// sequences use it, and when it was last placed.
+#[derive(Default)]
+struct LoraSlots {
+    held: Vec<Option<u32>>,
+    refs: Vec<usize>,
+    used: Vec<u64>,
+    clock: u64,
+    /// Adapters to copy into slots before the next step.
+    loads: Vec<(usize, u32)>,
+}
+
+impl LoraSlots {
+    fn holding(&self, a: u32) -> Option<usize> {
+        (1..self.held.len()).find(|&i| self.held[i] == Some(a))
+    }
+    fn can_place(&self, a: u32) -> bool {
+        self.holding(a).is_some() || (1..self.held.len()).any(|i| self.refs[i] == 0)
+    }
+    /// The slot for adapter `a`: the one holding it, or a free one (empty
+    /// first, then least recently used), queued for upload.
+    fn place(&mut self, a: u32) -> usize {
+        self.clock += 1;
+        let i = match self.holding(a) {
+            Some(i) => i,
+            None => {
+                let i = (1..self.held.len())
+                    .filter(|&i| self.refs[i] == 0)
+                    .min_by_key(|&i| (self.held[i].is_some(), self.used[i]))
+                    .expect("checked by can_place");
+                self.held[i] = Some(a);
+                self.loads.push((i, a));
+                i
+            }
+        };
+        self.refs[i] += 1;
+        self.used[i] = self.clock;
+        i
+    }
+}
+
 pub struct Scheduler {
     meta: Meta,
+    lora: LoraSlots,
     image_token: u32,
     pool_free: Vec<(usize, usize)>,
     pool_rows: usize,
@@ -377,6 +429,7 @@ impl Scheduler {
             block_refs: vec![0; blocks],
             total_blocks: blocks,
             prefixes: Prefixes::default(),
+            lora: LoraSlots::default(),
             pending_copies: Vec::new(),
             verify_rows: VERIFY_ROWS,
             waiting: VecDeque::new(),
@@ -396,6 +449,44 @@ impl Scheduler {
     pub fn with_verify_rows(mut self, rows: usize) -> Self {
         self.verify_rows = rows;
         self
+    }
+
+    /// Lets requests run adapters, `slots` of them on the GPU at once.
+    pub fn with_lora_slots(mut self, slots: usize) -> Self {
+        self.lora = LoraSlots {
+            held: vec![None; slots + 1],
+            refs: vec![0; slots + 1],
+            used: vec![0; slots + 1],
+            ..Default::default()
+        };
+        self
+    }
+
+    /// Whether a running or waiting request uses adapter `a`.
+    pub fn uses_adapter(&self, a: u32) -> bool {
+        self.running
+            .iter()
+            .chain(&self.waiting)
+            .any(|s| s.req.adapter == a)
+    }
+
+    /// Forgets adapter `a`'s slot and cache entries once it is unloaded.
+    pub fn forget_adapter(&mut self, a: u32) {
+        if let Some(i) = self.lora.holding(a) {
+            self.lora.held[i] = None;
+        }
+        let gone: Vec<u64> = self
+            .prefixes
+            .entries
+            .iter()
+            .filter(|(_, e)| e.adapter == a)
+            .map(|(&h, _)| h)
+            .collect();
+        for h in gone {
+            let e = self.prefixes.entries.remove(&h).expect("present");
+            self.unref_blocks(&e.blocks);
+            self.prefixes.free_snaps.push(e.snap);
+        }
     }
 
     pub fn with_prefix_cache(mut self, slots: std::ops::Range<usize>, turn: u32) -> Self {
@@ -459,6 +550,7 @@ impl Scheduler {
         self.waiting.push_back(Seq {
             req,
             slot: 0,
+            lora: 0,
             drafts: Vec::new(),
             outs: Vec::new(),
             blocks: Vec::new(),
@@ -477,10 +569,17 @@ impl Scheduler {
     }
 
     fn admit(&mut self) {
+        // Requests whose adapter cannot get a GPU slot yet wait; those after
+        // them may still start.
+        let mut at = 0;
         while self.running.len() < self.meta.max_seqs {
-            let Some(seq) = self.waiting.front() else {
+            let Some(seq) = self.waiting.get(at) else {
                 break;
             };
+            if seq.req.adapter != 0 && !self.lora.can_place(seq.req.adapter) {
+                at += 1;
+                continue;
+            }
             let total_blocks = (seq.req.prompt.len() + seq.req.max_new).div_ceil(BLOCK_SIZE);
             let rows: usize = seq.req.images.iter().map(Image::tokens).sum();
             // Text prompts may reuse and leave cached prefixes; prompts with
@@ -488,7 +587,7 @@ impl Scheduler {
             let cacheable = rows == 0
                 && (!self.prefixes.free_snaps.is_empty() || !self.prefixes.entries.is_empty());
             let hit = if cacheable {
-                self.lookup(&seq.req.prompt)
+                self.lookup(seq.req.adapter, &seq.req.prompt)
             } else {
                 None
             };
@@ -524,7 +623,10 @@ impl Scheduler {
             {
                 break;
             }
-            let mut seq = self.waiting.pop_front().expect("front exists");
+            let mut seq = self.waiting.remove(at).expect("checked above");
+            if seq.req.adapter != 0 {
+                seq.lora = self.lora.place(seq.req.adapter);
+            }
             if let Some(i) = pool_at {
                 let (start, len) = self.pool_free[i];
                 if len == rows {
@@ -619,20 +721,24 @@ impl Scheduler {
 
     /// The longest cached prefix of `prompt` that leaves at least one token to
     /// compute: its hash and length.
-    fn lookup(&self, prompt: &[u32]) -> Option<(u64, usize)> {
-        let hashes = unit_hashes(&prompt[..prompt.len() - 1]);
+    fn lookup(&self, adapter: u32, prompt: &[u32]) -> Option<(u64, usize)> {
+        let hashes = unit_hashes(adapter, &prompt[..prompt.len() - 1]);
         hashes.iter().enumerate().rev().find_map(|(k, h)| {
             let len = (k + 1) * CACHE_UNIT;
             self.prefixes
                 .entries
                 .get(h)
-                .filter(|e| e.tokens[..] == prompt[..len])
+                .filter(|e| e.adapter == adapter && e.tokens[..] == prompt[..len])
                 .map(|_| (*h, len))
         })
     }
 
     fn release(&mut self, mut seq: Seq) -> Seq {
         self.free_slots.push(seq.slot);
+        if seq.lora != 0 {
+            self.lora.refs[seq.lora] -= 1;
+            seq.lora = 0;
+        }
         let blocks = std::mem::take(&mut seq.blocks);
         self.unref_blocks(&blocks);
         self.release_pool(&mut seq);
@@ -754,19 +860,26 @@ impl Scheduler {
                 }
                 self.running[ri].snap_at.remove(0);
                 let prefix = self.running[ri].req.prompt[..at].to_vec();
-                if let Some(slot) = self.reserve_snap(&prefix) {
+                if let Some(slot) = self.reserve_snap(self.running[ri].req.adapter, &prefix) {
                     step.snaps.push((si, at, slot));
                 }
             }
         }
         step.copies = std::mem::take(&mut self.pending_copies);
+        step.lora_loads = std::mem::take(&mut self.lora.loads);
+        step.lora_tiles = step
+            .rows
+            .iter()
+            .filter(|&&(ri, _)| self.running[ri].lora != 0)
+            .map(|&(_, n)| n.div_ceil(crate::lora::TILE))
+            .sum();
         Some(step)
     }
 
     /// A free snapshot slot for a new cache entry of `prefix`, evicting the
     /// least recently used entry if needed; None if the entry exists.
-    fn reserve_snap(&mut self, prefix: &[u32]) -> Option<usize> {
-        let h = *unit_hashes(prefix).last()?;
+    fn reserve_snap(&mut self, adapter: u32, prefix: &[u32]) -> Option<usize> {
+        let h = *unit_hashes(adapter, prefix).last()?;
         if self.prefixes.entries.contains_key(&h) {
             return None;
         }
@@ -780,7 +893,8 @@ impl Scheduler {
     /// entry whose state is (or will be, before the next step) in `snap`.
     fn add_entry(&mut self, ri: usize, len: usize, snap: usize) {
         let s = &self.running[ri];
-        let Some(&h) = unit_hashes(&s.req.prompt[..len]).last() else {
+        let adapter = s.req.adapter;
+        let Some(&h) = unit_hashes(adapter, &s.req.prompt[..len]).last() else {
             self.prefixes.free_snaps.push(snap);
             return;
         };
@@ -793,6 +907,7 @@ impl Scheduler {
         self.prefixes.entries.insert(
             h,
             Entry {
+                adapter,
                 tokens,
                 blocks,
                 snap,
@@ -807,6 +922,7 @@ impl Scheduler {
         let me = &self.meta;
         let mut t = 0;
         let mut e = 0;
+        let mut tiles = 0;
         m[me.cu()] = 0;
         m[me.pen_cu()] = 0;
         m[me.ocu()] = 0;
@@ -819,6 +935,15 @@ impl Scheduler {
                 (Some((start, _)), Some(&r)) if r >= 0 => start as i32 + r,
                 _ => -1,
             };
+            if s.lora != 0 {
+                for k in (0..n).step_by(crate::lora::TILE) {
+                    let at = me.lora() + 1 + 3 * tiles;
+                    m[at] = (t + k) as i32;
+                    m[at + 1] = (n - k).min(crate::lora::TILE) as i32;
+                    m[at + 2] = s.lora as i32;
+                    tiles += 1;
+                }
+            }
             for k in 0..n {
                 let p = s.fed + k;
                 m[me.ids() + t] = if verifies && k > 0 {
@@ -889,6 +1014,7 @@ impl Scheduler {
                 *dst = b as i32;
             }
         }
+        m[me.lora()] = tiles as i32;
         e
     }
 
@@ -902,6 +1028,7 @@ impl Scheduler {
             m[me.cu()] = 0;
             m[me.pen_cu()] = 0;
             m[me.ocu()] = 0;
+            m[me.lora()] = 0;
         }
         for i in from..to {
             for k in 0..n {
@@ -1069,7 +1196,7 @@ impl Scheduler {
     fn keep_prefix(&mut self, ri: usize) {
         let len = self.running[ri].fed;
         let prefix = self.running[ri].req.prompt[..len].to_vec();
-        if let Some(snap) = self.reserve_snap(&prefix) {
+        if let Some(snap) = self.reserve_snap(self.running[ri].req.adapter, &prefix) {
             self.pending_copies.push((self.running[ri].slot, snap));
             self.add_entry(ri, len, snap);
         }

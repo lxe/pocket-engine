@@ -13,6 +13,7 @@ fn main() {
         "amd/gdn_chunk.cuh",
         "amd/attention.cuh",
         "amd/skinny.cuh",
+        "amd/qtile8.cuh",
     ] {
         println!("cargo:rerun-if-changed=src/kernels/{f}");
     }

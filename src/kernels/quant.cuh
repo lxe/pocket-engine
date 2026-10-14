@@ -1097,11 +1097,17 @@ __device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t
     }
 }
 
+#ifdef __HIP_PLATFORM_AMD__
+#include "amd/qtile8.cuh"
+#define QTILE8_IMPL qtile8_mfma
+#else
+#define QTILE8_IMPL qtile8
+#endif
 #define QTILE8(T, name, MT)                                                                            \
     extern "C" __global__ void __launch_bounds__(128) qtile8_##name##_##MT(                            \
         const uint8_t* W, int N, int K, const int8_t* Xq, const float2* Xs, int Mp, int M, void* Y,    \
         int ldy, int off, int f32_out, float* acc_ws, int ksplit) {                                    \
-        qtile8<T, MT>(W, N, K, Xq, Xs, Mp, M, Y, ldy, off, f32_out, acc_ws, ksplit);                   \
+        QTILE8_IMPL<T, MT>(W, N, K, Xq, Xs, Mp, M, Y, ldy, off, f32_out, acc_ws, ksplit);              \
     }
 QTILE8(T_Q4_0, q4_0, 8) QTILE8(T_Q4_0, q4_0, 16) QTILE8(T_Q4_0, q4_0, 32) QTILE8(T_Q4_0, q4_0, 64)
 QTILE8(T_Q4_K, q4_k, 8) QTILE8(T_Q4_K, q4_k, 16) QTILE8(T_Q4_K, q4_k, 32) QTILE8(T_Q4_K, q4_k, 64)

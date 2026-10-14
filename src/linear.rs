@@ -118,7 +118,9 @@ fn gemv_rows() -> usize {
 }
 /// Rows from which `--int8` takes the int8 path; below, weights dominate and
 /// bf16 is as fast.
-const INT8_ROWS: usize = 16;
+/// On AMD the bf16 tile kernels emulate NVIDIA's mma.sync while the int8 ones
+/// run natively on MFMA, so int8 takes every batch there.
+const INT8_ROWS: usize = if cfg!(feature = "rocm") { 1 } else { 16 };
 pub fn int8_rows() -> usize {
     env_usize("POCKET_INT8_ROWS", INT8_ROWS).max(1)
 }

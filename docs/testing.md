@@ -56,5 +56,7 @@ python scripts/accuracy.py compare out.ref.json out.ours.json             # agre
 
 `POCKET_PROFILE=1` times every kernel and cuBLAS call with CUDA events and adds GPU time by kernel to the server's 10-second report. CUDA graphs hide the kernels inside them, so profile with `--no-graphs`. It works where `ncu` cannot read counters, as in most rented containers.
 
+`POCKET_NO_WS=1` sends prompts on Hopper and B200 to the portable flash kernel instead of the warp-specialized one, for A/B runs.
+
 `scripts/perf_check.py` reruns the matmul, attention and linear-attention benchmarks and short load tests against a stored baseline for the GPU, and fails on a regression.
 

@@ -216,7 +216,8 @@ enum Cmd {
         /// device's choice).
         #[arg(long)]
         shape: Option<String>,
-        /// The wgmma kernel (Hopper; groups of 4 or 6).
+        /// The warp-specialized kernel (wgmma on Hopper, tcgen05 on B200;
+        /// groups of 4 or 6).
         #[arg(long)]
         wg: bool,
     },
@@ -835,12 +836,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => pocket_engine::model::fa_shape(group, gpu.arch, false),
             };
             let (tiles, smem) = (sh.tiles, sh.smem(group));
-            let (name, grid, threads, smem) = if wg {
+            let ws = if wg {
+                Some(
+                    pocket_engine::model::FaWs::get(group, gpu.arch, false)
+                        .ok_or("--wg needs Hopper or B200 and a group of 4 or 6")?,
+                )
+            } else {
+                None
+            };
+            let (name, grid, threads, smem) = if let Some(ws) = ws {
                 (
-                    format!("attn_ws_g{group}"),
-                    (gpu.sms as u32, 1, 1),
-                    384,
-                    pocket_engine::model::WS_SMEM,
+                    ws.name(),
+                    ws.grid(t, seqs, hq, gpu.sms),
+                    ws.threads(),
+                    ws.smem(),
                 )
             } else {
                 (

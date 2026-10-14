@@ -1543,7 +1543,7 @@ __device__ __forceinline__ void wg_o(float* d, const uint32_t* a, uint64_t db) {
 }
 #endif
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 __device__ __forceinline__ void mbar_init(uint32_t bar, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar), "r"(count));
 }
@@ -1865,6 +1865,7 @@ __device__ __forceinline__ void attn_ws_body(ATTN_FLASH_ARGS, const CUtensorMap*
 #define ATTN_WS_PASS ATTN_FLASH_PASS, &kmap, &vmap, nslots
 extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g4(ATTN_WS_ARGS) { attn_ws_body<4>(ATTN_WS_PASS); }
 extern "C" __global__ void __launch_bounds__(384, 1) attn_ws_g6(ATTN_WS_ARGS) { attn_ws_body<6>(ATTN_WS_PASS); }
+#include "attn_sm100.cuh"
 
 
 // Combines the key ranges of split decode attention (attn_body with `part`)

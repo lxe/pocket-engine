@@ -67,6 +67,9 @@ struct EngineArgs {
     /// omitted).
     #[arg(long, num_args = 0..=1, default_missing_value = "2")]
     mtp: Option<usize>,
+    /// int8 activations for Q4_0 and Q4_K matrices in batches of 16 or more.
+    #[arg(long)]
+    int8: bool,
 }
 
 impl EngineArgs {
@@ -88,6 +91,7 @@ impl EngineArgs {
             state_bf16: !self.state_f32,
             prefix_cache: self.prefix_cache,
             mtp: self.mtp.unwrap_or(0),
+            int8: self.int8,
             ..EngineConfig::new(self.model.clone())
         }
     }
@@ -348,6 +352,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut quants = Quants::default();
             let qk = quants.get(&gpu, info.ty)?;
             quants.prepare(&gpu, n * k)?;
+            let mut quants8 = Quants::default();
+            quants8.int8_rows = 1;
+            quants8.get(&gpu, info.ty)?;
+            quants8.prepare(&gpu, n * k)?;
+            let int8 = qk.tiled.as_ref().is_some_and(|t| t.mma8.is_some());
             // Weights stream from memory when serving, so each format cycles
             // through copies that together exceed the L2 cache several times.
             let copies = |bytes: usize| (512usize << 20).div_ceil(bytes).clamp(2, 32);
@@ -414,11 +423,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data.len() as f64 / 1e6
             );
             for &m in &rows {
-                let time = |ls: &[Linear], y: u64| -> Result<f64, Box<dyn std::error::Error>> {
+                let time_with = |quants: &Quants,
+                                 ls: &[Linear],
+                                 y: u64|
+                 -> Result<f64, Box<dyn std::error::Error>> {
                     let run = |l: &Linear| {
                         l.forward(
                             &gpu,
-                            &quants,
+                            quants,
                             pocket_engine::linear::Input::bf16(x.ptr),
                             m,
                             y,
@@ -438,6 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gpu.sync()?;
                     Ok(t0.elapsed().as_secs_f64() / iters as f64)
                 };
+                let time = |ls: &[Linear], y: u64| time_with(&quants, ls, y);
                 let rel = |p: u64, q: u64| -> Result<f32, Box<dyn std::error::Error>> {
                     let (mut ha, mut hb) = (gpu.pinned(m * n * 4)?, gpu.pinned(m * n * 4)?);
                     gpu.dtoh(&mut ha, p, m * n * 4)?;
@@ -454,12 +467,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     String::new()
                 } else {
                     let t = time(&tiled, yt.ptr)?;
-                    format!(
+                    let mut s = format!(
                         "  tiled {:8.1} us ({:6.0} GB/s, diff {:.1e})",
                         t * 1e6,
                         data.len() as f64 / t / 1e9,
                         rel(yt.ptr, yb.ptr)?
-                    )
+                    );
+                    if int8 {
+                        let t = time_with(&quants8, &tiled, yt.ptr)?;
+                        s += &format!(
+                            "  int8 {:8.1} us (diff {:.1e})",
+                            t * 1e6,
+                            rel(yt.ptr, yb.ptr)?
+                        );
+                    }
+                    s
                 };
                 println!(
                     "rows {m:4}: quant {:8.1} us ({:6.0} GB/s of weights)  bf16 cuBLAS {:8.1} us  max rel diff {err:.1e}{tt}",

@@ -48,6 +48,8 @@ pub struct EngineConfig {
     /// Drafts per step from the multi-token-prediction layer; 0 turns
     /// speculative decoding off.
     pub mtp: usize,
+    /// Quantize activations to int8 for 4-bit GGUF matrices in batches.
+    pub int8: bool,
 }
 
 impl EngineConfig {
@@ -70,6 +72,7 @@ impl EngineConfig {
             state_bf16: true,
             prefix_cache: None,
             mtp: 0,
+            int8: false,
         }
     }
 }
@@ -155,6 +158,7 @@ impl Engine {
             quantize: cfg.fp8 || cfg.fp4,
             fp4: cfg.fp4,
             mtp: cfg.mtp > 0,
+            int8: cfg.int8,
         };
         if cfg.mtp > 7 {
             return Err(Error::Config("--mtp takes 1 to 7 drafts per step".into()));

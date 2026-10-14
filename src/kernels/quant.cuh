@@ -801,6 +801,189 @@ __device__ void qtile(const uint8_t* __restrict__ W, int N, int K, const bf16* _
     }
 }
 
+// ---------------------------------------------------------------------------
+// W4A8: the tiled 4-bit layout against int8 activations, on int8 tensor cores
+// (mma m16n8k32), llama.cpp's MMQ scheme. Each step of 32 inputs gives an
+// exact integer dot product per (row, token), scaled by the row's step scale
+// and the token's activation scale.
+
+// Xq[m][k] = round(x / d) in int8, d = max|x| / 127 per (m, step of 32), with
+// each group of 8 stored as inputs 0 4 1 5 2 6 3 7: the byte order the
+// nibble words of the tiled layout unpack to under one mask. Xs[step * Mp +
+// m] = (d, sum of x) as floats. One thread per group of 8.
+extern "C" __global__ void quant_act8(const bf16* __restrict__ X, int ldx, int M, int K, int Mp,
+                                      int8_t* __restrict__ Xq, float2* __restrict__ Xs) {
+    const int groups = K / 8;
+    const long long n = (long long)M * groups;
+    // Four consecutive threads share a step; n is a multiple of 4.
+    for (long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x; e - (threadIdx.x & 3) < n;
+         e += (long long)gridDim.x * blockDim.x) {
+        const bool ok = e < n;
+        const int m = ok ? (int)(e / groups) : 0, k8 = ok ? (int)(e % groups) : 0;
+        float v[8];
+        const uint4 raw = ok ? *reinterpret_cast<const uint4*>(X + (size_t)m * ldx + 8 * k8) : make_uint4(0, 0, 0, 0);
+        const bf16* h = reinterpret_cast<const bf16*>(&raw);
+        float amax = 0.f, sum = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            v[i] = __bfloat162float(h[i]);
+            amax = fmaxf(amax, fabsf(v[i]));
+            sum += v[i];
+        }
+#pragma unroll
+        for (int o = 1; o < 4; o <<= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        }
+        if (!ok) continue;
+        const float d = amax / 127.f, id = amax > 0.f ? 127.f / amax : 0.f;
+        constexpr int ORDER[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+        uint32_t w[2] = {0, 0};
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            w[i >> 2] |= (uint32_t)(uint8_t)(int8_t)__float2int_rn(v[ORDER[i]] * id) << (8 * (i & 3));
+        *reinterpret_cast<uint2*>(Xq + (size_t)m * K + 8 * k8) = make_uint2(w[0], w[1]);
+        if ((k8 & 3) == 0) Xs[(size_t)(k8 >> 2) * Mp + m] = make_float2(d, sum);
+    }
+}
+
+__device__ __forceinline__ void mma_s8(int* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%10,%10,%10,%10};"
+                 : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+}
+
+// qtile's loop with int8 activations. A row's weight at step s is q * sc - mn
+// (Q4_0: sc = d, mn = 8d), so its dot product with token x is
+// sc * dx * sum(q * xq) - mn * sum(x). The block's four warps share each
+// chunk's activations, staged in shared memory a chunk ahead with cp.async.
+#define Q8_XSTR 288  // byte stride of an activation row: 256 plus 32 against bank conflicts
+template <int MT>
+struct Q8Stage {
+    int8_t x[MT * Q8_XSTR];
+    float2 d[8 * MT];
+};
+template <int T, int MT>
+__device__ void qtile8(const uint8_t* __restrict__ W, int N, int K, const int8_t* __restrict__ Xq,
+                       const float2* __restrict__ Xs, int Mp, int M, void* __restrict__ Y, int ldy, int off,
+                       int f32_out, float* __restrict__ acc_ws, int ksplit) {
+    static_assert(T == T_Q4_0 || T == T_Q4_K, "4-bit tiled formats only");
+    constexpr int CH = Tiled<T>::CHUNK;
+    __shared__ __align__(16) Q8Stage<MT> st[2];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int tile = blockIdx.x * 4 + warp, n0 = tile * 16;
+    // Warps past the last row still help stage activations.
+    const bool live = n0 < N;
+    const int m0 = blockIdx.y * MT;
+    const int KB = K / 256, per = (KB + ksplit - 1) / ksplit;
+    const int b0 = blockIdx.z * per, b1 = min(KB, b0 + per);
+    const uint8_t* base = W + (size_t)(live ? tile : 0) * KB * CH;
+    float acc[MT / 8][4];
+#pragma unroll
+    for (int j = 0; j < MT / 8; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    auto stage = [&](int kb, Q8Stage<MT>& sb) {
+#pragma unroll
+        for (int i = threadIdx.x; i < MT * 16; i += 128) {
+            const int r = i >> 4, c = (i & 15) * 16, m = m0 + r;
+            cp16z(sb.x + r * Q8_XSTR + c, Xq + (size_t)(m < M ? m : 0) * K + 256 * kb + c, m < M);
+        }
+#pragma unroll
+        for (int i = threadIdx.x; i < MT * 4; i += 128) {
+            const int s = i / (MT / 2), c = i % (MT / 2);
+            cp16z(sb.d + s * MT + 2 * c, Xs + (size_t)(8 * kb + s) * Mp + m0 + 2 * c, true);
+        }
+        cp_commit();
+    };
+    struct Chunk {
+        uint4 q[4];
+        TileRow ra, rb;
+    };
+    auto fetch = [&](int kb, Chunk& ch) {
+        if (!live) return;
+        const uint8_t* c = base + (size_t)kb * CH;
+#pragma unroll
+        for (int i = 0; i < 4; i++) ch.q[i] = ld_stream(c + 512 * i + 16 * lane);
+        ch.ra = tile_row<T>(c, g);
+        ch.rb = tile_row<T>(c, g + 8);
+    };
+    auto compute = [&](const Chunk& ch, const Q8Stage<MT>& sb) {
+        if (!live) return;
+#pragma unroll
+        for (int s = 0; s < 8; s++) {
+            uint2 xv[MT / 8];
+            float4 ds[MT / 8];
+#pragma unroll
+            for (int j = 0; j < MT / 8; j++) {
+                xv[j] = *reinterpret_cast<const uint2*>(sb.x + (8 * j + g) * Q8_XSTR + 32 * s + 8 * t);
+                ds[j] = *reinterpret_cast<const float4*>(sb.d + s * MT + 8 * j + 2 * t);
+            }
+            float sa, ma, sb_, mb;
+            tile_scale<T>(ch.ra, s, t, sa, ma);
+            tile_scale<T>(ch.rb, s, t, sb_, mb);
+            const uint32_t wa = word_of(ch.q[s >> 1], 2 * (s & 1)), wb = word_of(ch.q[s >> 1], 2 * (s & 1) + 1);
+            const uint32_t a[4] = {wa & 0x0F0F0F0Fu, wb & 0x0F0F0F0Fu, (wa >> 4) & 0x0F0F0F0Fu,
+                                   (wb >> 4) & 0x0F0F0F0Fu};
+#pragma unroll
+            for (int j = 0; j < MT / 8; j++) {
+                int c[4];
+                mma_s8(c, a, xv[j].x, xv[j].y);
+                acc[j][0] = fmaf(-ma, ds[j].y, fmaf((float)c[0], sa * ds[j].x, acc[j][0]));
+                acc[j][1] = fmaf(-ma, ds[j].w, fmaf((float)c[1], sa * ds[j].z, acc[j][1]));
+                acc[j][2] = fmaf(-mb, ds[j].y, fmaf((float)c[2], sb_ * ds[j].x, acc[j][2]));
+                acc[j][3] = fmaf(-mb, ds[j].w, fmaf((float)c[3], sb_ * ds[j].z, acc[j][3]));
+            }
+        }
+    };
+    // Weights two chunks ahead in registers, activations one ahead in shared memory.
+    auto step = [&](int kb, const Chunk& w) {
+        if (kb + 1 < b1) {
+            stage(kb + 1, st[(kb + 1 - b0) & 1]);
+            cp_wait<1>();
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+        compute(w, st[(kb - b0) & 1]);
+        __syncthreads();
+    };
+    Chunk c0, c1;
+    if (b0 < b1) fetch(b0, c0), stage(b0, st[0]);
+    if (b0 + 1 < b1) fetch(b0 + 1, c1);
+    for (int kb = b0; kb < b1; kb += 2) {
+        const Chunk w0 = c0;
+        if (kb + 2 < b1) fetch(kb + 2, c0);
+        step(kb, w0);
+        if (kb + 1 < b1) {
+            const Chunk w1 = c1;
+            if (kb + 3 < b1) fetch(kb + 3, c1);
+            step(kb + 1, w1);
+        }
+    }
+    if (!live) return;
+#pragma unroll
+    for (int j = 0; j < MT / 8; j++) {
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            const int n = n0 + g + (e >> 1) * 8, m = m0 + 8 * j + 2 * t + (e & 1);
+            if (n < N && m < M) {
+                if (ksplit > 1) acc_ws[((size_t)blockIdx.z * M + m) * N + n] = acc[j][e];
+                else if (f32_out) ((float*)Y)[(size_t)m * ldy + off + n] = acc[j][e];
+                else ((bf16*)Y)[(size_t)m * ldy + off + n] = f2b(acc[j][e]);
+            }
+        }
+    }
+}
+
+#define QTILE8(T, name, MT)                                                                            \
+    extern "C" __global__ void __launch_bounds__(128) qtile8_##name##_##MT(                            \
+        const uint8_t* W, int N, int K, const int8_t* Xq, const float2* Xs, int Mp, int M, void* Y,    \
+        int ldy, int off, int f32_out, float* acc_ws, int ksplit) {                                    \
+        qtile8<T, MT>(W, N, K, Xq, Xs, Mp, M, Y, ldy, off, f32_out, acc_ws, ksplit);                   \
+    }
+QTILE8(T_Q4_0, q4_0, 8) QTILE8(T_Q4_0, q4_0, 16) QTILE8(T_Q4_0, q4_0, 32) QTILE8(T_Q4_0, q4_0, 64)
+QTILE8(T_Q4_K, q4_k, 8) QTILE8(T_Q4_K, q4_k, 16) QTILE8(T_Q4_K, q4_k, 32) QTILE8(T_Q4_K, q4_k, 64)
+
 #define QTILE(T, name, MT)                                                                             \
     extern "C" __global__ void __launch_bounds__(128) qtile_##name##_##MT(                             \
         const uint8_t* W, int N, int K, const bf16* X, int ldx, int M, void* Y, int ldy, int off,      \

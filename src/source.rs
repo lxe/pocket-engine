@@ -349,6 +349,8 @@ pub struct Load {
     pub fp4: bool,
     /// Load the multi-token-prediction layer.
     pub mtp: bool,
+    /// Run 4-bit GGUF matrices on int8 tensor cores for batches.
+    pub int8: bool,
 }
 
 /// What a part of a layer becomes on the device.

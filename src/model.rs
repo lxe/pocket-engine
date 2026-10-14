@@ -499,6 +499,9 @@ impl Model {
         };
         cfg.tiled_v = src.tiled_value_heads() && cfg.lin_v_heads != cfg.lin_k_heads;
         let mut quants = Quants::default();
+        if load.int8 {
+            quants.int8_rows = crate::linear::int8_rows();
+        }
         let (h, i) = (cfg.hidden, cfg.inter);
         let up = |v: &[f32]| gpu.upload(&f32_bytes(v));
         let mut layers = Vec::with_capacity(cfg.layers);

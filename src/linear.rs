@@ -86,6 +86,8 @@ pub struct TiledKernels {
     pub tile: Kernel,
     pub dequant: Kernel,
     pub mma: [Kernel; 4],
+    /// The same tiles against int8 activations (Q4_0 and Q4_K).
+    pub mma8: Option<[Kernel; 4]>,
 }
 
 const MMA_TILES: [usize; 4] = [8, 16, 32, 64];
@@ -111,6 +113,12 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn gemv_rows() -> usize {
     env_usize("POCKET_GEMV_ROWS", GEMV_ROWS).min(8)
 }
+/// Rows from which `--int8` takes the int8 path; below, weights dominate and
+/// bf16 is as fast.
+const INT8_ROWS: usize = 16;
+pub fn int8_rows() -> usize {
+    env_usize("POCKET_INT8_ROWS", INT8_ROWS).max(1)
+}
 fn split_tuning() -> (usize, usize) {
     (
         env_usize("POCKET_SPLIT_WARPS", 32),
@@ -130,6 +138,17 @@ pub struct Quants {
     sms: usize,
     /// bf16 copy of a weight matrix (or a slice of its rows) for large batches.
     scratch: Option<Buf>,
+    /// Run 4-bit tiled matrices on int8 tensor cores from this many rows on
+    /// (`--int8`); 0 keeps bf16.
+    pub int8_rows: usize,
+    /// The activation quantizer and its int8 copy and scales.
+    act8: Option<(Kernel, Buf)>,
+}
+
+/// Widest input the int8 activation buffer holds.
+const ACT8_COLS: usize = 20_480;
+fn int8_max_rows() -> usize {
+    env_usize("POCKET_INT8_MAX_ROWS", 4096).next_multiple_of(64)
 }
 
 /// Rows above which a quantized matrix is dequantized to bf16 and handed to
@@ -173,6 +192,16 @@ impl Quants {
                     tile: gpu.kernel(&format!("tile_{name}"))?,
                     dequant: gpu.kernel(&format!("dequant_tiled_{name}"))?,
                     mma: mma.try_into().unwrap_or_else(|_| unreachable!()),
+                    mma8: match name {
+                        "q4_0" | "q4_k" => {
+                            let mut k = Vec::with_capacity(4);
+                            for t in MMA_TILES {
+                                k.push(gpu.kernel(&format!("qtile8_{name}_{t}"))?);
+                            }
+                            Some(k.try_into().unwrap_or_else(|_| unreachable!()))
+                        }
+                        _ => None,
+                    },
                 })
             }
             None => None,
@@ -211,6 +240,15 @@ impl Quants {
     pub fn prepare(&mut self, gpu: &Gpu, largest: usize) -> Result<()> {
         if (!self.kernels.is_empty() || self.fp4.is_some()) && self.scratch.is_none() {
             self.scratch = Some(gpu.alloc(largest.min(SCRATCH_WEIGHTS) * 2)?);
+        }
+        let int8 = self
+            .kernels
+            .values()
+            .any(|k| k.tiled.as_ref().is_some_and(|t| t.mma8.is_some()));
+        if self.int8_rows > 0 && int8 && self.act8.is_none() {
+            let rows = int8_max_rows();
+            let bytes = rows * ACT8_COLS + ACT8_COLS / 32 * rows * 8;
+            self.act8 = Some((gpu.kernel("quant_act8")?, gpu.alloc(bytes)?));
         }
         Ok(())
     }
@@ -258,6 +296,43 @@ impl Linear {
         use Arg::{I, P};
         let x = input.bf16;
         let elem = if f32_out { 4 } else { 2 };
+        // int8 activations, quantized once for all of this layer's parts.
+        let act8 = match &q.act8 {
+            Some((quant, buf))
+                if rows >= q.int8_rows
+                    && rows <= int8_max_rows()
+                    && self.cols <= ACT8_COLS
+                    && self.parts.iter().any(|p| match p.kind {
+                        Kind::Tiled(ty) => q
+                            .loaded(ty)
+                            .and_then(|k| k.tiled.as_ref())
+                            .is_some_and(|t| t.mma8.is_some()),
+                        _ => false,
+                    }) =>
+            {
+                let ti = MMA_TILES.iter().position(|&t| rows <= t).unwrap_or(3);
+                let mp = rows.next_multiple_of(MMA_TILES[ti]);
+                let xs = buf.ptr + (int8_max_rows() * ACT8_COLS) as u64;
+                let n = rows * self.cols / 8;
+                gpu.launch(
+                    *quant,
+                    (n.div_ceil(256).min(65_535) as u32, 1, 1),
+                    256,
+                    0,
+                    &[
+                        P(x),
+                        I(self.cols as i32),
+                        I(rows as i32),
+                        I(self.cols as i32),
+                        I(mp as i32),
+                        P(buf.ptr),
+                        P(xs),
+                    ],
+                )?;
+                Some((buf.ptr, xs, mp))
+            }
+            _ => None,
+        };
         for p in &self.parts {
             match p.kind {
                 Kind::Fp8(mode) => {
@@ -417,6 +492,7 @@ impl Linear {
                         Some(tk) => (tk.dequant, &tk.mma, 256),
                         None => (k.dequant, &k.mma, 32),
                     };
+                    let mma8 = act8.zip(tiled.and_then(|tk| tk.mma8.as_ref()));
                     let args = |extra: &[Arg]| -> Vec<Arg> {
                         let mut v = vec![
                             P(p.buf.ptr),
@@ -435,6 +511,7 @@ impl Linear {
                         v
                     };
                     if rows > DENSE_ROWS
+                        && mma8.is_none()
                         && let Some(sc) = &q.scratch
                     {
                         // Dequantize slices of rows into scratch, then cuBLAS.
@@ -498,9 +575,29 @@ impl Linear {
                         // Every slice keeps its own partial sums.
                         split = split.min(SPLIT_WORKSPACE / (rows * p.rows * 4)).max(1);
                         let ws = q.workspace.as_ref().map_or(0, |b| b.ptr);
-                        let margs = args_mma(&args(&[I(rows as i32)]), ws, split);
+                        let (kernel, margs) = match mma8 {
+                            Some(((xq, xs, mp), k8)) => (
+                                k8[ti],
+                                vec![
+                                    P(p.buf.ptr),
+                                    I(p.rows as i32),
+                                    I(self.cols as i32),
+                                    P(xq),
+                                    P(xs),
+                                    I(mp as i32),
+                                    I(rows as i32),
+                                    P(y),
+                                    I(ldy as i32),
+                                    I(p.off as i32),
+                                    I(f32_out as i32),
+                                    P(ws),
+                                    I(split as i32),
+                                ],
+                            ),
+                            None => (mma[ti], args_mma(&args(&[I(rows as i32)]), ws, split)),
+                        };
                         gpu.launch(
-                            mma[ti],
+                            kernel,
                             (
                                 p.rows.div_ceil(64) as u32,
                                 rows.div_ceil(tile) as u32,

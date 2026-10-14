@@ -5,7 +5,7 @@
   pocket-engine score --model MODEL_DIR OUT.pairs.json OUT.ours.json
   python scripts/accuracy.py compare OUT.ref.json OUT.ours.json
 
-`reference` needs torch and transformers (see README); `compare` needs only Python."""
+`reference` needs torch and transformers (see docs/testing.md); `compare` needs only Python."""
 import json, sys
 
 

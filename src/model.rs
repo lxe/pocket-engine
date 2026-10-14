@@ -1529,6 +1529,9 @@ struct View {
     snaps: u64,
     /// The step's adapters, for the decoder layers.
     lora: Option<crate::lora::StepLora>,
+    /// Leading sequences of one token or verifying drafts, which a prompt
+    /// step runs through gdn_recurrent rather than the chunked kernels.
+    head: usize,
 }
 
 impl View {
@@ -1547,6 +1550,7 @@ impl View {
             block_table: a.m(me.block_table()),
             snaps: a.m(me.snaps()),
             lora: None,
+            head: 0,
         }
     }
 }
@@ -1569,6 +1573,7 @@ impl Model {
         s: usize,
         r: usize,
         lora: Option<crate::lora::StepLora>,
+        head: usize,
     ) -> Result<()> {
         use Arg::{F, I, P};
         let c = &self.cfg;
@@ -1592,6 +1597,7 @@ impl Model {
         )?;
         let v = View {
             lora,
+            head,
             ..View::of(a)
         };
         for (li, layer) in self.layers.iter().enumerate() {
@@ -1816,6 +1822,7 @@ impl Model {
             block_table: a.m(me.block_table()),
             snaps: 0,
             lora: None,
+            head: 0,
         };
         for d in 1..me.spec - 1 {
             gpu.launch(
@@ -2051,21 +2058,42 @@ impl Model {
                             ]
                             .concat(),
                         )?;
-                        let split = gdn_split(s, hv, gpu);
-                        gpu.launch(
-                            k.gdn_scan[split.trailing_zeros() as usize],
-                            (si, hv as u32, split as u32),
-                            2 * GDN_DIM as u32,
-                            gdn_scan_smem(split) as u32,
-                            &[
-                                args.as_slice(),
-                                &a.fp8_args(|f| &f.core, t),
-                                &outs,
-                                &scratch,
-                                &[P(v.snaps)],
-                            ]
-                            .concat(),
-                        )?;
+                        // The step's leading one-token and verifying rows take
+                        // the recurrent kernel (its blocks need no shared
+                        // memory, so many more run at once); the chunked scan
+                        // takes the rest, from sequence `d` on.
+                        let d = v.head.min(s);
+                        if d > 0 {
+                            gpu.launch(
+                                k.gdn_recurrent,
+                                (d as u32, hv as u32, 1),
+                                2 * GDN_DIM as u32,
+                                0,
+                                &[args.as_slice(), &a.fp8_args(|f| &f.core, t), &outs].concat(),
+                            )?;
+                        }
+                        if d < s {
+                            let at = |p: u64, per: usize| P(p + (4 * per * d) as u64);
+                            let mut tail = args;
+                            tail[11] = at(v.cu, 1);
+                            tail[12] = at(v.slots, 1);
+                            tail[13] = at(v.fresh, 1);
+                            let split = gdn_split(s - d, hv, gpu);
+                            gpu.launch(
+                                k.gdn_scan[split.trailing_zeros() as usize],
+                                ((s - d) as u32, hv as u32, split as u32),
+                                2 * GDN_DIM as u32,
+                                gdn_scan_smem(split) as u32,
+                                &[
+                                    tail.as_slice(),
+                                    &a.fp8_args(|f| &f.core, t),
+                                    &[at(v.outs, me.spec), outs[1]],
+                                    &scratch,
+                                    &[if v.snaps == 0 { P(0) } else { at(v.snaps, 4) }],
+                                ]
+                                .concat(),
+                            )?;
+                        }
                         gpu.launch(
                             k.gdn_norm,
                             (t as u32, 1, 1),

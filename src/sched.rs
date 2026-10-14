@@ -1172,6 +1172,15 @@ impl Scheduler {
         (e, nmask)
     }
 
+    /// How many of `step`'s first rows feed one token or verify drafts:
+    /// the linear attention takes them token by token, the rest in chunks.
+    pub fn head_rows(&self, step: &Step) -> usize {
+        step.rows
+            .iter()
+            .take_while(|&&(ri, n)| n == 1 || self.running[ri].verifies(n))
+            .count()
+    }
+
     /// Output rows of `step` whose requests want log-probabilities, and how
     /// many top tokens each wants.
     pub fn logprob_rows(&self, step: &Step) -> Vec<(usize, usize)> {

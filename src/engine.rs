@@ -405,12 +405,12 @@ impl Engine {
                     };
                     // A plain run first, so cuBLAS settles its kernels outside capture.
                     self.model
-                        .forward(&self.gpu, &self.state, &self.act, t, b, t, lora)?;
+                        .forward(&self.gpu, &self.state, &self.act, t, b, t, lora, b)?;
                     self.gpu.sync()?;
                     self.gpu.begin_capture()?;
                     let r = self
                         .model
-                        .forward(&self.gpu, &self.state, &self.act, t, b, t, lora);
+                        .forward(&self.gpu, &self.state, &self.act, t, b, t, lora, b);
                     let g = self.gpu.end_capture();
                     r?;
                     let set = match (with_lora, n == 1) {
@@ -557,8 +557,9 @@ impl Engine {
                     Some(l) if tiles > 0 => Some(self.act.lora_step(l, tiles)),
                     _ => None,
                 };
+                let head = self.sched.head_rows(&step);
                 self.model
-                    .forward(&self.gpu, &self.state, &self.act, t, s, r, lora)?;
+                    .forward(&self.gpu, &self.state, &self.act, t, s, r, lora, head)?;
             }
         }
         if !lp_rows.is_empty() {

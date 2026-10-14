@@ -30,6 +30,13 @@ fn main() {
         println!("cargo:rerun-if-env-changed={name}");
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("qwen35.fatbin");
+    // POCKET_SKIP_KERNELS=1: no kernel image, for type-checking a feature
+    // without its compiler (cargo check --features rocm on a CUDA machine).
+    println!("cargo:rerun-if-env-changed=POCKET_SKIP_KERNELS");
+    if env::var_os("POCKET_SKIP_KERNELS").is_some_and(|v| v == "1") {
+        std::fs::write(&out, []).expect("write empty kernel image");
+        return;
+    }
     if env::var_os("CARGO_FEATURE_ROCM").is_some() {
         assert!(
             env::var_os("CARGO_FEATURE_CUDA").is_none(),

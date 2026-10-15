@@ -12,6 +12,998 @@
   "env": "VLLM_ROCM_USE_AITER=1 HIP_FORCE_DEV_KERNARG=1 SAFETENSORS_FAST_GPU=1 TORCH_BLAS_PREFER_HIPBLASLT=1"
  },
  "runs": {
+  "load-27b-fp8-mtp2-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 4.14,
+    "out_tok_s": 162.5,
+    "ttft_p50": 0.032,
+    "ttft_p95": 0.039,
+    "lat_p50": 0.212,
+    "lat_p95": 0.381,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 3.59,
+    "out_tok_s": 713.0,
+    "ttft_p50": 0.07,
+    "ttft_p95": 0.108,
+    "lat_p50": 0.406,
+    "lat_p95": 0.69,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 3.27,
+    "out_tok_s": 1212.7,
+    "ttft_p50": 0.07,
+    "ttft_p95": 0.103,
+    "lat_p50": 0.515,
+    "lat_p95": 0.835,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 3.93,
+    "out_tok_s": 1294.7,
+    "ttft_p50": 0.14,
+    "ttft_p95": 0.438,
+    "lat_p50": 0.855,
+    "lat_p95": 1.517,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 5.88,
+    "out_tok_s": 1281.2,
+    "ttft_p50": 0.258,
+    "ttft_p95": 1.005,
+    "lat_p50": 1.64,
+    "lat_p95": 3.285,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.05,
+    "out_tok_s": 1250.7,
+    "ttft_p50": 0.606,
+    "ttft_p95": 1.007,
+    "lat_p50": 1.677,
+    "lat_p95": 2.033,
+    "first_error": null
+   }
+  ],
+  "load-27b-fp8-mtp3-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 3.49,
+    "out_tok_s": 192.8,
+    "ttft_p50": 0.032,
+    "ttft_p95": 0.04,
+    "lat_p50": 0.177,
+    "lat_p95": 0.321,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 3.25,
+    "out_tok_s": 787.9,
+    "ttft_p50": 0.071,
+    "ttft_p95": 0.097,
+    "lat_p50": 0.371,
+    "lat_p95": 0.621,
+    "first_error": null
+   }
+  ],
+  "load-27b-fp8-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 6.22,
+    "out_tok_s": 108.1,
+    "ttft_p50": 0.031,
+    "ttft_p95": 0.039,
+    "lat_p50": 0.303,
+    "lat_p95": 0.585,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 6.19,
+    "out_tok_s": 413.5,
+    "ttft_p50": 0.063,
+    "ttft_p95": 0.088,
+    "lat_p50": 0.628,
+    "lat_p95": 1.236,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 5.33,
+    "out_tok_s": 745.1,
+    "ttft_p50": 0.063,
+    "ttft_p95": 0.117,
+    "lat_p50": 0.806,
+    "lat_p95": 1.352,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.34,
+    "out_tok_s": 952.2,
+    "ttft_p50": 0.171,
+    "ttft_p95": 0.428,
+    "lat_p50": 1.195,
+    "lat_p95": 2.079,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 6.0,
+    "out_tok_s": 1256.9,
+    "ttft_p50": 0.313,
+    "ttft_p95": 0.973,
+    "lat_p50": 1.571,
+    "lat_p95": 3.172,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.22,
+    "out_tok_s": 1152.6,
+    "ttft_p50": 0.599,
+    "ttft_p95": 0.986,
+    "lat_p50": 1.628,
+    "lat_p95": 2.201,
+    "first_error": null
+   }
+  ],
+  "load-27b-mtp2-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 4.72,
+    "out_tok_s": 142.3,
+    "ttft_p50": 0.032,
+    "ttft_p95": 0.04,
+    "lat_p50": 0.243,
+    "lat_p95": 0.429,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 3.64,
+    "out_tok_s": 704.0,
+    "ttft_p50": 0.061,
+    "ttft_p95": 0.087,
+    "lat_p50": 0.404,
+    "lat_p95": 0.703,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 3.22,
+    "out_tok_s": 1230.5,
+    "ttft_p50": 0.068,
+    "ttft_p95": 0.11,
+    "lat_p50": 0.507,
+    "lat_p95": 0.808,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 3.95,
+    "out_tok_s": 1287.2,
+    "ttft_p50": 0.151,
+    "ttft_p95": 0.444,
+    "lat_p50": 0.864,
+    "lat_p95": 1.537,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 5.9,
+    "out_tok_s": 1278.3,
+    "ttft_p50": 0.238,
+    "ttft_p95": 1.01,
+    "lat_p50": 1.651,
+    "lat_p95": 3.299,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.06,
+    "out_tok_s": 1240.0,
+    "ttft_p50": 0.621,
+    "ttft_p95": 1.023,
+    "lat_p50": 1.69,
+    "lat_p95": 2.042,
+    "first_error": null
+   }
+  ],
+  "load-27b-mtp3-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 4.01,
+    "out_tok_s": 167.7,
+    "ttft_p50": 0.032,
+    "ttft_p95": 0.04,
+    "lat_p50": 0.202,
+    "lat_p95": 0.359,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 3.25,
+    "out_tok_s": 786.6,
+    "ttft_p50": 0.065,
+    "ttft_p95": 0.099,
+    "lat_p50": 0.374,
+    "lat_p95": 0.614,
+    "first_error": null
+   }
+  ],
+  "load-27b-ngram-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 4.49,
+    "out_tok_s": 149.8,
+    "ttft_p50": 0.031,
+    "ttft_p95": 0.038,
+    "lat_p50": 0.249,
+    "lat_p95": 0.365,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 3.83,
+    "out_tok_s": 668.2,
+    "ttft_p50": 0.061,
+    "ttft_p95": 0.082,
+    "lat_p50": 0.457,
+    "lat_p95": 0.724,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 3.44,
+    "out_tok_s": 1154.2,
+    "ttft_p50": 0.073,
+    "ttft_p95": 0.12,
+    "lat_p50": 0.548,
+    "lat_p95": 0.848,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.02,
+    "out_tok_s": 1013.1,
+    "ttft_p50": 0.153,
+    "ttft_p95": 0.434,
+    "lat_p50": 1.169,
+    "lat_p95": 2.074,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 5.69,
+    "out_tok_s": 1325.0,
+    "ttft_p50": 0.322,
+    "ttft_p95": 0.994,
+    "lat_p50": 1.581,
+    "lat_p95": 3.198,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.04,
+    "out_tok_s": 1255.8,
+    "ttft_p50": 0.605,
+    "ttft_p95": 1.007,
+    "lat_p50": 1.632,
+    "lat_p95": 2.02,
+    "first_error": null
+   }
+  ],
+  "load-27b-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 9.18,
+    "out_tok_s": 73.2,
+    "ttft_p50": 0.031,
+    "ttft_p95": 0.039,
+    "lat_p50": 0.434,
+    "lat_p95": 0.854,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 5.99,
+    "out_tok_s": 427.6,
+    "ttft_p50": 0.06,
+    "ttft_p95": 0.088,
+    "lat_p50": 0.602,
+    "lat_p95": 1.188,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 5.16,
+    "out_tok_s": 769.4,
+    "ttft_p50": 0.062,
+    "ttft_p95": 0.117,
+    "lat_p50": 0.792,
+    "lat_p95": 1.301,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.35,
+    "out_tok_s": 951.4,
+    "ttft_p50": 0.173,
+    "ttft_p95": 0.434,
+    "lat_p50": 1.193,
+    "lat_p95": 2.068,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 6.03,
+    "out_tok_s": 1250.1,
+    "ttft_p50": 0.282,
+    "ttft_p95": 0.993,
+    "lat_p50": 1.577,
+    "lat_p95": 3.181,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.21,
+    "out_tok_s": 1159.5,
+    "ttft_p50": 0.604,
+    "ttft_p95": 1.008,
+    "lat_p50": 1.629,
+    "lat_p95": 2.186,
+    "first_error": null
+   }
+  ],
+  "load-9b-fp8-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 2.57,
+    "out_tok_s": 261.3,
+    "ttft_p50": 0.011,
+    "ttft_p95": 0.013,
+    "lat_p50": 0.125,
+    "lat_p95": 0.243,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.25,
+    "out_tok_s": 1139.9,
+    "ttft_p50": 0.02,
+    "ttft_p95": 0.027,
+    "lat_p50": 0.225,
+    "lat_p95": 0.443,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 1.96,
+    "out_tok_s": 2025.0,
+    "ttft_p50": 0.022,
+    "ttft_p95": 0.036,
+    "lat_p50": 0.287,
+    "lat_p95": 0.48,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.73,
+    "out_tok_s": 2935.7,
+    "ttft_p50": 0.047,
+    "ttft_p95": 0.12,
+    "lat_p50": 0.366,
+    "lat_p95": 0.654,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 1.87,
+    "out_tok_s": 4020.2,
+    "ttft_p50": 0.07,
+    "ttft_p95": 0.225,
+    "lat_p50": 0.508,
+    "lat_p95": 0.946,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 0.74,
+    "out_tok_s": 3471.5,
+    "ttft_p50": 0.172,
+    "ttft_p95": 0.275,
+    "lat_p50": 0.511,
+    "lat_p95": 0.715,
+    "first_error": null
+   }
+  ],
+  "load-9b-lora-amd0-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 4.52,
+    "out_tok_s": 148.7,
+    "ttft_p50": 0.015,
+    "ttft_p95": 0.017,
+    "lat_p50": 0.218,
+    "lat_p95": 0.428,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 3.16,
+    "out_tok_s": 809.0,
+    "ttft_p50": 0.028,
+    "ttft_p95": 0.036,
+    "lat_p50": 0.314,
+    "lat_p95": 0.619,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 2.84,
+    "out_tok_s": 1399.3,
+    "ttft_p50": 0.029,
+    "ttft_p95": 0.048,
+    "lat_p50": 0.431,
+    "lat_p95": 0.694,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 2.67,
+    "out_tok_s": 1908.8,
+    "ttft_p50": 0.066,
+    "ttft_p95": 0.165,
+    "lat_p50": 0.547,
+    "lat_p95": 0.995,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 3.07,
+    "out_tok_s": 2454.9,
+    "ttft_p50": 0.099,
+    "ttft_p95": 0.318,
+    "lat_p50": 0.837,
+    "lat_p95": 1.562,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 1.14,
+    "out_tok_s": 2246.9,
+    "ttft_p50": 0.281,
+    "ttft_p95": 0.352,
+    "lat_p50": 0.791,
+    "lat_p95": 1.118,
+    "first_error": null
+   }
+  ],
+  "load-9b-lora-amd1-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 4.26,
+    "out_tok_s": 157.6,
+    "ttft_p50": 0.015,
+    "ttft_p95": 0.017,
+    "lat_p50": 0.206,
+    "lat_p95": 0.404,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.99,
+    "out_tok_s": 856.8,
+    "ttft_p50": 0.027,
+    "ttft_p95": 0.036,
+    "lat_p50": 0.297,
+    "lat_p95": 0.585,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 2.64,
+    "out_tok_s": 1502.9,
+    "ttft_p50": 0.029,
+    "ttft_p95": 0.048,
+    "lat_p50": 0.4,
+    "lat_p95": 0.646,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 2.5,
+    "out_tok_s": 2036.0,
+    "ttft_p50": 0.067,
+    "ttft_p95": 0.166,
+    "lat_p50": 0.517,
+    "lat_p95": 0.934,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 2.84,
+    "out_tok_s": 2655.3,
+    "ttft_p50": 0.098,
+    "ttft_p95": 0.319,
+    "lat_p50": 0.764,
+    "lat_p95": 1.452,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 1.05,
+    "out_tok_s": 2448.6,
+    "ttft_p50": 0.28,
+    "ttft_p95": 0.351,
+    "lat_p50": 0.729,
+    "lat_p95": 1.025,
+    "first_error": null
+   }
+  ],
+  "load-9b-lora-dec-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 3.78,
+    "out_tok_s": 177.6,
+    "ttft_p50": 0.015,
+    "ttft_p95": 0.017,
+    "lat_p50": 0.183,
+    "lat_p95": 0.358,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.69,
+    "out_tok_s": 950.3,
+    "ttft_p50": 0.026,
+    "ttft_p95": 0.036,
+    "lat_p50": 0.271,
+    "lat_p95": 0.53,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 2.37,
+    "out_tok_s": 1673.6,
+    "ttft_p50": 0.029,
+    "ttft_p95": 0.048,
+    "lat_p50": 0.353,
+    "lat_p95": 0.583,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 2.21,
+    "out_tok_s": 2303.9,
+    "ttft_p50": 0.066,
+    "ttft_p95": 0.164,
+    "lat_p50": 0.46,
+    "lat_p95": 0.826,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 2.46,
+    "out_tok_s": 3065.4,
+    "ttft_p50": 0.105,
+    "ttft_p95": 0.318,
+    "lat_p50": 0.652,
+    "lat_p95": 1.255,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 0.9,
+    "out_tok_s": 2838.6,
+    "ttft_p50": 0.271,
+    "ttft_p95": 0.354,
+    "lat_p50": 0.645,
+    "lat_p95": 0.883,
+    "first_error": null
+   }
+  ],
+  "load-9b-mtp2-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 1.91,
+    "out_tok_s": 351.6,
+    "ttft_p50": 0.012,
+    "ttft_p95": 0.014,
+    "lat_p50": 0.094,
+    "lat_p95": 0.182,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 1.34,
+    "out_tok_s": 1908.1,
+    "ttft_p50": 0.023,
+    "ttft_p95": 0.028,
+    "lat_p50": 0.151,
+    "lat_p95": 0.257,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 1.25,
+    "out_tok_s": 3163.1,
+    "ttft_p50": 0.026,
+    "ttft_p95": 0.037,
+    "lat_p50": 0.198,
+    "lat_p95": 0.298,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.26,
+    "out_tok_s": 4035.1,
+    "ttft_p50": 0.044,
+    "ttft_p95": 0.128,
+    "lat_p50": 0.273,
+    "lat_p95": 0.472,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 1.92,
+    "out_tok_s": 3920.5,
+    "ttft_p50": 0.054,
+    "ttft_p95": 0.244,
+    "lat_p50": 0.543,
+    "lat_p95": 1.023,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 0.69,
+    "out_tok_s": 3694.7,
+    "ttft_p50": 0.182,
+    "ttft_p95": 0.283,
+    "lat_p50": 0.545,
+    "lat_p95": 0.672,
+    "first_error": null
+   }
+  ],
+  "load-9b-q4km-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 3.13,
+    "out_tok_s": 215.0,
+    "ttft_p50": 0.012,
+    "ttft_p95": 0.014,
+    "lat_p50": 0.151,
+    "lat_p95": 0.296,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.36,
+    "out_tok_s": 1086.4,
+    "ttft_p50": 0.021,
+    "ttft_p95": 0.028,
+    "lat_p50": 0.235,
+    "lat_p95": 0.462,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 2.05,
+    "out_tok_s": 1935.8,
+    "ttft_p50": 0.022,
+    "ttft_p95": 0.037,
+    "lat_p50": 0.314,
+    "lat_p95": 0.499,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.79,
+    "out_tok_s": 2842.3,
+    "ttft_p50": 0.048,
+    "ttft_p95": 0.121,
+    "lat_p50": 0.373,
+    "lat_p95": 0.669,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 1.93,
+    "out_tok_s": 3914.0,
+    "ttft_p50": 0.072,
+    "ttft_p95": 0.226,
+    "lat_p50": 0.519,
+    "lat_p95": 0.96,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 0.75,
+    "out_tok_s": 3423.4,
+    "ttft_p50": 0.175,
+    "ttft_p95": 0.273,
+    "lat_p50": 0.516,
+    "lat_p95": 0.725,
+    "first_error": null
+   }
+  ],
+  "load-9b-r7": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 2.98,
+    "out_tok_s": 225.1,
+    "ttft_p50": 0.011,
+    "ttft_p95": 0.013,
+    "lat_p50": 0.144,
+    "lat_p95": 0.282,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.15,
+    "out_tok_s": 1193.0,
+    "ttft_p50": 0.02,
+    "ttft_p95": 0.027,
+    "lat_p50": 0.214,
+    "lat_p95": 0.421,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 1.88,
+    "out_tok_s": 2110.6,
+    "ttft_p50": 0.021,
+    "ttft_p95": 0.035,
+    "lat_p50": 0.287,
+    "lat_p95": 0.458,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.7,
+    "out_tok_s": 2995.2,
+    "ttft_p50": 0.047,
+    "ttft_p95": 0.121,
+    "lat_p50": 0.357,
+    "lat_p95": 0.637,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 1.85,
+    "out_tok_s": 4068.2,
+    "ttft_p50": 0.077,
+    "ttft_p95": 0.225,
+    "lat_p50": 0.495,
+    "lat_p95": 0.928,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 0.72,
+    "out_tok_s": 3534.8,
+    "ttft_p50": 0.189,
+    "ttft_p95": 0.274,
+    "lat_p50": 0.503,
+    "lat_p95": 0.702,
+    "first_error": null
+   }
+  ],
+  "load-fresh-9b-q4km-128-r7": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 2.01,
+    "out_tok_s": 5171.9,
+    "ttft_p50": 0.179,
+    "ttft_p95": 0.424,
+    "lat_p50": 0.831,
+    "lat_p95": 1.57,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.97,
+    "out_tok_s": 2579.1,
+    "ttft_p50": 0.86,
+    "ttft_p95": 1.434,
+    "lat_p50": 1.406,
+    "lat_p95": 1.819,
+    "first_error": null
+   }
+  ],
+  "load-fresh-9b-q4km-256-r7": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 3.45,
+    "out_tok_s": 6011.4,
+    "ttft_p50": 0.15,
+    "ttft_p95": 0.808,
+    "lat_p50": 1.451,
+    "lat_p95": 2.814,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.99,
+    "out_tok_s": 1734.1,
+    "ttft_p50": 4.16,
+    "ttft_p95": 5.005,
+    "lat_p50": 4.852,
+    "lat_p95": 5.592,
+    "first_error": null
+   }
+  ],
   "load-fresh-pe-27b-128-hipblaslt-t0": [
    {
     "case": "closed c=128",
@@ -2765,6 +3757,94 @@
     "lat_p95": 0.781,
     "first_error": null
    }
+  ],
+  "long-27b-r7": [
+   {
+    "case": "long 8192 tok, c=1",
+    "ok": 1,
+    "errors": 0,
+    "wall_s": 1.37,
+    "out_tok_s": 19.7,
+    "prompt_tok_s": 5982.4,
+    "ttft_p50": 1.006,
+    "ttft_p95": 1.006,
+    "lat_p50": 1.373,
+    "decode_tok_s_per_request": 70.9,
+    "prefill_tok_s": 8162.2,
+    "first_error": null
+   },
+   {
+    "case": "long 32768 tok, c=1",
+    "ok": 1,
+    "errors": 0,
+    "wall_s": 5.18,
+    "out_tok_s": 4.6,
+    "prompt_tok_s": 6335.7,
+    "ttft_p50": 4.833,
+    "ttft_p95": 4.833,
+    "lat_p50": 5.175,
+    "decode_tok_s_per_request": 67.3,
+    "prefill_tok_s": 6784.0,
+    "first_error": null
+   },
+   {
+    "case": "long 65536 tok, c=1",
+    "ok": 1,
+    "errors": 0,
+    "wall_s": 12.32,
+    "out_tok_s": 1.9,
+    "prompt_tok_s": 5320.9,
+    "ttft_p50": 11.958,
+    "ttft_p95": 11.958,
+    "lat_p50": 12.321,
+    "decode_tok_s_per_request": 63.4,
+    "prefill_tok_s": 5482.5,
+    "first_error": null
+   }
+  ],
+  "long-9b-r7": [
+   {
+    "case": "long 8192 tok, c=1",
+    "ok": 1,
+    "errors": 0,
+    "wall_s": 0.47,
+    "out_tok_s": 53.5,
+    "prompt_tok_s": 17576.0,
+    "ttft_p50": 0.351,
+    "ttft_p95": 0.351,
+    "lat_p50": 0.467,
+    "decode_tok_s_per_request": 206.8,
+    "prefill_tok_s": 23384.3,
+    "first_error": null
+   },
+   {
+    "case": "long 32768 tok, c=1",
+    "ok": 1,
+    "errors": 0,
+    "wall_s": 1.85,
+    "out_tok_s": 11.9,
+    "prompt_tok_s": 17696.6,
+    "ttft_p50": 1.744,
+    "ttft_p95": 1.744,
+    "lat_p50": 1.853,
+    "decode_tok_s_per_request": 193.6,
+    "prefill_tok_s": 18797.4,
+    "first_error": null
+   },
+   {
+    "case": "long 65536 tok, c=1",
+    "ok": 1,
+    "errors": 0,
+    "wall_s": 4.59,
+    "out_tok_s": 5.2,
+    "prompt_tok_s": 14272.6,
+    "ttft_p50": 4.468,
+    "ttft_p95": 4.468,
+    "lat_p50": 4.593,
+    "decode_tok_s_per_request": 183.5,
+    "prefill_tok_s": 14673.2,
+    "first_error": null
+   }
   ]
  },
  "builds": {
@@ -2779,7 +3859,8 @@
   "load-fresh-pe-9b-256-r5-client-stall": "the same server and client as load-fresh-pe-9b-256-r5, a stalled client run (3,291 tok/s); two reruns gave 5,878 and 5,880",
   "*-r6": "main at 46710d3 (tuned hipBLASLt solutions): docs/benchmarks.md pocket-engine columns; vLLM columns unchanged from 2026-10-13",
   "*-hipblaslt-t0, *-hipblaslt-t1": "the same build without and with HIPBLASLT_TUNING_OVERRIDE_FILE, the convolution fusion off",
-  "*-fusedconv-nofuse0, -nofuse1": "a fused short-convolution + recurrence kernel on (0) and off (1); dropped"
+  "*-fusedconv-nofuse0, -nofuse1": "a fused short-convolution + recurrence kernel on (0) and off (1); dropped",
+  "*-r7": "main with the round-7 commits (bf16 copies for GGUF, FP8 weights, AMD LoRA decode kernels), thinking on; docs/benchmarks.md options table. load-9b-lora-amd0 / -amd1: the original and first AMD LoRA kernels; load-9b-lora-dec: the decode-shaped shrink that shipped"
  },
  "notes": [
   "Startup, launch to serving: pocket-engine 1.6-3.9 s (9B, 27B); vLLM 260 s (9B) and 316 s (27B) on first start, including AITER JIT builds and graph compilation.",
@@ -2802,7 +3883,14 @@
   "Research notes with sources: pocket-engine-bench/research/2026-10-14-mi325x-architecture.md (XCD L2 coherence and fences, dispatch costs, delta-rule decode designs in FLA/vLLM/AITER, hipBLASLt tuning).",
   "Round 6 (46710d3): 9B 219 of 220, 27B 213 of 213; tests/gpu.rs passes all 15 on 9B. Kernel code unchanged from round 5; NVIDIA unaffected.",
   "hipBLASLt's heuristic solutions ran decode-sized products far from the weight bandwidth: 27B's 64-row output projection (5120 x 6144) took 42.5 us (1.4 TB/s), against 22.1 us for the best of 1,446 solutions (hipblaslt-bench, rotating 512 MB). Tuning every logged shape at the engine's graph batch sizes (204 shapes, 27B and 9B, ~10 s each) and replaying via HIPBLASLT_TUNING_OVERRIDE_FILE: 27B +14% at 8 and 16 in flight, +4% at 32 and 64, unchanged at 128 and 256 (A/B, same build); 9B +5 to +11% from 8 to 256.",
-  "Tried and dropped in round 6: a short-convolution + recurrence kernel per (sequence, key head), exact (greedy outputs identical) but 2-3% slower (16 blocks instead of 48 at batch 1); folding SiLU*mul or RMSNorm into the matrix-vector kernel, which needs a persistent shared-memory kernel 5-27% slower than ours on every shape (a separate SiLU*mul costs ~1.5 us)."
+  "Tried and dropped in round 6: a short-convolution + recurrence kernel per (sequence, key head), exact (greedy outputs identical) but 2-3% slower (16 blocks instead of 48 at batch 1); folding SiLU*mul or RMSNorm into the matrix-vector kernel, which needs a persistent shared-memory kernel 5-27% slower than ours on every shape (a separate SiLU*mul costs ~1.5 us).",
+  "Round 7 (2026-10-15, 0.70 h on one MI325X): prepared locally against what earlier rounds measured, then checked in stages that fail fast: kernel labs (seconds to build) while the engine compiled, scores and tests per feature, then performance.",
+  "Correctness: 9B 219 of 220, 27B 213 of 213; --fp8 9B 213 of 220, 27B 212 of 213; 9B Q4_K_M 208 of 220 with the bf16 copy and without it (identical log-probabilities). tests/gpu.rs passes all 15 on 9B, 9B --fp8, 9B with 3 drafts, 9B with the AMD LoRA kernels, and 9B Q4_K_M. FP8: the bf16 copy equals the decoded E4M3 times its power-of-two row scale exactly; mean quantization error 2.1% of mean |w|.",
+  "FP8 one-row products (klab_skinny): 1.6 to 2.2 times bf16's speed (LM head 517 to 238 us); 3-row products only 1.05 to 1.24 times (skinny_fp8_r3 compiles poorly), so 3 rows take the 4-row kernel.",
+  "Measured and dropped in round 7: one persistent kernel per layer with a grid barrier on relaxed device-scope atomics (189 us a layer against 175 for a kernel per product; 247 with fences); hipBLASLt tuning for 4,096-row prompt chunks (27B's 32k-token first token 4.83 to 4.81 s); v_dot2c_f32_bf16, which gfx942 does not have.",
+  "Adapters (rank 16, every request): 9B cost 34% at one request with the original kernels; lora_shrink_amd took 10.7 us of each layer's 14.8; the decode-shaped lora_shrink_dec brought shrink + expand from 16.4 to 7.2 us and the cost to 21% (178 against 225 tok/s).",
+  "Long prompts (one at a time): 27B 1.0 / 4.8 / 12.0 s and 9B 0.35 / 1.74 / 4.47 s to the first token at 8k / 32k / 64k tokens. 27B at 32k: hipBLASLt GEMMs 49% of GPU time (~0.69 PFLOP/s), prompt attention (attn_mfma) 28% at ~145 TFLOP/s, the next lever.",
+  "Not run on AMD: background adapter loading (95e8f42), which landed after this rental."
  ],
  "profiles": {
   "method": "27B; rocprofv3 --kernel-trace for pocket-engine, vLLM's torch profiler (rocprofv3 lost vLLM's engine process at shutdown); per output token over one fixed-concurrency load.py run, prompts included. Kernel time per output token in us by category, with GPU busy share",

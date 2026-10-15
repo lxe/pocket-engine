@@ -105,9 +105,9 @@ FP8 runs on cuBLASLt, with block scales on Hopper and MXFP8 on Blackwell. On RTX
 
 ## AMD
 
-`--features rocm` builds the same kernels for the MI325X. The hot paths have their own versions in `kernels/amd/`, written for AMD's 64-lane waves and matrix instructions. FP8 and FP4 are NVIDIA only.
+`--features rocm` builds the same kernels for the MI325X. The hot paths have their own versions in `kernels/amd/`, written for AMD's 64-lane waves and matrix instructions. FP4 is NVIDIA only, and FP8 on AMD covers weights only.
 
-Decoding streams weights with a kernel modelled on vLLM's, and larger products go to hipBLASLt, with solutions tuned for the MI325X's shapes (`tuning/`), up to 1.9 times as fast as its own picks. Adapter updates run in order on one stream, since a second stream changed outputs on AMD.
+Decoding streams weights with a kernel modelled on vLLM's, and larger products go to hipBLASLt, with solutions tuned for the MI325X's shapes (`tuning/`), up to 1.9 times as fast as its own picks. GGUF and FP8 weights also keep a bf16 copy for batches, made once at load; FP8 decoding reads its E4M3 rows directly, with power-of-two scales so both copies hold the same values. Adapters decode with their own kernels and run in order on one stream, since a second stream changed outputs on AMD.
 
 What costs time on an MI325X (details in the [receipt](receipts/mi325x.json)):
 

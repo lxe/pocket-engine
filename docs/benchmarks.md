@@ -57,7 +57,23 @@ One MI325X (ROCm 7.14) against vLLM 0.31.0's ROCm image with AITER attention. Ou
 | 128 | **5,484** | 4,580 | **1,529** | 1,485 |
 | 256 | **6,170** | 5,445 | **1,688** | 1,669 |
 
-Startup takes 2 to 3 s against vLLM's 260 to 316 s (plus up to 5 s while the driver frees a previous process's memory), and the median first token at 64 in flight is 77 ms against 135 (9B) and 313 against 353 (27B). Qwen3.5-9B Q4_K_M serves 81, 879 and 2,146 tokens/s at 1, 16 and 64 in flight (thinking off).
+Startup takes 2 to 3 s against vLLM's 260 to 316 s (plus up to 5 s while the driver frees a previous process's memory), and the median first token at 64 in flight is 77 ms against 135 (9B) and 313 against 353 (27B).
+
+Options on the same GPU, measured 2026-10-15 (vLLM's numbers above ran without drafts):
+
+| Model | Option | 1 | 8 | 16 | 64 |
+|---|---|---:|---:|---:|---:|
+| 27B | `--fp8` | 108 | 414 | 745 | 1,257 |
+| 27B | `--mtp 2` | 142 | 704 | 1,230 | 1,278 |
+| 27B | `--mtp 3` | 168 | 787 | | |
+| 27B | `--fp8 --mtp 3` | 193 | 788 | | |
+| 27B | `--ngram` | 150 | 668 | 1,154 | 1,325 |
+| 9B | `--fp8` | 261 | 1,140 | 2,025 | 4,020 |
+| 9B | `--mtp 2` | 352 | 1,908 | 3,163 | 3,921 |
+| 9B | Q4_K_M (GGUF) | 215 | 1,086 | 1,936 | 3,914 |
+| 9B | a rank-16 adapter | 178 | 950 | 1,674 | 3,065 |
+
+First token for one long prompt: 27B 1.0, 4.8 and 12.0 s at 8k, 32k and 64k tokens; 9B 0.35, 1.74 and 4.47 s.
 
 ## First token by prompt length, H100
 

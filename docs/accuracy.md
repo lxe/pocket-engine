@@ -22,7 +22,7 @@ With images, prompt tokens match Transformers' processor exactly:
 | Qwen3.5-9B | 85 of 85 | 0.0000, 0.040 |
 | Qwen3.8-27B | 91 of 91 | 0.0001, 0.050 |
 
-On an AMD MI325X: Qwen3.5-9B 218 of 220, Qwen3.8-27B 212 of 213 and Qwen3.5-9B Q4_K_M 213 of 220, every bf16 miss within one bf16 step.
+On an AMD MI325X: Qwen3.5-9B 219 of 220 and Qwen3.8-27B 213 of 213 in bf16, 213 of 220 and 212 of 213 with `--fp8`, and Qwen3.5-9B Q4_K_M 208 of 220.
 
 ## Quantized weights
 

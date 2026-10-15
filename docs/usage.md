@@ -18,7 +18,7 @@ Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Mixture-of-experts mo
 | Format | GPUs | Load |
 |---|---|---|
 | bf16 | all | a Hugging Face checkpoint |
-| FP8 | H100, H200, RTX 50-series | an FP8 checkpoint, or any bf16 one with `--fp8` |
+| FP8 | H100, H200, RTX 50-series; MI325X (weights) | an FP8 checkpoint, or any bf16 one with `--fp8` |
 | FP4 | RTX 50-series | an NVFP4 checkpoint, or any bf16 one with `--fp4` |
 | GGUF | all | a `.gguf` file (Q4_K_M, Q8_0, IQ4_XS and the other common types); text only |
 
@@ -26,9 +26,11 @@ Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Mixture-of-experts mo
 
 `--mtp` needs a checkpoint or GGUF file that includes the draft layer; among GGUF files, Unsloth's Qwen3.8-27B UD quantizations do. Use it for a few streams at a time: it speeds up each one (64 to 112 tok/s on 27B on an RTX 5090) and costs a few percent at high load.
 
-GGUF weights in 4- to 6-bit formats run batches against int8 activations, which serves about 20% more tokens/s under load on RTX GPUs and a few percent more on H100, with the same agreement with Transformers. `--no-int8` keeps activations in bf16. On AMD, batches dequantize to bf16 for hipBLASLt instead.
+GGUF weights in 4- to 6-bit formats run batches against int8 activations, which serves about 20% more tokens/s under load on RTX GPUs and a few percent more on H100, with the same agreement with Transformers. `--no-int8` keeps activations in bf16. On AMD, GGUF weights are dequantized once at load into a bf16 copy that every product reads, which serves at bf16's speed (`POCKET_GGUF_DENSE=0` keeps the quantized weights alone).
 
 On an MI325X, hipBLASLt uses the solutions in `tuning/` for the shapes decoding runs: 5 to 15% more tokens/s from 8 to 256 requests in flight on 9B, up to 14% on 27B. `POCKET_HIPBLASLT_TUNING=0` turns them off; `HIPBLASLT_TUNING_OVERRIDE_FILE` takes precedence.
+
+On AMD, `--fp8` quantizes weights only, with a power-of-two scale per row: decoding reads the FP8 bytes, larger batches a bf16 copy of the same values (27B at one request: 74 to 108 tok/s).
 
 `--kv-fp8` stores the KV cache in FP8, which fits about twice the tokens. How each format runs is in [the design notes](design.md#quantized-weights).
 

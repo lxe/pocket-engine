@@ -46,7 +46,7 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 
 - **Models:** Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Dense models only.
 - **GPUs:** H100, H200, B200 and RTX 50-series; AMD MI325X (ROCm).
-- **Weights:** bf16, FP8 (NVIDIA), FP4 (RTX 50-series) and GGUF.
+- **Weights:** bf16, FP8, FP4 (RTX 50-series) and GGUF.
 - **Adapters:** PEFT and llama.cpp LoRA, over any of those weights.
 
 ## Documentation

@@ -18,6 +18,7 @@ fn main() {
         "amd/qtile8.cuh",
         "amd/attn_decode.cuh",
         "amd/norm.cuh",
+        "amd/fp8w.cuh",
     ] {
         println!("cargo:rerun-if-changed=src/kernels/{f}");
     }

@@ -426,6 +426,8 @@ enum Target {
     Fp8Quantized,
     /// NVFP4 from the checkpoint, re-quantized to MXFP4 tiles.
     Fp4Checkpoint,
+    /// AMD: bf16 from the checkpoint, quantized to E4M3 rows (Kind::Fp8Row).
+    Fp8Row,
     /// bf16 from the checkpoint, quantized to MXFP4 tiles.
     Fp4Quantized,
 }
@@ -784,6 +786,7 @@ impl Source {
                     Target::Quant(ty)
                 }
                 Kind::Fp8(_) => Target::Fp8Checkpoint,
+                Kind::Fp8Row => unreachable!("made only at load"),
                 Kind::Fp4 => {
                     quants.fp4(gpu)?;
                     Target::Fp4Checkpoint
@@ -804,6 +807,16 @@ impl Source {
                         && cols.is_multiple_of(128) =>
                 {
                     Target::Fp8Quantized
+                }
+                Kind::Bf16
+                    if cfg!(feature = "rocm")
+                        && load.quantize
+                        && !load.fp4
+                        && !keeps_bf16(name)
+                        && cols.is_multiple_of(16) =>
+                {
+                    quants.fp8w(gpu)?;
+                    Target::Fp8Row
                 }
                 Kind::Bf16 => Target::Bf16,
             };
@@ -986,6 +999,28 @@ impl Source {
                 }
                 part(out, Kind::Fp4, None)
             }
+            Target::Fp8Row => {
+                let w = to_temp(0, &pieces)?;
+                let q = gpu.alloc(rows * cols)?;
+                let s = gpu.alloc(rows * 4)?;
+                let d = gpu.alloc(rows * cols * 2)?;
+                gpu.launch(
+                    gpu.kernel("fp8w_quantize")?,
+                    (rows as u32, 1, 1),
+                    256,
+                    0,
+                    &[
+                        Arg::P(w),
+                        Arg::I(cols as i32),
+                        Arg::P(q.ptr),
+                        Arg::P(s.ptr),
+                        Arg::P(d.ptr),
+                    ],
+                )?;
+                let mut p = part(q, Kind::Fp8Row, Some(s));
+                p.dense = Some(Rc::new(d));
+                p
+            }
             Target::Fp8Quantized => {
                 let mode = load.fp8.expect("checked when chosen");
                 let w = to_temp(0, &pieces)?;
@@ -1017,7 +1052,9 @@ impl Source {
                 part(q, Kind::Fp8(mode), Some(sx))
             }
         };
-        placed.dense = dense_copy(gpu, &placed.buf, placed.kind, rows, cols)?.map(Rc::new);
+        if placed.dense.is_none() {
+            placed.dense = dense_copy(gpu, &placed.buf, placed.kind, rows, cols)?.map(Rc::new);
+        }
         Ok(placed)
     }
 

@@ -220,7 +220,8 @@ impl Engine {
                 "--fp4 needs a Blackwell GPU (RTX 50-series)".into(),
             ));
         }
-        if cfg.fp8 && load.fp8.is_none() {
+        // On AMD, --fp8 quantizes weights only (Kind::Fp8Row).
+        if cfg.fp8 && load.fp8.is_none() && !cfg!(feature = "rocm") {
             return Err(Error::Config(
                 "--fp8 needs a GPU with FP8 matmuls (Hopper or Blackwell)".into(),
             ));

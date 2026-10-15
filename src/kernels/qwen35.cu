@@ -2768,6 +2768,7 @@ extern "C" __global__ void vit_bias(const float* __restrict__ y, const float* __
 
 #ifdef __HIP_PLATFORM_AMD__
 #include "amd/skinny.cuh"
+#include "amd/fp8w.cuh"
 #endif
 
 #include "quant.cuh"

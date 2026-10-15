@@ -974,7 +974,7 @@ impl Model {
         let embed_kernel = match embed_kind {
             Kind::Bf16 => gpu.kernel("embed")?,
             Kind::Quant(ty) => quants.get(gpu, ty)?.embed,
-            Kind::Fp8(_) | Kind::Tiled(_) | Kind::Fp4 => {
+            Kind::Fp8(_) | Kind::Fp8Row | Kind::Tiled(_) | Kind::Fp4 => {
                 return Err(Error::Config(
                     "FP8, FP4 and tiled embeddings are not supported".into(),
                 ));

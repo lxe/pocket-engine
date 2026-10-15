@@ -20,6 +20,10 @@ pub enum Kind {
     Fp4,
     /// E4M3 weights with scales in the given layout (see `Part::scales`).
     Fp8(Fp8Mode),
+    /// AMD (`--fp8`): E4M3 weights (gfx942's FNUZ variant) with an f32 power
+    /// of two per row (`Part::scales`), read by skinny_fp8_r* for 1 to 4
+    /// rows; `Part::dense` holds the same values as bf16 for larger batches.
+    Fp8Row,
 }
 
 pub struct Part {
@@ -156,6 +160,8 @@ pub struct Quants {
     fp4: Option<[Kernel; 4]>,
     /// Expands MXFP4 tiles to MXFP8 rows for cuBLASLt.
     fp4_expand: Option<Kernel>,
+    /// AMD: skinny_fp8_r1..r4 for Kind::Fp8Row.
+    fp8w: Option<[Kernel; 4]>,
     finish: Option<Kernel>,
     workspace: Option<Buf>,
     sms: usize,
@@ -298,6 +304,19 @@ impl Quants {
     }
 
     /// Loads the MXFP4 kernels and the split-K workspace.
+    /// Loads the kernels for Kind::Fp8Row.
+    pub fn fp8w(&mut self, gpu: &Gpu) -> Result<()> {
+        if self.fp8w.is_none() {
+            self.fp8w = Some([
+                gpu.kernel("skinny_fp8_r1")?,
+                gpu.kernel("skinny_fp8_r2")?,
+                gpu.kernel("skinny_fp8_r3")?,
+                gpu.kernel("skinny_fp8_r4")?,
+            ]);
+        }
+        Ok(())
+    }
+
     pub fn fp4(&mut self, gpu: &Gpu) -> Result<()> {
         if self.fp4.is_none() {
             let mut k = Vec::with_capacity(4);
@@ -420,6 +439,30 @@ impl Linear {
             _ => None,
         };
         for p in &self.parts {
+            // FP8 rows run their own kernel up to 4 rows, the bf16 copy beyond.
+            // Three rows take the 4-row kernel (skinny_fp8_r3 compiles poorly:
+            // 1.05 to 1.24 times bf16's speed where r4 reaches 1.36 to 1.42);
+            // the extra row reads stale inputs and writes an unused output row,
+            // as `fp8_rows` pads NVIDIA's.
+            if let (Kind::Fp8Row, 1..=4, Some(ks), Some(s)) = (p.kind, rows, &q.fp8w, &p.scales) {
+                gpu.launch(
+                    ks[if rows == 3 { 3 } else { rows - 1 }],
+                    (p.rows.div_ceil(8) as u32, 1, 1),
+                    256,
+                    0,
+                    &[
+                        P(p.buf.ptr),
+                        P(s.ptr),
+                        P(x),
+                        P(y + (p.off * elem) as u64),
+                        I(self.cols as i32),
+                        I(p.rows as i32),
+                        I(ldy as i32),
+                        I(f32_out as i32),
+                    ],
+                )?;
+                continue;
+            }
             if let Some(d) = &p.dense {
                 gpu.gemm_ld(
                     x,
@@ -434,6 +477,8 @@ impl Linear {
                 continue;
             }
             match p.kind {
+                // Handled above: its kernel or its bf16 copy.
+                Kind::Fp8Row => return Err(Error::Config("FP8 rows without their kernels".into())),
                 Kind::Fp8(mode) => {
                     if input.fp8 == 0 {
                         return Err(Error::Config("an FP8 layer got no FP8 input".into()));

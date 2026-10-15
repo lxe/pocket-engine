@@ -2,9 +2,9 @@
 
 An inference server for Qwen3.5 and Qwen3.8 models, written from scratch in Rust and CUDA, with an OpenAI-compatible chat API. Runs on NVIDIA GPUs and on AMD's MI325X.
 
-- **[Starts in 2 to 3 seconds.](docs/design.md#one-process-no-python)** No Python. vLLM takes 1 to 5 minutes.
-- **Fast first tokens.** 13.5 ms for a short prompt on an H100, against vLLM's 57.5 ms.
-- **[Speculative decoding](docs/design.md#speculative-decoding)** with Qwen's built-in prediction layer. Same answers as without it, 293 vs 253 tokens/s for one 9B request on an H100.
+- **[Starts in 2 to 3 seconds.](docs/design.md#one-process-no-python)** A single Rust binary, no Python.
+- **Fast first tokens.** 13.5 ms for a short prompt on an H100.
+- **[Speculative decoding](docs/design.md#speculative-decoding)** with Qwen's built-in prediction layer. Same answers as without it, nearly twice as fast: 293 tokens/s for one 9B request on an H100.
 - **[Drafting from the prompt.](docs/design.md#speculative-decoding)** Up to 4 times faster when answers quote or edit their input.
 - **[Prefix caching for hybrid models.](docs/design.md#prefix-cache)** Each turn of a chat reuses the last one's work.
 - **[GGUF support.](docs/design.md#quantized-weights)** Serve the quantized files you already have from llama.cpp, with no conversion, at 2,372 tokens/s for 9B on an RTX 5090.

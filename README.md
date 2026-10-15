@@ -17,8 +17,8 @@ Output tokens per second, one request and 64 in flight, against vLLM 0.31.0 on t
 | B200 | Qwen3.8-27B | 86 / 1,766 | **87** / **1,803** |
 | H100 | Qwen3.5-9B | **150** / **3,534** | 143 / 2,567 |
 | H100 | Qwen3.8-27B | **50** / 1,069 | 45 / **1,092** |
-| MI325X | Qwen3.5-9B | **224** / **3,800** | 207 / 3,273 |
-| MI325X | Qwen3.8-27B | 74 / **1,187** | **76** / 1,166 |
+| MI325X | Qwen3.5-9B | **225** / **4,103** | 207 / 3,273 |
+| MI325X | Qwen3.8-27B | 74 / **1,269** | **76** / 1,166 |
 
 bf16 weights throughout. H200, RTX 5090, FP8, GGUF, first-token times and the runs behind each number are in [benchmarks](docs/benchmarks.md).
 

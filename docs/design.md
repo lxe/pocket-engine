@@ -111,7 +111,7 @@ What costs time on an MI325X (details in the [receipt](receipts/mi325x.json)):
 
 | Cost | Measured | Response |
 |---|---|---|
-| Each kernel launch | 1.5 µs | Fewer, fused kernels |
+| Each kernel launch | 1.5 µs | Fuse only where parallelism stays |
 | A load waiting on a branch | ~0.3 µs | Issue loads first |
 | A device-wide fence | 83 µs | No hand-offs between blocks |
 

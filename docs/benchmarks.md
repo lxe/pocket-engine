@@ -36,12 +36,12 @@ On a B200, prompt attention runs on tcgen05 tensor cores with tensor memory, as 
 
 | | Before | Now | vLLM, same pod |
 |---|---:|---:|---:|
-| Qwen3.5-9B, first token for a 64k-token prompt | 2.50 s | 1.44 s | 1.32–1.38 s |
-| Prompt attention at 64k tokens (`bench-attn`) | 251 TFLOPS | 1,050 TFLOPS | |
+| Qwen3.5-9B, first token for a 64k-token prompt | 2.50 s | 1.36 s | 1.32–1.38 s |
+| Prompt attention at 64k tokens (`bench-attn`) | 251 TFLOPS | 1,085 TFLOPS | |
 | Linear-attention decode, 64 sequences of 27B (`bench-gdn`) | 115 µs | 69 µs | |
-| Qwen3.8-27B, 64 requests in flight | 1,583 tok/s | 1,655 tok/s | 1,236 tok/s |
+| Qwen3.8-27B, 64 requests in flight | 1,583 tok/s | 1,766 tok/s | 1,236 tok/s |
 
-These pods capped each container at 20 CPUs on a busy host. That slows vLLM's scheduler: its one-stream rates there were 20–30% under its own in the table above, so its last number here understates it. Against that table's 1,803 tok/s, 27B at 64 in flight is close but not yet matched.
+Most of these pods capped each container at 20 CPUs, which slows vLLM's scheduler, so its same-pod numbers understate it; the newest pocket-engine run had 30. Against vLLM's 1,803 tok/s in the table above, 27B at 64 in flight is close but not yet matched.
 
 ## AMD MI325X
 

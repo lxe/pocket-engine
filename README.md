@@ -2,23 +2,25 @@
 
 An inference server for Qwen3.5 and Qwen3.8 models, written from scratch in Rust and CUDA, with an OpenAI-compatible chat API. Runs on NVIDIA GPUs and on AMD's MI325X.
 
-- **Starts in seconds.** Serving 3 seconds after launch, where vLLM takes 1.5 to 3 minutes.
-- **Fast first tokens.** 13.5 ms for a short prompt against vLLM's 57.5 ms.
-- **Higher throughput** on most models, with optional speculative decoding from the checkpoint's own multi-token-prediction layer, or from the prompt itself.
-- **LoRA adapters,** many per server, loaded at runtime through vLLM's API.
-- **JSON output and log-probabilities** in OpenAI's format.
-- **bf16, FP8, FP4 and GGUF weights,** and images.
+- **Ready in seconds.** A single Rust binary with no Python serves a 9B model 2 to 3 seconds after launch; vLLM takes 1 to 5 minutes on the same GPUs.
+- **Fast first tokens.** 13.5 ms for a short prompt on an H100, against vLLM's 57.5 ms.
+- **Drafts for free.** The checkpoint's own multi-token-prediction layer, or earlier text in the request, proposes tokens; output stays exactly the same. One 9B stream on an H100 runs at 293 tokens/s against vLLM's 253, and copy-heavy answers run up to 4 times faster.
+- **GGUF on tensor cores.** llama.cpp's files serve as they are, at 2,372 tokens/s for 9B Q4_K_M on an RTX 5090, 64 requests in flight.
+- **Built for the hybrid models.** A prefix cache that snapshots the linear-attention state, and attention kernels shaped for Qwen's 256-wide heads, down to pairing SMs on a B200.
+- **LoRA adapters, JSON output, log-probabilities and images,** with vLLM's APIs.
 
-Qwen3.5-9B on one H100, against vLLM 0.31.0 on the same machine:
+Output tokens per second, one request and 64 in flight, against vLLM 0.31.0 on the same GPU model:
 
-| | pocket-engine | vLLM |
-|---|---:|---:|
-| Launch to serving | **2.6–3.5 s** | 89–165 s |
-| First token, short prompt | **13.5 ms** | 57.5 ms |
-| First token, 64k-token prompt | 2.29 s | **2.28 s** |
-| Output tokens/s, 64 requests in flight | **3,534** | 2,567 |
+| GPU | Model | pocket-engine | vLLM |
+|---|---|---:|---:|
+| B200 | Qwen3.5-9B | **230** / **5,408** | 224 / 4,782 |
+| B200 | Qwen3.8-27B | 86 / 1,766 | **87** / **1,803** |
+| H100 | Qwen3.5-9B | **150** / **3,534** | 143 / 2,567 |
+| H100 | Qwen3.8-27B | **50** / 1,069 | 45 / **1,092** |
+| MI325X | Qwen3.5-9B | **224** / **3,800** | 207 / 3,273 |
+| MI325X | Qwen3.8-27B | 74 / **1,187** | **76** / 1,166 |
 
-H200, B200, RTX 5090, AMD MI325X, Qwen3.8-27B and other formats are in [benchmarks](docs/benchmarks.md).
+bf16 weights throughout. H200, RTX 5090, FP8, GGUF, first-token times and the runs behind each number are in [benchmarks](docs/benchmarks.md).
 
 ## Quick start
 

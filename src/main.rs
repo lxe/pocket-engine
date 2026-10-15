@@ -82,6 +82,14 @@ struct EngineArgs {
     /// [default: 4 with --lora, else off].
     #[arg(long)]
     max_loras: Option<usize>,
+    /// Load adapters on first use from DIR: a request for model NAME loads
+    /// DIR/NAME (a PEFT directory) or DIR/NAME.gguf.
+    #[arg(long, value_name = "DIR")]
+    lora_dir: Option<std::path::PathBuf>,
+    /// Adapters loaded from --lora-dir kept in host memory; the least
+    /// recently used idle one is dropped first (0: no limit).
+    #[arg(long, default_value_t = 32)]
+    max_cpu_loras: usize,
     /// Largest adapter rank.
     #[arg(long, default_value_t = 16)]
     max_lora_rank: usize,
@@ -122,10 +130,16 @@ impl EngineArgs {
                     }
                 })
                 .collect(),
-            max_loras: self
-                .max_loras
-                .unwrap_or(if self.lora.is_empty() { 0 } else { 4 }),
+            max_loras: self.max_loras.unwrap_or(
+                if self.lora.is_empty() && self.lora_dir.is_none() {
+                    0
+                } else {
+                    4
+                },
+            ),
             max_lora_rank: self.max_lora_rank,
+            lora_dir: self.lora_dir.clone(),
+            max_cpu_loras: self.max_cpu_loras,
             ..EngineConfig::new(self.model.clone())
         }
     }

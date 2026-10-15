@@ -56,6 +56,13 @@ pub struct EngineConfig {
     pub loras: Vec<(String, PathBuf)>,
     /// Adapters on the GPU at once; 0 turns adapters off.
     pub max_loras: usize,
+    /// Where a request naming an unknown adapter finds it: DIR/<name> (a PEFT
+    /// directory) or DIR/<name>.gguf, loaded on first use.
+    pub lora_dir: Option<PathBuf>,
+    /// Adapters loaded from `lora_dir` kept in host memory; past that, the
+    /// least recently used idle one is dropped (it loads again on demand). 0:
+    /// no limit.
+    pub max_cpu_loras: usize,
     /// Largest adapter rank.
     pub max_lora_rank: usize,
 }
@@ -85,6 +92,8 @@ impl EngineConfig {
             loras: Vec::new(),
             max_loras: 0,
             max_lora_rank: 16,
+            lora_dir: None,
+            max_cpu_loras: 32,
         }
     }
 }
@@ -104,9 +113,13 @@ pub struct Scoring {
 pub enum Msg {
     Request(Request),
     /// Loads an adapter under a name; the reply carries an error, if any.
+    /// With `on_demand` (a request named it), a name already loaded or loading
+    /// is fine, and the adapter may be dropped again to stay under
+    /// `max_cpu_loras`.
     LoadAdapter {
         name: String,
         path: PathBuf,
+        on_demand: bool,
         reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     UnloadAdapter {
@@ -116,8 +129,14 @@ pub enum Msg {
 }
 
 type Reply = tokio::sync::oneshot::Sender<std::result::Result<(), String>>;
+
 /// An adapter read on a worker thread, on its way back to the engine.
-type Prepared = (String, PathBuf, Result<crate::lora::Adapter>, Reply);
+struct Prepared {
+    name: String,
+    path: PathBuf,
+    adapter: Result<crate::lora::Adapter>,
+    on_demand: bool,
+}
 
 /// Adapter names the server may route requests to, by id.
 pub type Adapters = Arc<Mutex<HashMap<String, u32>>>;
@@ -131,6 +150,8 @@ pub struct Info {
     pub max_seqs: usize,
     pub kv_blocks: usize,
     pub max_context: usize,
+    /// Where adapters load from on first use, if anywhere.
+    pub lora_dir: Option<PathBuf>,
 }
 
 /// Engine state shared with the server: capacity, and whether it still runs.
@@ -170,9 +191,16 @@ pub struct Engine {
     lora: Option<crate::lora::Loras>,
     pub adapters: Adapters,
     /// Adapters being read on worker threads, so steps keep running while
-    /// they load, and the channel they come back on.
-    loading: HashSet<String>,
+    /// they load, with the requests waiting on each, and the channel they come
+    /// back on.
+    loading: HashMap<String, Vec<Reply>>,
     prepared: (mpsc::Sender<Prepared>, mpsc::Receiver<Prepared>),
+    /// Adapters loaded on demand (droppable), and when each adapter was last
+    /// asked for.
+    on_demand: HashSet<u32>,
+    last_used: HashMap<u32, Instant>,
+    /// Unloaded adapters that requests still use; freed when they finish.
+    draining: Vec<u32>,
     vision: Option<Vision>,
     pub sched: Scheduler,
     pub stats: Stats,
@@ -356,8 +384,11 @@ impl Engine {
             lora_verify_graphs: HashMap::new(),
             lora,
             adapters: Arc::default(),
-            loading: HashSet::new(),
+            loading: HashMap::new(),
             prepared: mpsc::channel(),
+            on_demand: HashSet::new(),
+            last_used: HashMap::new(),
+            draining: Vec::new(),
             vision,
             sched,
             stats: Stats::default(),
@@ -390,6 +421,7 @@ impl Engine {
             max_seqs: self.cfg.max_seqs,
             kv_blocks: self.state.blocks,
             max_context: self.cfg.max_context,
+            lora_dir: self.cfg.lora_dir.clone(),
         }
     }
 
@@ -466,60 +498,136 @@ impl Engine {
 
     /// Starts reading an adapter on a worker thread; [`Engine::finish_loads`]
     /// registers it and answers `reply` once it is ready.
-    fn start_load(&mut self, name: String, path: PathBuf, reply: Reply) {
+    fn start_load(&mut self, name: String, path: PathBuf, on_demand: bool, reply: Reply) {
         let Some(l) = self.lora.as_ref() else {
             let _ = reply.send(Err(
                 "adapters are off; start with --max-loras or --lora".into()
             ));
             return;
         };
-        if l.id(&name).is_some() || self.loading.contains(&name) {
-            let _ = reply.send(Err(format!("adapter {name} is already loaded")));
+        if l.id(&name).is_some() {
+            let _ = reply.send(if on_demand {
+                Ok(())
+            } else {
+                Err(format!("adapter {name} is already loaded"))
+            });
+            return;
+        }
+        if let Some(waiting) = self.loading.get_mut(&name) {
+            if on_demand {
+                waiting.push(reply);
+            } else {
+                let _ = reply.send(Err(format!("adapter {name} is already loading")));
+            }
             return;
         }
         let prep = l.prep(&self.gpu);
         let tx = self.prepared.0.clone();
-        self.loading.insert(name.clone());
+        let worker_name = name.clone();
         let spawned = std::thread::Builder::new()
             .name("adapter".into())
             .spawn(move || {
-                let r = prep.read(&name, &path);
-                let _ = tx.send((name, path, r, reply));
+                let adapter = prep.read(&worker_name, &path);
+                let _ = tx.send(Prepared {
+                    name: worker_name,
+                    path,
+                    adapter,
+                    on_demand,
+                });
             });
-        if let Err(e) = spawned {
-            eprintln!("could not start an adapter thread: {e}");
+        match spawned {
+            Ok(_) => {
+                self.loading.insert(name, vec![reply]);
+            }
+            Err(e) => {
+                let _ = reply.send(Err(format!("could not start an adapter thread: {e}")));
+            }
         }
     }
 
-    /// Registers adapters the worker threads have finished reading.
+    /// Registers adapters the worker threads have finished reading, and
+    /// frees unloaded ones no request uses any more.
     pub fn finish_loads(&mut self) {
-        while let Ok((name, path, r, reply)) = self.prepared.1.try_recv() {
-            self.loading.remove(&name);
-            let r = r.and_then(|a| self.register(a, &path));
-            let _ = reply.send(r.map(|_| ()).map_err(|e| e.to_string()));
+        while let Ok(p) = self.prepared.1.try_recv() {
+            let replies = self.loading.remove(&p.name).unwrap_or_default();
+            let r = p.adapter.and_then(|a| self.register(a, &p.path));
+            if let Ok(id) = r
+                && p.on_demand
+            {
+                self.on_demand.insert(id);
+                self.last_used.insert(id, Instant::now());
+                self.evict();
+            }
+            let answer = r.map(|_| ()).map_err(|e| e.to_string());
+            for reply in replies {
+                let _ = reply.send(answer.clone());
+            }
+        }
+        let draining = std::mem::take(&mut self.draining);
+        for id in draining {
+            if self.sched.uses_adapter(id) {
+                self.draining.push(id);
+            } else {
+                self.free_adapter(id);
+            }
         }
     }
 
-    /// Whether an adapter is still being read.
-    pub fn loading(&self) -> bool {
-        !self.loading.is_empty()
+    /// Drops the least recently used idle adapters loaded on demand until at
+    /// most `max_cpu_loras` remain.
+    fn evict(&mut self) {
+        let cap = self.cfg.max_cpu_loras;
+        while cap > 0 && self.on_demand.len() > cap {
+            let victim = self
+                .on_demand
+                .iter()
+                .copied()
+                .filter(|&id| !self.sched.uses_adapter(id))
+                .min_by_key(|id| self.last_used.get(id).copied());
+            let Some(id) = victim else { break };
+            let name = self
+                .lora
+                .as_ref()
+                .and_then(|l| l.adapter(id))
+                .map(|a| a.name.clone());
+            if let (Some(name), Some(l)) = (name, self.lora.as_mut()) {
+                l.retire(&name);
+                self.adapters.lock().unwrap().remove(&name);
+                eprintln!("adapter {name}: dropped, the least recently used");
+            }
+            self.free_adapter(id);
+        }
     }
 
-    /// Unloads an adapter no request is using.
+    fn free_adapter(&mut self, id: u32) {
+        if let Some(l) = self.lora.as_mut() {
+            l.free(id);
+        }
+        self.sched.forget_adapter(id);
+        self.on_demand.remove(&id);
+        self.last_used.remove(&id);
+    }
+
+    /// Whether an adapter is still being read or waiting to be freed.
+    pub fn loading(&self) -> bool {
+        !self.loading.is_empty() || !self.draining.is_empty()
+    }
+
+    /// Unloads an adapter: new requests can no longer name it, and its memory
+    /// is freed once the requests already using it finish.
     pub fn unload_adapter(&mut self, name: &str) -> Result<()> {
-        let l = self
+        let id = self
             .lora
             .as_mut()
+            .and_then(|l| l.retire(name))
             .ok_or_else(|| Error::Config(format!("no adapter named {name}")))?;
-        let id = l
-            .id(name)
-            .ok_or_else(|| Error::Config(format!("no adapter named {name}")))?;
-        if self.sched.uses_adapter(id) {
-            return Err(Error::Config(format!("adapter {name} is in use")));
-        }
-        l.unload(name);
-        self.sched.forget_adapter(id);
         self.adapters.lock().unwrap().remove(name);
+        self.on_demand.remove(&id);
+        if self.sched.uses_adapter(id) {
+            self.draining.push(id);
+        } else {
+            self.free_adapter(id);
+        }
         Ok(())
     }
 
@@ -536,13 +644,21 @@ impl Engine {
             ));
             return;
         }
+        if r.adapter != 0 {
+            self.last_used.insert(r.adapter, Instant::now());
+        }
         self.sched.submit(r);
     }
 
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Request(r) => self.submit(r),
-            Msg::LoadAdapter { name, path, reply } => self.start_load(name, path, reply),
+            Msg::LoadAdapter {
+                name,
+                path,
+                on_demand,
+                reply,
+            } => self.start_load(name, path, on_demand, reply),
             Msg::UnloadAdapter { name, reply } => {
                 let _ = reply.send(self.unload_adapter(&name).map_err(|e| e.to_string()));
             }
@@ -785,6 +901,7 @@ pub fn spawn(cfg: EngineConfig) -> Result<Spawned> {
             publish(&engine, None);
             let mut last_report = Instant::now();
             loop {
+                engine.finish_loads();
                 if engine.sched.idle() {
                     publish(&engine, None);
                     // While an adapter loads, wake now and then to register it.

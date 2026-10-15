@@ -573,11 +573,15 @@ impl Loras {
         Ok(id)
     }
 
-    /// Drops an adapter no running request uses.
-    pub fn unload(&mut self, name: &str) -> Option<u32> {
-        let id = self.names.remove(name)?;
+    /// Takes an adapter's name off the routable list and returns its id; its
+    /// data stays until [`Loras::free`], for requests already using it.
+    pub fn retire(&mut self, name: &str) -> Option<u32> {
+        self.names.remove(name)
+    }
+
+    /// Drops a retired adapter's data.
+    pub fn free(&mut self, id: u32) {
         self.adapters.remove(&id);
-        Some(id)
     }
 
     /// Copies adapter `id` into GPU slot `slot` (1-based) and points that

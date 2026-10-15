@@ -65,6 +65,11 @@ pocket-engine serve --model models/Qwen3.5-9B-Q4_K_M.gguf --lora support=adapter
 
 Adapters are PEFT directories (`adapter_config.json` and `adapter_model.safetensors`) or llama.cpp GGUF adapters, over any base format. `--max-loras` adapters sit on the GPU at once; others wait on the host and swap in when a slot frees. On an RTX 5090, adapters cost 11% at one request on 9B Q4_K_M and 20 to 27% at 16 to 64 ([benchmarks](benchmarks.md#adapters-rtx-5090)). Requests for the base model cost nothing extra.
 
+Adapters can also come and go while the server runs:
+
+- `POST /v1/load_lora_adapter` and `/v1/unload_lora_adapter` work as in vLLM. Loading doesn't pause running requests. Unloading stops new requests at once and frees the adapter when the requests already using it finish.
+- With `--lora-dir DIR`, a request for a model the server doesn't know loads `DIR/<name>` (a PEFT directory) or `DIR/<name>.gguf` first. `--max-cpu-loras` caps how many of these stay in memory: the least recently used idle one is dropped and loads again when a request asks for it.
+
 Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`) plus vLLM's `top_k`, `min_p` and `repetition_penalty`. The default temperature is 1.0. Prompts that share a beginning reuse its cache. Thinking is off unless a request sends vLLM's `"chat_template_kwargs": {"enable_thinking": true}` (vLLM's default is on).
 
 ### Structured output and log-probabilities
@@ -95,8 +100,10 @@ Neither turns on speculative decoding for the request. On an RTX 5090 with 9B Q4
 | `--state-f32` | off | f32 linear-attention state (twice the memory) |
 | `--no-int8` | off | bf16 activations for GGUF weights (see above) |
 | `--lora NAME=PATH` | none | Serve an adapter; repeat for more |
-| `--max-loras N` | 4 with `--lora`, else off | Adapters on the GPU at once; also allows loading them at runtime |
+| `--max-loras N` | 4 with `--lora` or `--lora-dir`, else off | Adapters on the GPU at once; also allows loading them at runtime |
 | `--max-lora-rank N` | 16 | Largest adapter rank |
+| `--lora-dir DIR` | none | Load adapters on first use from `DIR/<name>` or `DIR/<name>.gguf` |
+| `--max-cpu-loras N` | 32 | Adapters from `--lora-dir` kept in memory (0: no limit) |
 | `--no-vision` | off | Text only |
 | `--max-image-pixels N` | 4194304 | Largest image after resizing |
 | `--image-pool N` | 16384 | Image embeddings waiting at once |

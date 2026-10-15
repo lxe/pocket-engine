@@ -519,15 +519,25 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
     // `model` names the base or an adapter. Without adapters any name means
     // the base, as before.
     let (served, adapter) = match (&req.model, &app.adapters) {
-        (Some(m), Some(a)) if *m != app.model => match a.lock().unwrap().get(m) {
-            Some(&id) => (m.clone(), id),
-            None => {
-                return err(
-                    StatusCode::NOT_FOUND,
-                    format!("The model `{m}` does not exist."),
-                );
+        (Some(m), Some(a)) if *m != app.model => {
+            let known = a.lock().unwrap().get(m).copied();
+            let id = match known {
+                Some(id) => Some(id),
+                None => match load_on_demand(&app, a, m).await {
+                    Ok(id) => id,
+                    Err(e) => return err(StatusCode::BAD_REQUEST, e),
+                },
+            };
+            match id {
+                Some(id) => (m.clone(), id),
+                None => {
+                    return err(
+                        StatusCode::NOT_FOUND,
+                        format!("The model `{m}` does not exist."),
+                    );
+                }
             }
-        },
+        }
         _ => (app.model.clone(), 0),
     };
     let n = app.next.fetch_add(1, Ordering::Relaxed);
@@ -957,6 +967,51 @@ async fn models(State(app): State<Arc<App>>) -> Json<Value> {
     Json(json!({ "object": "list", "data": data }))
 }
 
+/// An adapter a request names but the engine does not have, from
+/// `--lora-dir`: DIR/<name> (a PEFT directory) or DIR/<name>.gguf. None when
+/// there is no such adapter.
+async fn load_on_demand(
+    app: &App,
+    adapters: &Adapters,
+    name: &str,
+) -> std::result::Result<Option<u32>, String> {
+    let Some(dir) = &app.info.lora_dir else {
+        return Ok(None);
+    };
+    // A name, not a path: nothing outside the directory.
+    let plain = !name.is_empty()
+        && name.len() <= 200
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    if !plain {
+        return Ok(None);
+    }
+    let path = if dir.join(name).join("adapter_config.json").is_file() {
+        dir.join(name)
+    } else if dir.join(format!("{name}.gguf")).is_file() {
+        dir.join(format!("{name}.gguf"))
+    } else {
+        return Ok(None);
+    };
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let msg = Msg::LoadAdapter {
+        name: name.to_string(),
+        path,
+        on_demand: true,
+        reply,
+    };
+    if app.engine.lock().unwrap().send(msg).is_err() {
+        return Err("engine stopped".into());
+    }
+    match rx.await {
+        Ok(Ok(())) => Ok(adapters.lock().unwrap().get(name).copied()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("engine stopped".into()),
+    }
+}
+
 /// vLLM's runtime adapter endpoints.
 #[derive(Deserialize)]
 struct AdapterRequest {
@@ -994,6 +1049,7 @@ async fn load_adapter(State(app): State<Arc<App>>, Json(req): Json<AdapterReques
     let r = adapter_call(&app, |reply| Msg::LoadAdapter {
         name: name.clone(),
         path: path.into(),
+        on_demand: false,
         reply,
     })
     .await;

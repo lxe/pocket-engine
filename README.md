@@ -2,14 +2,15 @@
 
 An inference server for Qwen3.5 and Qwen3.8 models, written from scratch in Rust and CUDA, with an OpenAI-compatible chat API. Runs on NVIDIA GPUs and on AMD's MI325X.
 
-- **Ready in seconds.** A single Rust binary with no Python serves a 9B model 2 to 3 seconds after launch; vLLM takes 1 to 5 minutes on the same GPUs.
-- **Fast first tokens.** 13.5 ms for a short prompt on an H100, against vLLM's 57.5 ms.
-- **Drafts for free.** The checkpoint's own multi-token-prediction layer, or earlier text in the request, proposes tokens; output stays exactly the same. One 9B stream on an H100 runs at 293 tokens/s against vLLM's 253, and copy-heavy answers run up to 4 times faster.
-- **GGUF on tensor cores.** llama.cpp's files serve as they are, at 2,372 tokens/s for 9B Q4_K_M on an RTX 5090, 64 requests in flight.
-- **Built for the hybrid models.** A prefix cache that snapshots the linear-attention state, and attention kernels shaped for Qwen's 256-wide heads, down to pairing SMs on a B200.
-- **LoRA adapters, JSON output, log-probabilities and images,** with vLLM's APIs.
+- **Starts in seconds.** It's a single Rust binary with no Python. A 9B model is serving 2 to 3 seconds after launch, where vLLM takes 1 to 5 minutes.
+- **Fast first token.** A short prompt gets its first token in 13.5 ms on an H100. vLLM takes 57.5 ms.
+- **Speculative decoding.** Qwen checkpoints include a small extra layer that predicts the next few tokens. pocket-engine drafts with it and checks every draft against the full model, so answers are identical to normal decoding, only faster. With it, one 9B request on an H100 runs at 293 tokens/s. vLLM, drafting the same way, reaches 253.
+- **Drafting from the prompt.** When an answer repeats text from the prompt, as in editing or extraction, those tokens can be drafted from the prompt itself. Such answers come out up to 4 times faster.
+- **Runs GGUF files directly.** The quantized files llama.cpp uses run on tensor cores without conversion. A 9B Q4_K_M model serves 2,372 tokens/s on an RTX 5090 with 64 requests at once.
+- **Made for Qwen's hybrid layers.** The prefix cache saves the linear-attention state, so a chat's next turn doesn't recompute its history. The attention kernels are tuned for Qwen's extra-wide heads.
+- **Also:** LoRA adapters, JSON output, log-probabilities and images, through the same API as vLLM.
 
-Output tokens per second, one request and 64 in flight, against vLLM 0.31.0 on the same GPU model:
+Output tokens per second against vLLM 0.31.0 on the same GPU model. Each cell shows one request / 64 requests at once.
 
 | GPU | Model | pocket-engine | vLLM |
 |---|---|---:|---:|
@@ -20,7 +21,7 @@ Output tokens per second, one request and 64 in flight, against vLLM 0.31.0 on t
 | MI325X | Qwen3.5-9B | **225** / **4,103** | 207 / 3,273 |
 | MI325X | Qwen3.8-27B | 74 / **1,269** | **76** / 1,166 |
 
-bf16 weights throughout. H200, RTX 5090, FP8, GGUF, first-token times and the runs behind each number are in [benchmarks](docs/benchmarks.md).
+All bf16. More GPUs and formats, first-token times, and the runs behind every number are in [benchmarks](docs/benchmarks.md).
 
 ## Quick start
 

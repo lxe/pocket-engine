@@ -1266,3 +1266,15 @@ fn ngram_drafts_keep_the_models_greedy_choices() {
         assert!(worst < 0.15, "worst departure {worst}");
     }
 }
+
+/// Writes a synthetic adapter for POCKET_ENGINE_MODEL to POCKET_WRITE_ADAPTER
+/// (rank 16), for benchmarking adapters where no trained one is at hand:
+/// `cargo test --release --features rocm --test gpu write_synthetic_adapter -- --ignored`.
+#[test]
+#[ignore]
+fn write_synthetic_adapter() {
+    let (Some(dir), Some(out)) = (model(), std::env::var_os("POCKET_WRITE_ADAPTER")) else {
+        return;
+    };
+    synthetic_adapter(&dir, std::path::Path::new(&out), 16, 0.02, 7);
+}

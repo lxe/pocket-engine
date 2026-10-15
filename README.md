@@ -7,8 +7,8 @@ An inference server for Qwen3.5 and Qwen3.8 models, written from scratch in Rust
 - **[Speculative decoding](docs/design.md#speculative-decoding)** with Qwen's built-in prediction layer. Same answers as without it, 293 vs 253 tokens/s for one 9B request on an H100.
 - **[Drafting from the prompt.](docs/design.md#speculative-decoding)** Up to 4 times faster when answers quote or edit their input.
 - **[Prefix caching for hybrid models.](docs/design.md#prefix-cache)** Each turn of a chat reuses the last one's work.
-- **[GGUF on tensor cores.](docs/design.md#quantized-weights)** llama.cpp's files at 2,372 tokens/s for 9B on an RTX 5090.
-- **[Many LoRA adapters per server,](docs/design.md#lora-adapters)** loaded and unloaded at runtime.
+- **[GGUF support.](docs/design.md#quantized-weights)** Serve the quantized files you already have from llama.cpp, with no conversion, at 2,372 tokens/s for 9B on an RTX 5090.
+- **[Load and serve adapters on a live server.](docs/design.md#lora-adapters)** Add or remove a fine-tune without a restart, while requests for the base model keep full speed.
 - **bf16, FP8, FP4 and GGUF weights;** JSON output, log-probabilities and images.
 
 Output tokens per second against vLLM 0.31.0 on the same GPU model. Each cell shows one request / 64 requests at once.

@@ -27,6 +27,9 @@ pub struct Part {
     pub kind: Kind,
     /// FP8 weight scales.
     pub scales: Option<Rc<Buf>>,
+    /// AMD: the weights as bf16 (quantized ones dequantized once at load),
+    /// which every product then reads instead (see `Source::place`).
+    pub dense: Option<Rc<Buf>>,
     /// Output features of this part and their first column in the output.
     pub rows: usize,
     pub off: usize,
@@ -417,6 +420,19 @@ impl Linear {
             _ => None,
         };
         for p in &self.parts {
+            if let Some(d) = &p.dense {
+                gpu.gemm_ld(
+                    x,
+                    d.ptr,
+                    y + (p.off * elem) as u64,
+                    rows,
+                    self.cols,
+                    p.rows,
+                    ldy,
+                    f32_out,
+                )?;
+                continue;
+            }
             match p.kind {
                 Kind::Fp8(mode) => {
                     if input.fp8 == 0 {

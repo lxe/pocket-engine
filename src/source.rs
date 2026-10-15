@@ -237,6 +237,48 @@ impl Bytes<'_> {
 
 /// Uploads matrices stored back to back as one buffer of `kind`, repacking
 /// quantized blocks into the device layout on the GPU.
+/// AMD: a bf16 copy of quantized weights, dequantized once at load, which
+/// every product then reads (hipBLASLt, or the matrix-vector kernel for 1 to
+/// 4 rows) instead of dequantizing for each: the same values as before, so
+/// the same outputs, at bf16's speed. Made when it leaves a quarter of the
+/// GPU's memory free; POCKET_GGUF_DENSE=0 turns it off.
+pub fn dense_copy(
+    gpu: &Gpu,
+    buf: &Buf,
+    kind: Kind,
+    rows: usize,
+    cols: usize,
+) -> Result<Option<Buf>> {
+    if !cfg!(feature = "rocm") || std::env::var_os("POCKET_GGUF_DENSE").is_some_and(|v| v == "0") {
+        return Ok(None);
+    }
+    let name = match kind {
+        Kind::Quant(ty) => format!("dequant_{}", ty.name()),
+        Kind::Tiled(ty) => format!("dequant_tiled_{}", ty.name()),
+        _ => return Ok(None),
+    };
+    let bytes = rows * cols * 2;
+    let (free, total) = gpu.mem_info()?;
+    if free < bytes + total / 4 {
+        return Ok(None);
+    }
+    let out = gpu.alloc(bytes)?;
+    gpu.launch(
+        gpu.kernel(&name)?,
+        ((rows * cols / 8).div_ceil(256).min(65_535) as u32, 1, 1),
+        256,
+        0,
+        &[
+            Arg::P(buf.ptr),
+            Arg::I(0),
+            Arg::I(rows as i32),
+            Arg::I(cols as i32),
+            Arg::P(out.ptr),
+        ],
+    )?;
+    Ok(Some(out))
+}
+
 fn upload_kind(gpu: &Gpu, kind: Kind, pieces: &[Piece]) -> Result<Buf> {
     let Kind::Quant(ty) = kind else {
         return gpu.upload_pieces(pieces);
@@ -826,6 +868,7 @@ impl Source {
             buf: Rc::new(buf),
             kind,
             scales: scales.map(Rc::new),
+            dense: None,
             rows,
             off,
         };
@@ -841,7 +884,7 @@ impl Source {
             Ok(t)
         };
         let grid = |n: usize| ((n.div_ceil(256)).min(65_535) as u32, 1, 1);
-        Ok(match target {
+        let mut placed = match target {
             Target::Quant(ty)
                 if ty.tile_chunk().is_some()
                     && rows.is_multiple_of(16)
@@ -973,7 +1016,9 @@ impl Source {
                 }
                 part(q, Kind::Fp8(mode), Some(sx))
             }
-        })
+        };
+        placed.dense = dense_copy(gpu, &placed.buf, placed.kind, rows, cols)?.map(Rc::new);
+        Ok(placed)
     }
 
     /// A single matrix kept as one buffer, for sharing (tied embeddings).

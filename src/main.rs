@@ -441,6 +441,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     buf: Rc::new(buf),
                     kind,
                     scales: None,
+                    dense: None,
                     rows: n,
                     off: 0,
                 }],

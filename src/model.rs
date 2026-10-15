@@ -922,6 +922,8 @@ impl Model {
                     buf: embed.clone(),
                     kind: embed_kind,
                     scales: None,
+                    dense: crate::source::dense_copy(gpu, &embed, embed_kind, cfg.vocab, h)?
+                        .map(Rc::new),
                     rows: cfg.vocab,
                     off: 0,
                 }],
@@ -945,6 +947,7 @@ impl Model {
                             buf: p.buf.clone(),
                             kind: p.kind,
                             scales: p.scales.clone(),
+                            dense: p.dense.clone(),
                             rows: if sliceable { vocab } else { p.rows },
                             off: p.off,
                         })

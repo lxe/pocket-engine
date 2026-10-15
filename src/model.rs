@@ -1568,15 +1568,22 @@ impl Act {
 
     /// The step's LoRA work for the linear layers: `max_tiles` bounds the
     /// tiles the step's metadata lists.
-    pub fn lora_step(&self, l: &crate::lora::Loras, max_tiles: usize) -> crate::lora::StepLora {
+    /// `decode`: tiles of a few tokens (the decoding graphs), which take
+    /// `Loras::shrink_dec` and `expand_dec`.
+    pub fn lora_step(
+        &self,
+        l: &crate::lora::Loras,
+        max_tiles: usize,
+        decode: bool,
+    ) -> crate::lora::StepLora {
         crate::lora::StepLora {
             tiles: self.m(self.meta.lora()),
             max_tiles,
             s: l.s.ptr,
             s_stride: (self.meta.max_tokens * l.lds * 4) as u64,
             lds: l.lds,
-            shrink: l.shrink,
-            expand: l.expand,
+            shrink: if decode { l.shrink_dec } else { l.shrink },
+            expand: if decode { l.expand_dec } else { l.expand },
         }
     }
 

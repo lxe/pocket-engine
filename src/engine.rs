@@ -411,7 +411,7 @@ impl Engine {
                     let t = b * n;
                     // A sequence's tokens fit one tile, so b bounds the tiles.
                     let lora = match (&self.lora, with_lora) {
-                        (Some(l), true) => Some(self.act.lora_step(l, b)),
+                        (Some(l), true) => Some(self.act.lora_step(l, b, true)),
                         _ => None,
                     };
                     // A plain run first, so cuBLAS settles its kernels outside capture.
@@ -603,7 +603,7 @@ impl Engine {
                 self.act.upload_pen(&self.gpu, pens)?;
                 self.act.upload_meta(&self.gpu)?;
                 let lora = match &self.lora {
-                    Some(l) if tiles > 0 => Some(self.act.lora_step(l, tiles)),
+                    Some(l) if tiles > 0 => Some(self.act.lora_step(l, tiles, false)),
                     _ => None,
                 };
                 let head = self.sched.head_rows(&step);

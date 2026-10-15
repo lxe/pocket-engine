@@ -434,6 +434,11 @@ pub struct Loras {
     pub lds: usize,
     pub shrink: Kernel,
     pub expand: Kernel,
+    /// The pair for decoding steps (tiles of a few tokens): on AMD,
+    /// amd/lora.cuh's, faster there (1 token: 12.6 against 16.4 us a layer);
+    /// the originals stay faster for tiles of 16 prompt tokens.
+    pub shrink_dec: Kernel,
+    pub expand_dec: Kernel,
 }
 
 /// Per-layer hook a linear layer keeps: its descriptor table and launch shape.
@@ -504,6 +509,16 @@ impl Loras {
             lds,
             shrink: gpu.kernel("lora_shrink")?,
             expand: gpu.kernel("lora_expand")?,
+            shrink_dec: gpu.kernel(if amd_lora() {
+                "lora_shrink_amd"
+            } else {
+                "lora_shrink"
+            })?,
+            expand_dec: gpu.kernel(if amd_lora() {
+                "lora_expand_amd"
+            } else {
+                "lora_expand"
+            })?,
         })
     }
 
@@ -606,6 +621,12 @@ impl Loras {
     pub fn adapter(&self, id: u32) -> Option<&Adapter> {
         self.adapters.get(&id)
     }
+}
+
+/// Whether decoding steps run amd/lora.cuh's kernels: on AMD, unless
+/// POCKET_LORA_AMD=0.
+fn amd_lora() -> bool {
+    cfg!(feature = "rocm") && std::env::var_os("POCKET_LORA_AMD").is_none_or(|v| v != "0")
 }
 
 #[cfg(test)]

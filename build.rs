@@ -19,6 +19,7 @@ fn main() {
         "amd/attn_decode.cuh",
         "amd/norm.cuh",
         "amd/fp8w.cuh",
+        "amd/lora.cuh",
     ] {
         println!("cargo:rerun-if-changed=src/kernels/{f}");
     }

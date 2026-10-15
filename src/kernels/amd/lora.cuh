@@ -99,3 +99,47 @@ extern "C" __global__ void __launch_bounds__(128) lora_expand_amd(const float* _
         else ((bf16*)Y)[at] = f2b(b2f(((bf16*)Y)[at]) + acc[t]);
     }
 }
+
+// lora_shrink for decoding's tiles of a few tokens (grid and arguments as
+// lora_shrink): there, lora_shrink_amd keeps 32 of its 128 threads busy for
+// one token and waits on a load per step (10.7 us a call on 9B). Here wave w
+// takes columns n0 + 16 w .. + 15, two at a time (half-waves), its lanes
+// splitting the block's 256 inputs 8 each: all 8 of a lane's A loads issue
+// first, then each token's inputs, and sums over the half-wave are shuffles.
+extern "C" __global__ void __launch_bounds__(128) lora_shrink_dec(const bf16* __restrict__ X, int ldx, int K,
+                                                                  const int* __restrict__ tiles,
+                                                                  const LoraDesc* __restrict__ table,
+                                                                  float* __restrict__ S, int lds) {
+    const int tile = blockIdx.x;
+    if (tile >= tiles[0]) return;
+    const int t0 = tiles[1 + 3 * tile], len = tiles[2 + 3 * tile], slot = tiles[3 + 3 * tile];
+    const LoraDesc& d = table[slot];
+    const int n0 = blockIdx.y * 32;
+    if (n0 >= d.rank) return;
+    const int w = threadIdx.x >> 6, lane = threadIdx.x & 63, half = lane >> 5;
+    const int k = blockIdx.z * LORA_KCHUNK + 8 * (lane & 31);
+    if (k >= K) return;  // whole half-waves: K is a multiple of 256
+    uint4 av[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int n = min(n0 + 16 * w + 2 * j + half, d.rank - 1);
+        av[j] = *reinterpret_cast<const uint4*>(d.a + (size_t)n * K + k);
+    }
+    float af[8][8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) unpack8(av[j], af[j]);
+    for (int t = 0; t < len; t++) {
+        float xf[8];
+        unpack8(*reinterpret_cast<const uint4*>(X + (size_t)(t0 + t) * ldx + k), xf);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float s = 0.f;
+#pragma unroll
+            for (int e = 0; e < 8; e++) s = fmaf(xf[e], af[j][e], s);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) s += __shfl_xor(s, o, 64);
+            const int n = n0 + 16 * w + 2 * j + half;
+            if ((lane & 31) == 0 && n < d.rank) atomicAdd(&S[(size_t)(t0 + t) * lds + n], s);
+        }
+    }
+}

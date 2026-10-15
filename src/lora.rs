@@ -435,8 +435,8 @@ pub struct Loras {
     pub shrink: Kernel,
     pub expand: Kernel,
     /// The pair for decoding steps (tiles of a few tokens): on AMD,
-    /// amd/lora.cuh's, faster there (1 token: 12.6 against 16.4 us a layer);
-    /// the originals stay faster for tiles of 16 prompt tokens.
+    /// amd/lora.cuh's lora_shrink_dec and lora_expand_amd, faster there; the
+    /// originals stay faster for tiles of 16 prompt tokens.
     pub shrink_dec: Kernel,
     pub expand_dec: Kernel,
 }
@@ -510,7 +510,7 @@ impl Loras {
             shrink: gpu.kernel("lora_shrink")?,
             expand: gpu.kernel("lora_expand")?,
             shrink_dec: gpu.kernel(if amd_lora() {
-                "lora_shrink_amd"
+                "lora_shrink_dec"
             } else {
                 "lora_shrink"
             })?,

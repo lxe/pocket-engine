@@ -49,15 +49,15 @@ One MI325X (ROCm 7.14) against vLLM 0.31.0's ROCm image with AITER attention. Ou
 
 | In flight | 9B pocket-engine | 9B vLLM | 27B pocket-engine | 27B vLLM |
 |---:|---:|---:|---:|---:|
-| 1 | **224** | 207 | 74 | **76** |
-| 8 | **1,094** | 772 | **368** | 349 |
-| 16 | **1,962** | 1,263 | **668** | 587 |
-| 32 | **2,752** | 2,046 | **902** | 873 |
-| 64 | **3,800** | 3,273 | **1,187** | 1,166 |
-| 128 | **5,073** | 4,580 | 1,481 | **1,485** |
-| 256 | **5,878** | 5,445 | 1,640 | **1,669** |
+| 1 | **225** | 207 | 74 | **76** |
+| 8 | **1,212** | 772 | **433** | 349 |
+| 16 | **2,140** | 1,263 | **778** | 587 |
+| 32 | **3,051** | 2,046 | **964** | 873 |
+| 64 | **4,103** | 3,273 | **1,269** | 1,166 |
+| 128 | **5,484** | 4,580 | **1,529** | 1,485 |
+| 256 | **6,170** | 5,445 | **1,688** | 1,669 |
 
-Startup takes 2 to 3 s against vLLM's 260 to 316 s (plus up to 5 s while the driver frees a previous process's memory), and the median first token at 64 in flight is 73 ms against 135 (9B) and 332 against 353 (27B). Qwen3.5-9B Q4_K_M serves 81, 879 and 2,146 tokens/s at 1, 16 and 64 in flight (thinking off).
+Startup takes 2 to 3 s against vLLM's 260 to 316 s (plus up to 5 s while the driver frees a previous process's memory), and the median first token at 64 in flight is 77 ms against 135 (9B) and 313 against 353 (27B). Qwen3.5-9B Q4_K_M serves 81, 879 and 2,146 tokens/s at 1, 16 and 64 in flight (thinking off).
 
 ## First token by prompt length, H100
 

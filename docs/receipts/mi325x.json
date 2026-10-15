@@ -1,6 +1,6 @@
 {
  "gpu": "AMD Instinct MI325X (gfx942, 256 GB HBM3E), DigitalOcean gpu-mi325x1-256gb, ROCm 7.14",
- "date": "2026-10-13 and 2026-10-14 (PDT)",
+ "date": "2026-10-13 to 2026-10-15 (PDT)",
  "workload": "scripts/load.py: chat prompts of ~60-200 tokens, 16-64 output tokens, temperature 0; closed loops at 1/8/16/32/64 in flight and a burst of 64; load_hi.py runs 128 and 256 in flight and a burst of 256. *-thinking runs send \"chat_template_kwargs\": {\"enable_thinking\": true} (vLLM's template default), so both engines answer to max_tokens, ~40 tokens per request",
  "pocket_engine": {
   "branch": "rocm",
@@ -12,6 +12,58 @@
   "env": "VLLM_ROCM_USE_AITER=1 HIP_FORCE_DEV_KERNARG=1 SAFETENSORS_FAST_GPU=1 TORCH_BLAS_PREFER_HIPBLASLT=1"
  },
  "runs": {
+  "load-fresh-pe-27b-128-hipblaslt-t0": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 6.87,
+    "out_tok_s": 1510.4,
+    "ttft_p50": 0.383,
+    "ttft_p95": 1.939,
+    "lat_p50": 2.732,
+    "lat_p95": 5.649,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 3.76,
+    "out_tok_s": 1352.3,
+    "ttft_p50": 1.231,
+    "ttft_p95": 2.049,
+    "lat_p50": 3.015,
+    "lat_p95": 3.665,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-27b-128-hipblaslt-t1": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 6.89,
+    "out_tok_s": 1507.3,
+    "ttft_p50": 0.385,
+    "ttft_p95": 2.104,
+    "lat_p50": 2.76,
+    "lat_p95": 5.736,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 3.67,
+    "out_tok_s": 1385.5,
+    "ttft_p50": 1.233,
+    "ttft_p95": 2.055,
+    "lat_p50": 2.96,
+    "lat_p95": 3.558,
+    "first_error": null
+   }
+  ],
   "load-fresh-pe-27b-128-r2": [
    {
     "case": "closed c=128",
@@ -61,6 +113,32 @@
     "ttft_p95": 2.112,
     "lat_p50": 3.055,
     "lat_p95": 3.705,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-27b-128-r6": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 6.79,
+    "out_tok_s": 1529.4,
+    "ttft_p50": 0.382,
+    "ttft_p95": 2.091,
+    "lat_p50": 2.724,
+    "lat_p95": 5.656,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 3.63,
+    "out_tok_s": 1401.3,
+    "ttft_p50": 1.205,
+    "ttft_p95": 2.028,
+    "lat_p50": 2.927,
+    "lat_p95": 3.514,
     "first_error": null
    }
   ],
@@ -116,6 +194,58 @@
     "first_error": null
    }
   ],
+  "load-fresh-pe-27b-256-hipblaslt-t0": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 12.4,
+    "out_tok_s": 1670.4,
+    "ttft_p50": 0.448,
+    "ttft_p95": 3.671,
+    "lat_p50": 5.112,
+    "lat_p95": 10.864,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 8.73,
+    "out_tok_s": 1189.8,
+    "ttft_p50": 4.365,
+    "ttft_p95": 6.167,
+    "lat_p50": 7.192,
+    "lat_p95": 8.148,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-27b-256-hipblaslt-t1": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 12.41,
+    "out_tok_s": 1670.1,
+    "ttft_p50": 0.469,
+    "ttft_p95": 3.835,
+    "lat_p50": 5.221,
+    "lat_p95": 10.98,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 8.67,
+    "out_tok_s": 1198.3,
+    "ttft_p50": 4.437,
+    "ttft_p95": 6.221,
+    "lat_p50": 7.25,
+    "lat_p95": 8.212,
+    "first_error": null
+   }
+  ],
   "load-fresh-pe-27b-256-r2": [
    {
     "case": "closed c=256",
@@ -165,6 +295,32 @@
     "ttft_p95": 6.105,
     "lat_p50": 7.226,
     "lat_p95": 8.126,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-27b-256-r6": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 12.27,
+    "out_tok_s": 1688.2,
+    "ttft_p50": 0.466,
+    "ttft_p95": 3.816,
+    "lat_p50": 5.158,
+    "lat_p95": 10.869,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 8.55,
+    "out_tok_s": 1214.8,
+    "ttft_p50": 4.418,
+    "ttft_p95": 6.15,
+    "lat_p50": 7.146,
+    "lat_p95": 8.01,
     "first_error": null
    }
   ],
@@ -310,6 +466,32 @@
     "first_error": null
    }
   ],
+  "load-fresh-pe-9b-128-r6": [
+   {
+    "case": "closed c=128",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 1.89,
+    "out_tok_s": 5484.0,
+    "ttft_p50": 0.119,
+    "ttft_p95": 0.422,
+    "lat_p50": 0.786,
+    "lat_p95": 1.502,
+    "first_error": null
+   },
+   {
+    "case": "burst n=128",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.98,
+    "out_tok_s": 2575.7,
+    "ttft_p50": 0.91,
+    "ttft_p95": 1.496,
+    "lat_p50": 1.365,
+    "lat_p95": 1.835,
+    "first_error": null
+   }
+  ],
   "load-fresh-pe-9b-128-thinking": [
    {
     "case": "closed c=128",
@@ -411,6 +593,32 @@
     "ttft_p95": 4.919,
     "lat_p50": 4.772,
     "lat_p95": 5.545,
+    "first_error": null
+   }
+  ],
+  "load-fresh-pe-9b-256-r6": [
+   {
+    "case": "closed c=256",
+    "ok": 512,
+    "errors": 0,
+    "wall_s": 3.36,
+    "out_tok_s": 6169.7,
+    "ttft_p50": 0.133,
+    "ttft_p95": 0.799,
+    "lat_p50": 1.394,
+    "lat_p95": 2.728,
+    "first_error": null
+   },
+   {
+    "case": "burst n=256",
+    "ok": 256,
+    "errors": 0,
+    "wall_s": 5.85,
+    "out_tok_s": 1775.3,
+    "ttft_p50": 4.045,
+    "ttft_p95": 4.941,
+    "lat_p50": 4.656,
+    "lat_p95": 5.505,
     "first_error": null
    }
   ],
@@ -930,6 +1138,302 @@
     "error": "client connection reset (httpx.ReadError) during the burst; not retried"
    }
   ],
+  "load-pe-27b-fusedconv-nofuse0": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 9.26,
+    "out_tok_s": 72.6,
+    "ttft_p50": 0.03,
+    "ttft_p95": 0.037,
+    "lat_p50": 0.446,
+    "lat_p95": 0.878,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 6.96,
+    "out_tok_s": 368.1,
+    "ttft_p50": 0.06,
+    "ttft_p95": 0.086,
+    "lat_p50": 0.699,
+    "lat_p95": 1.373,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 5.88,
+    "out_tok_s": 674.8,
+    "ttft_p50": 0.062,
+    "ttft_p95": 0.115,
+    "lat_p50": 0.907,
+    "lat_p95": 1.472,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.61,
+    "out_tok_s": 906.7,
+    "ttft_p50": 0.18,
+    "ttft_p95": 0.429,
+    "lat_p50": 1.224,
+    "lat_p95": 2.144,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 6.41,
+    "out_tok_s": 1176.3,
+    "ttft_p50": 0.323,
+    "ttft_p95": 0.983,
+    "lat_p50": 1.675,
+    "lat_p95": 3.336,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.36,
+    "out_tok_s": 1086.6,
+    "ttft_p50": 0.597,
+    "ttft_p95": 0.994,
+    "lat_p50": 1.716,
+    "lat_p95": 2.333,
+    "first_error": null
+   }
+  ],
+  "load-pe-27b-fusedconv-nofuse1": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 9.01,
+    "out_tok_s": 74.6,
+    "ttft_p50": 0.03,
+    "ttft_p95": 0.037,
+    "lat_p50": 0.435,
+    "lat_p95": 0.854,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 6.83,
+    "out_tok_s": 374.7,
+    "ttft_p50": 0.064,
+    "ttft_p95": 0.085,
+    "lat_p50": 0.685,
+    "lat_p95": 1.349,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 5.86,
+    "out_tok_s": 677.4,
+    "ttft_p50": 0.062,
+    "ttft_p95": 0.116,
+    "lat_p50": 0.891,
+    "lat_p95": 1.472,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.54,
+    "out_tok_s": 919.2,
+    "ttft_p50": 0.179,
+    "ttft_p95": 0.431,
+    "lat_p50": 1.213,
+    "lat_p95": 2.12,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 6.25,
+    "out_tok_s": 1204.9,
+    "ttft_p50": 0.318,
+    "ttft_p95": 0.982,
+    "lat_p50": 1.627,
+    "lat_p95": 3.272,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.3,
+    "out_tok_s": 1115.2,
+    "ttft_p50": 0.602,
+    "ttft_p95": 0.991,
+    "lat_p50": 1.676,
+    "lat_p95": 2.274,
+    "first_error": null
+   }
+  ],
+  "load-pe-27b-hipblaslt-t0": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 9.0,
+    "out_tok_s": 74.7,
+    "ttft_p50": 0.03,
+    "ttft_p95": 0.037,
+    "lat_p50": 0.434,
+    "lat_p95": 0.853,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 6.78,
+    "out_tok_s": 377.8,
+    "ttft_p50": 0.064,
+    "ttft_p95": 0.085,
+    "lat_p50": 0.681,
+    "lat_p95": 1.338,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 5.82,
+    "out_tok_s": 682.1,
+    "ttft_p50": 0.061,
+    "ttft_p95": 0.115,
+    "lat_p50": 0.886,
+    "lat_p95": 1.462,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.52,
+    "out_tok_s": 921.1,
+    "ttft_p50": 0.179,
+    "ttft_p95": 0.433,
+    "lat_p50": 1.212,
+    "lat_p95": 2.116,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 6.25,
+    "out_tok_s": 1206.7,
+    "ttft_p50": 0.317,
+    "ttft_p95": 0.984,
+    "lat_p50": 1.627,
+    "lat_p95": 3.268,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.29,
+    "out_tok_s": 1119.1,
+    "ttft_p50": 0.599,
+    "ttft_p95": 0.996,
+    "lat_p50": 1.67,
+    "lat_p95": 2.266,
+    "first_error": null
+   }
+  ],
+  "load-pe-27b-hipblaslt-t1": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 9.14,
+    "out_tok_s": 73.5,
+    "ttft_p50": 0.03,
+    "ttft_p95": 0.038,
+    "lat_p50": 0.433,
+    "lat_p95": 0.851,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 5.92,
+    "out_tok_s": 432.5,
+    "ttft_p50": 0.06,
+    "ttft_p95": 0.085,
+    "lat_p50": 0.595,
+    "lat_p95": 1.172,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 5.14,
+    "out_tok_s": 771.8,
+    "ttft_p50": 0.061,
+    "ttft_p95": 0.115,
+    "lat_p50": 0.788,
+    "lat_p95": 1.295,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.33,
+    "out_tok_s": 954.8,
+    "ttft_p50": 0.173,
+    "ttft_p95": 0.427,
+    "lat_p50": 1.187,
+    "lat_p95": 2.059,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 6.0,
+    "out_tok_s": 1256.3,
+    "ttft_p50": 0.322,
+    "ttft_p95": 0.984,
+    "lat_p50": 1.578,
+    "lat_p95": 3.146,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.21,
+    "out_tok_s": 1160.8,
+    "ttft_p50": 0.598,
+    "ttft_p95": 0.995,
+    "lat_p50": 1.626,
+    "lat_p95": 2.185,
+    "first_error": null
+   }
+  ],
   "load-pe-27b-merged": [
    {
     "case": "closed c=1",
@@ -1149,6 +1653,80 @@
     "ttft_p95": 1.027,
     "lat_p50": 1.706,
     "lat_p95": 2.302,
+    "first_error": null
+   }
+  ],
+  "load-pe-27b-r6": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 9.14,
+    "out_tok_s": 73.5,
+    "ttft_p50": 0.03,
+    "ttft_p95": 0.038,
+    "lat_p50": 0.433,
+    "lat_p95": 0.85,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 5.92,
+    "out_tok_s": 432.7,
+    "ttft_p50": 0.06,
+    "ttft_p95": 0.085,
+    "lat_p50": 0.594,
+    "lat_p95": 1.17,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 5.1,
+    "out_tok_s": 778.1,
+    "ttft_p50": 0.061,
+    "ttft_p95": 0.114,
+    "lat_p50": 0.785,
+    "lat_p95": 1.283,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 5.28,
+    "out_tok_s": 964.4,
+    "ttft_p50": 0.171,
+    "ttft_p95": 0.427,
+    "lat_p50": 1.177,
+    "lat_p95": 2.038,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 5.94,
+    "out_tok_s": 1268.8,
+    "ttft_p50": 0.313,
+    "ttft_p95": 0.977,
+    "lat_p50": 1.549,
+    "lat_p95": 3.134,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.18,
+    "out_tok_s": 1175.5,
+    "ttft_p50": 0.593,
+    "ttft_p95": 0.987,
+    "lat_p50": 1.603,
+    "lat_p95": 2.157,
     "first_error": null
    }
   ],
@@ -1744,6 +2322,80 @@
     "first_error": null
    }
   ],
+  "load-pe-9b-r6": [
+   {
+    "case": "closed c=1",
+    "ok": 16,
+    "errors": 0,
+    "wall_s": 2.98,
+    "out_tok_s": 225.1,
+    "ttft_p50": 0.011,
+    "ttft_p95": 0.013,
+    "lat_p50": 0.144,
+    "lat_p95": 0.283,
+    "first_error": null
+   },
+   {
+    "case": "closed c=8",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 2.11,
+    "out_tok_s": 1211.8,
+    "ttft_p50": 0.02,
+    "ttft_p95": 0.026,
+    "lat_p50": 0.211,
+    "lat_p95": 0.414,
+    "first_error": null
+   },
+   {
+    "case": "closed c=16",
+    "ok": 96,
+    "errors": 0,
+    "wall_s": 1.85,
+    "out_tok_s": 2140.2,
+    "ttft_p50": 0.021,
+    "ttft_p95": 0.035,
+    "lat_p50": 0.282,
+    "lat_p95": 0.45,
+    "first_error": null
+   },
+   {
+    "case": "closed c=32",
+    "ok": 128,
+    "errors": 0,
+    "wall_s": 1.67,
+    "out_tok_s": 3051.0,
+    "ttft_p50": 0.046,
+    "ttft_p95": 0.118,
+    "lat_p50": 0.35,
+    "lat_p95": 0.625,
+    "first_error": null
+   },
+   {
+    "case": "closed c=64",
+    "ok": 192,
+    "errors": 0,
+    "wall_s": 1.84,
+    "out_tok_s": 4102.9,
+    "ttft_p50": 0.077,
+    "ttft_p95": 0.22,
+    "lat_p50": 0.489,
+    "lat_p95": 0.922,
+    "first_error": null
+   },
+   {
+    "case": "burst n=64",
+    "ok": 64,
+    "errors": 0,
+    "wall_s": 0.71,
+    "out_tok_s": 3586.9,
+    "ttft_p50": 0.173,
+    "ttft_p95": 0.271,
+    "lat_p50": 0.501,
+    "lat_p95": 0.692,
+    "first_error": null
+   }
+  ],
   "load-pe-9b-thinking": [
    {
     "case": "closed c=1",
@@ -2123,8 +2775,11 @@
   "load-pe-9b-q4km-merged": "GGUF dequantized to bf16 for every batch, the shipped default; load-pe-9b-q4km: int8 below 16 rows (0684cec); load-pe-9b-q4km-emulated: before native AMD kernels",
   "*-r2": "rocm at 0fe012a with thinking off (~26 tokens per request on 27B, ~35 on 9B, against vLLM's ~40); superseded by *-thinking",
   "*-thinking": "rocm at 1a90d4d with thinking on (superseded by *-r5)",
-  "*-r5": "main at fdcacb6 (decode recurrence laid out for gfx942, RMSNorm loads issued together), thinking on: docs/benchmarks.md pocket-engine columns; vLLM columns unchanged from 2026-10-13",
-  "load-fresh-pe-9b-256-r5-client-stall": "the same server and client as load-fresh-pe-9b-256-r5, a stalled client run (3,291 tok/s); two reruns gave 5,878 and 5,880"
+  "*-r5": "main at fdcacb6 (superseded by *-r6)",
+  "load-fresh-pe-9b-256-r5-client-stall": "the same server and client as load-fresh-pe-9b-256-r5, a stalled client run (3,291 tok/s); two reruns gave 5,878 and 5,880",
+  "*-r6": "main at 46710d3 (tuned hipBLASLt solutions): docs/benchmarks.md pocket-engine columns; vLLM columns unchanged from 2026-10-13",
+  "*-hipblaslt-t0, *-hipblaslt-t1": "the same build without and with HIPBLASLT_TUNING_OVERRIDE_FILE, the convolution fusion off",
+  "*-fusedconv-nofuse0, -nofuse1": "a fused short-convolution + recurrence kernel on (0) and off (1); dropped"
  },
  "notes": [
   "Startup, launch to serving: pocket-engine 1.6-3.9 s (9B, 27B); vLLM 260 s (9B) and 316 s (27B) on first start, including AITER JIT builds and graph compilation.",
@@ -2144,7 +2799,10 @@
   "Round 5 method: fixed costs measured on the GPU (empty kernel in a graph 1.54 us; dependent load 29 ns L1, 173 ns L2, 290-336 ns beyond; one CU streams 56 GB/s; agent-scope fence + atomic per block 83 us a launch of 1,216 blocks against 2.2; a 256-thread block reduction ~0.45 us), timestamps inside kernels, and the gfx942 ISA. A branch between a load and its use (the state's format, freshness, the row's end) made the compiler wait for each load in turn: 5 of the recurrence's 12 us a block, and eight round trips in RMSNorm.",
   "Round 5 kernels (48 heads of 27B, rocprofv3): gdn_recurrent 15.0 to 9.5 us at 1 sequence, 118 to 80 at 64, 447 to 268 at 256; RMSNorm 4.2 to 3.4 us a row in a graph (bitwise identical). Tried and dropped: splitting a head's value columns across blocks (at most 0.5 us gained at 1 sequence, slower beyond, and a separate norm kernel; handing the norm to the last block via __threadfence was 2-40x slower), and issuing the short convolution's and the attention prefetch's loads unconditionally (5.5 to 6.1 us and 12.8 to 13.8 us: slower).",
   "--max-batch-tokens at 27B, 256 in flight: 2,048 gives 1,625 tok/s, 4,096 (default) 1,640-1,647, 8,192 1,669 with the median first token 0.46 to 0.80 s.",
-  "Research notes with sources: pocket-engine-bench/research/2026-10-14-mi325x-architecture.md (XCD L2 coherence and fences, dispatch costs, delta-rule decode designs in FLA/vLLM/AITER, hipBLASLt tuning)."
+  "Research notes with sources: pocket-engine-bench/research/2026-10-14-mi325x-architecture.md (XCD L2 coherence and fences, dispatch costs, delta-rule decode designs in FLA/vLLM/AITER, hipBLASLt tuning).",
+  "Round 6 (46710d3): 9B 219 of 220, 27B 213 of 213; tests/gpu.rs passes all 15 on 9B. Kernel code unchanged from round 5; NVIDIA unaffected.",
+  "hipBLASLt's heuristic solutions ran decode-sized products far from the weight bandwidth: 27B's 64-row output projection (5120 x 6144) took 42.5 us (1.4 TB/s), against 22.1 us for the best of 1,446 solutions (hipblaslt-bench, rotating 512 MB). Tuning every logged shape at the engine's graph batch sizes (204 shapes, 27B and 9B, ~10 s each) and replaying via HIPBLASLT_TUNING_OVERRIDE_FILE: 27B +14% at 8 and 16 in flight, +4% at 32 and 64, unchanged at 128 and 256 (A/B, same build); 9B +5 to +11% from 8 to 256.",
+  "Tried and dropped in round 6: a short-convolution + recurrence kernel per (sequence, key head), exact (greedy outputs identical) but 2-3% slower (16 blocks instead of 48 at batch 1); folding SiLU*mul or RMSNorm into the matrix-vector kernel, which needs a persistent shared-memory kernel 5-27% slower than ours on every shape (a separate SiLU*mul costs ~1.5 us)."
  ],
  "profiles": {
   "method": "27B; rocprofv3 --kernel-trace for pocket-engine, vLLM's torch profiler (rocprofv3 lost vLLM's engine process at shutdown); per output token over one fixed-concurrency load.py run, prompts included. Kernel time per output token in us by category, with GPU busy share",

@@ -107,7 +107,7 @@ Common formats are reordered at load to match the order the kernels read them, a
 
 `--features rocm` builds the same kernels for the MI325X. The hot paths have their own versions in `kernels/amd/`, written for AMD's 64-lane waves and matrix instructions. FP8 and FP4 are NVIDIA only.
 
-- Decoding streams weights with a kernel modelled on vLLM's; larger products go to hipBLASLt.
+- Decoding streams weights with a kernel modelled on vLLM's; larger products go to hipBLASLt, with solutions tuned per shape for the MI325X (`tuning/`), up to 1.9 times as fast as its defaults.
 - Adapter updates run in order on one stream, since a second stream changed outputs on AMD.
 
 What costs time on an MI325X (details in the [receipt](receipts/mi325x.json)):

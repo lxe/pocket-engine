@@ -28,6 +28,8 @@ Qwen3.5 0.8B, 2B, 4B and 9B, and Qwen3.8-27B, with images. Mixture-of-experts mo
 
 GGUF weights in 4- to 6-bit formats run batches against int8 activations, which serves about 20% more tokens/s under load on RTX GPUs and a few percent more on H100, with the same agreement with Transformers. `--no-int8` keeps activations in bf16. On AMD, batches dequantize to bf16 for hipBLASLt instead.
 
+On an MI325X, hipBLASLt uses the solutions in `tuning/` for the shapes decoding runs: 5 to 15% more tokens/s from 8 to 256 requests in flight on 9B, up to 14% on 27B. `POCKET_HIPBLASLT_TUNING=0` turns them off; `HIPBLASLT_TUNING_OVERRIDE_FILE` takes precedence.
+
 `--kv-fp8` stores the KV cache in FP8, which fits about twice the tokens. How each format runs is in [the design notes](design.md#quantized-weights).
 
 Images can be JPEG, PNG, WebP, GIF or BMP, as `data:` or `http(s)` URLs.

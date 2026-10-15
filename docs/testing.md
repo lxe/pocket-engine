@@ -62,6 +62,8 @@ On AMD, `rocprofv3 --kernel-trace --stats -- pocket-engine serve ...` lists ever
 
 `POCKET_SKIP_KERNELS=1 cargo check --features rocm` type-checks a backend without its kernel compiler.
 
+`scripts/tune_hipblaslt.sh MODEL...` retunes hipBLASLt for another AMD GPU or ROCm release: it logs the matrix multiplies a load test runs, searches every solution for each, and writes the fastest to `tuning.txt` (bundle it as `tuning/hipblaslt-<arch>-<CUs>.txt`).
+
 `POCKET_NO_WS=1` sends prompts on Hopper and B200 to the portable flash kernel instead of the warp-specialized one, for A/B runs.
 
 `POCKET_CHECK_HEADS=1 pocket-engine bench-attn ... --check` also reports the largest difference per head, and for heads off by more than 5e-3 which tokens and columns: a wrong warp shows up as a block of 32 tokens.

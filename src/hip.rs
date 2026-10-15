@@ -17,6 +17,44 @@ use std::ffi::{c_char, c_int, c_uint, c_void};
 /// hipErrorNotSupported.
 const NOT_SUPPORTED: c_int = 801;
 
+/// hipBLASLt solutions tuned per matrix-multiply shape, by GPU architecture
+/// (major * 10 + minor) and compute units: made with
+/// scripts/tune_hipblaslt.sh on ROCm 7.14's hipBLASLt (solutions are
+/// specific to a hipBLASLt build; others fall back to its own choices).
+const TUNED_GEMMS: &[(u32, i32, &str, &str)] = &[(
+    94,
+    304,
+    "hipblaslt-gfx942-304.txt",
+    include_str!("../tuning/hipblaslt-gfx942-304.txt"),
+)];
+
+/// Points hipBLASLt at this GPU's tuned solutions (HIPBLASLT_TUNING_OVERRIDE_FILE,
+/// read when hipBLASLt loads), unless that is already set or
+/// POCKET_HIPBLASLT_TUNING=0. For decoding's 8 to 256 rows the tuned
+/// solutions are up to 1.9 times as fast as hipBLASLt's heuristic picks.
+pub fn use_tuned_gemms(arch: u32, cus: i32) {
+    if std::env::var_os("HIPBLASLT_TUNING_OVERRIDE_FILE").is_some()
+        || std::env::var_os("POCKET_HIPBLASLT_TUNING").is_some_and(|v| v == "0")
+    {
+        return;
+    }
+    let Some(&(_, _, name, table)) = TUNED_GEMMS.iter().find(|t| t.0 == arch && t.1 == cus) else {
+        return;
+    };
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    table.hash(&mut h);
+    let path = std::env::temp_dir().join(format!(
+        "pocket-engine-hipblaslt-{arch}-{cus}-{:016x}.txt",
+        h.finish()
+    ));
+    if path.exists() || std::fs::write(&path, table).is_ok() {
+        // SAFETY: called while creating the GPU, before hipBLASLt reads it.
+        unsafe { std::env::set_var("HIPBLASLT_TUNING_OVERRIDE_FILE", &path) };
+        eprintln!("hipBLASLt: tuned solutions from tuning/{name}");
+    }
+}
+
 pub mod cu {
     use super::*;
 

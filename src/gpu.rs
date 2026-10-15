@@ -398,6 +398,8 @@ impl Gpu {
                 }
                 ks
             };
+            #[cfg(feature = "rocm")]
+            crate::hip::use_tuned_gemms((major * 10 + minor) as u32, sms);
             let mut blas = std::ptr::null_mut();
             check_blas(cb::cublasCreate_v2(&mut blas), "cublasCreate")?;
             check_blas(

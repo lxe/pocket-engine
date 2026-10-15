@@ -7,7 +7,7 @@ use crate::model::{Act, BLOCK_SIZE, Config, Meta, Model, State};
 use crate::sched::{Load, Pen, Request, Sampling, Scheduler, Scored, Seq};
 use crate::vision::Vision;
 use crate::{Error, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -115,6 +115,10 @@ pub enum Msg {
     },
 }
 
+type Reply = tokio::sync::oneshot::Sender<std::result::Result<(), String>>;
+/// An adapter read on a worker thread, on its way back to the engine.
+type Prepared = (String, PathBuf, Result<crate::lora::Adapter>, Reply);
+
 /// Adapter names the server may route requests to, by id.
 pub type Adapters = Arc<Mutex<HashMap<String, u32>>>;
 
@@ -165,6 +169,10 @@ pub struct Engine {
     lora_verify_graphs: HashMap<usize, Graph>,
     lora: Option<crate::lora::Loras>,
     pub adapters: Adapters,
+    /// Adapters being read on worker threads, so steps keep running while
+    /// they load, and the channel they come back on.
+    loading: HashSet<String>,
+    prepared: (mpsc::Sender<Prepared>, mpsc::Receiver<Prepared>),
     vision: Option<Vision>,
     pub sched: Scheduler,
     pub stats: Stats,
@@ -347,6 +355,8 @@ impl Engine {
             lora_verify_graphs: HashMap::new(),
             lora,
             adapters: Arc::default(),
+            loading: HashSet::new(),
+            prepared: mpsc::channel(),
             vision,
             sched,
             stats: Stats::default(),
@@ -437,17 +447,61 @@ impl Engine {
 
     /// Loads an adapter and makes it routable by name; returns its id.
     pub fn load_adapter(&mut self, name: &str, path: &std::path::Path) -> Result<u32> {
-        let l = self.lora.as_mut().ok_or_else(|| {
+        let l = self.lora.as_ref().ok_or_else(|| {
             Error::Config("adapters are off; start with --max-loras or --lora".into())
         })?;
-        let id = l.load(&self.gpu, name, path)?;
-        self.adapters.lock().unwrap().insert(name.to_string(), id);
-        eprintln!(
-            "adapter {name}: rank {} from {}",
-            l.adapter(id).map_or(0, |a| a.rank),
-            path.display()
-        );
+        let adapter = l.prep(&self.gpu).read(name, path)?;
+        self.register(adapter, path)
+    }
+
+    fn register(&mut self, adapter: crate::lora::Adapter, path: &std::path::Path) -> Result<u32> {
+        let l = self.lora.as_mut().expect("adapters are on");
+        let (name, rank) = (adapter.name.clone(), adapter.rank);
+        let id = l.insert(adapter)?;
+        eprintln!("adapter {name}: rank {rank} from {}", path.display());
+        self.adapters.lock().unwrap().insert(name, id);
         Ok(id)
+    }
+
+    /// Starts reading an adapter on a worker thread; [`Engine::finish_loads`]
+    /// registers it and answers `reply` once it is ready.
+    fn start_load(&mut self, name: String, path: PathBuf, reply: Reply) {
+        let Some(l) = self.lora.as_ref() else {
+            let _ = reply.send(Err(
+                "adapters are off; start with --max-loras or --lora".into()
+            ));
+            return;
+        };
+        if l.id(&name).is_some() || self.loading.contains(&name) {
+            let _ = reply.send(Err(format!("adapter {name} is already loaded")));
+            return;
+        }
+        let prep = l.prep(&self.gpu);
+        let tx = self.prepared.0.clone();
+        self.loading.insert(name.clone());
+        let spawned = std::thread::Builder::new()
+            .name("adapter".into())
+            .spawn(move || {
+                let r = prep.read(&name, &path);
+                let _ = tx.send((name, path, r, reply));
+            });
+        if let Err(e) = spawned {
+            eprintln!("could not start an adapter thread: {e}");
+        }
+    }
+
+    /// Registers adapters the worker threads have finished reading.
+    pub fn finish_loads(&mut self) {
+        while let Ok((name, path, r, reply)) = self.prepared.1.try_recv() {
+            self.loading.remove(&name);
+            let r = r.and_then(|a| self.register(a, &path));
+            let _ = reply.send(r.map(|_| ()).map_err(|e| e.to_string()));
+        }
+    }
+
+    /// Whether an adapter is still being read.
+    pub fn loading(&self) -> bool {
+        !self.loading.is_empty()
     }
 
     /// Unloads an adapter no request is using.
@@ -487,13 +541,7 @@ impl Engine {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Request(r) => self.submit(r),
-            Msg::LoadAdapter { name, path, reply } => {
-                let _ = reply.send(
-                    self.load_adapter(&name, &path)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
-                );
-            }
+            Msg::LoadAdapter { name, path, reply } => self.start_load(name, path, reply),
             Msg::UnloadAdapter { name, reply } => {
                 let _ = reply.send(self.unload_adapter(&name).map_err(|e| e.to_string()));
             }
@@ -738,9 +786,21 @@ pub fn spawn(cfg: EngineConfig) -> Result<Spawned> {
             loop {
                 if engine.sched.idle() {
                     publish(&engine, None);
-                    match rx.recv() {
-                        Ok(m) => engine.handle(m),
-                        Err(_) => return,
+                    // While an adapter loads, wake now and then to register it.
+                    let m = if engine.loading() {
+                        match rx.recv_timeout(Duration::from_millis(2)) {
+                            Ok(m) => Some(m),
+                            Err(mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    } else {
+                        match rx.recv() {
+                            Ok(m) => Some(m),
+                            Err(_) => return,
+                        }
+                    };
+                    if let Some(m) = m {
+                        engine.handle(m);
                     }
                 }
                 // Every sender gone: the server has shut down, so stop
@@ -752,6 +812,7 @@ pub fn spawn(cfg: EngineConfig) -> Result<Spawned> {
                         Err(mpsc::TryRecvError::Disconnected) => return,
                     }
                 }
+                engine.finish_loads();
                 if let Err(e) = engine.step() {
                     eprintln!("engine step failed: {e}");
                     engine.sched.fail_all(&e.to_string());

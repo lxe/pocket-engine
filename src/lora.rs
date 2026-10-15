@@ -5,7 +5,7 @@
 //! `lora_expand` (y += S B^T per part) after the layer's own matrix multiply.
 
 use crate::gguf::Gguf;
-use crate::gpu::{Buf, Gpu, Kernel, Pinned};
+use crate::gpu::{Buf, Gpu, Kernel, Pinned, Pinner};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -280,6 +280,137 @@ fn read_gguf(path: &Path, sites: &[Site]) -> Result<(Modules, bool)> {
     Ok((out, true))
 }
 
+/// Everything preparing an adapter needs, apart from the engine: reading
+/// and converting one takes tens of milliseconds, so the engine hands this
+/// to a worker thread and keeps serving (see [`Loras::prep`]).
+#[derive(Clone)]
+pub struct Prep {
+    sites: Vec<Site>,
+    base_gguf: bool,
+    heads: (usize, usize),
+    max_rank: usize,
+    pinner: Pinner,
+}
+
+impl Prep {
+    /// Reads an adapter from a PEFT directory or a GGUF file, laid out as its
+    /// GPU slot will hold it.
+    pub fn read(&self, name: &str, path: &Path) -> Result<Adapter> {
+        let (modules, tiled_file) = if path.is_dir() {
+            read_peft(path)?
+        } else {
+            read_gguf(path, &self.sites)?
+        };
+        self.prepare(name, modules, tiled_file)
+    }
+
+    fn prepare(&self, name: &str, mut modules: Modules, tiled_file: bool) -> Result<Adapter> {
+        if tiled_file && !self.base_gguf {
+            return Err(Error::Config(format!(
+                "{name}: GGUF adapters need a GGUF base (their value heads are reordered)"
+            )));
+        }
+        let (hk, hv) = self.heads;
+        // PEFT adapters on a GGUF base move value heads to the base's order.
+        let order = (self.base_gguf && !tiled_file && hk != hv).then(|| tiled_order(hk, hv));
+        let mut rank = 0;
+        // Layout first, then fill.
+        let mut sites = Vec::with_capacity(self.sites.len());
+        let mut len = 0;
+        for site in &self.sites {
+            let mut sd = SiteData::default();
+            let mut r_total = 0;
+            for (pi, part) in site.parts.iter().enumerate() {
+                if let Some(f) = modules.get(&(site.layer, part.module.clone())) {
+                    if f.a.len() != f.r * site.cols || f.b.len() != part.rows * f.r {
+                        return Err(Error::Config(format!(
+                            "{name}: layer {} {}: shapes do not match the model",
+                            site.layer, part.module
+                        )));
+                    }
+                    let rp = f.r.next_multiple_of(RANK_STEP);
+                    if rp > self.max_rank {
+                        return Err(Error::Config(format!(
+                            "{name}: rank {} is over --max-lora-rank {}",
+                            f.r, self.max_rank
+                        )));
+                    }
+                    rank = rank.max(f.r);
+                    sd.parts[pi] = (0, r_total, rp);
+                    r_total += rp;
+                }
+            }
+            sd.rank = r_total;
+            if r_total > 0 {
+                sd.a = len;
+                len += r_total * site.cols * 2;
+                for (pi, part) in site.parts.iter().enumerate() {
+                    if sd.parts[pi].2 > 0 {
+                        sd.parts[pi].0 = len;
+                        len += part.rows * sd.parts[pi].2 * 2;
+                    }
+                }
+            }
+            sites.push(sd);
+        }
+        let used = modules.len();
+        let placed: usize = self
+            .sites
+            .iter()
+            .map(|s| {
+                s.parts
+                    .iter()
+                    .filter(|p| modules.contains_key(&(s.layer, p.module.clone())))
+                    .count()
+            })
+            .sum();
+        if placed == 0 || placed < used {
+            return Err(Error::Config(format!(
+                "{name}: {} of its {used} modules match this model's layers",
+                placed
+            )));
+        }
+        let mut data = self.pinner.pinned(len.max(1))?;
+        let bytes = data.as_mut_slice::<u8>();
+        bytes.fill(0);
+        for (site, sd) in self.sites.iter().zip(&sites) {
+            for (pi, part) in site.parts.iter().enumerate() {
+                let (b_off, r_off, rp) = sd.parts[pi];
+                if rp == 0 {
+                    continue;
+                }
+                let mut f = modules
+                    .remove(&(site.layer, part.module.clone()))
+                    .expect("placed above");
+                if let Some(order) = &order {
+                    f.permute(part, site.col_heads, site.cols, order, false);
+                }
+                // A rows r_off..r_off + r of the stacked A; padding stays zero.
+                let a0 = sd.a + r_off * site.cols * 2;
+                bf16_bytes(
+                    &mut bytes[a0..a0 + f.r * site.cols * 2],
+                    f.a.iter().copied(),
+                );
+                // B [rows, rp], the last rp - r columns zero.
+                for row in 0..part.rows {
+                    let at = b_off + row * rp * 2;
+                    bf16_bytes(
+                        &mut bytes[at..at + f.r * 2],
+                        f.b[row * f.r..(row + 1) * f.r].iter().copied(),
+                    );
+                }
+            }
+        }
+        Ok(Adapter {
+            name: name.to_string(),
+            rank,
+            data,
+            len,
+            sites,
+        })
+    }
+}
+
 /// The LoRA state of an engine: adapters by id, the GPU slots and their
 /// per-layer descriptor tables.
 pub struct Loras {
@@ -401,21 +532,29 @@ impl Loras {
         v
     }
 
-    /// Reads an adapter from a PEFT directory or a GGUF file and registers it.
-    pub fn load(&mut self, gpu: &Gpu, name: &str, path: &Path) -> Result<u32> {
-        if self.names.contains_key(name) {
-            return Err(Error::Config(format!("adapter {name} is already loaded")));
+    /// What preparing an adapter needs, to do it off the engine thread.
+    pub fn prep(&self, gpu: &Gpu) -> Prep {
+        Prep {
+            sites: self.sites.clone(),
+            base_gguf: self.base_gguf,
+            heads: self.heads,
+            max_rank: self.max_rank,
+            pinner: gpu.pinner(),
         }
-        let (modules, tiled_file) = if path.is_dir() {
-            read_peft(path)?
-        } else {
-            read_gguf(path, &self.sites)?
-        };
-        let adapter = self.prepare(gpu, name, modules, tiled_file)?;
+    }
+
+    /// Registers an adapter [`Prep::read`] made; returns its id.
+    pub fn insert(&mut self, adapter: Adapter) -> Result<u32> {
+        if self.names.contains_key(&adapter.name) {
+            return Err(Error::Config(format!(
+                "adapter {} is already loaded",
+                adapter.name
+            )));
+        }
         let id = self.next_id;
         self.next_id += 1;
+        self.names.insert(adapter.name.clone(), id);
         self.adapters.insert(id, adapter);
-        self.names.insert(name.to_string(), id);
         Ok(id)
     }
 
@@ -424,118 +563,6 @@ impl Loras {
         let id = self.names.remove(name)?;
         self.adapters.remove(&id);
         Some(id)
-    }
-
-    fn prepare(
-        &self,
-        gpu: &Gpu,
-        name: &str,
-        mut modules: Modules,
-        tiled_file: bool,
-    ) -> Result<Adapter> {
-        if tiled_file && !self.base_gguf {
-            return Err(Error::Config(format!(
-                "{name}: GGUF adapters need a GGUF base (their value heads are reordered)"
-            )));
-        }
-        let (hk, hv) = self.heads;
-        // PEFT adapters on a GGUF base move value heads to the base's order.
-        let order = (self.base_gguf && !tiled_file && hk != hv).then(|| tiled_order(hk, hv));
-        let mut rank = 0;
-        // Layout first, then fill.
-        let mut sites = Vec::with_capacity(self.sites.len());
-        let mut len = 0;
-        for site in &self.sites {
-            let mut sd = SiteData::default();
-            let mut r_total = 0;
-            for (pi, part) in site.parts.iter().enumerate() {
-                if let Some(f) = modules.get(&(site.layer, part.module.clone())) {
-                    if f.a.len() != f.r * site.cols || f.b.len() != part.rows * f.r {
-                        return Err(Error::Config(format!(
-                            "{name}: layer {} {}: shapes do not match the model",
-                            site.layer, part.module
-                        )));
-                    }
-                    let rp = f.r.next_multiple_of(RANK_STEP);
-                    if rp > self.max_rank {
-                        return Err(Error::Config(format!(
-                            "{name}: rank {} is over --max-lora-rank {}",
-                            f.r, self.max_rank
-                        )));
-                    }
-                    rank = rank.max(f.r);
-                    sd.parts[pi] = (0, r_total, rp);
-                    r_total += rp;
-                }
-            }
-            sd.rank = r_total;
-            if r_total > 0 {
-                sd.a = len;
-                len += r_total * site.cols * 2;
-                for (pi, part) in site.parts.iter().enumerate() {
-                    if sd.parts[pi].2 > 0 {
-                        sd.parts[pi].0 = len;
-                        len += part.rows * sd.parts[pi].2 * 2;
-                    }
-                }
-            }
-            sites.push(sd);
-        }
-        let used = modules.len();
-        let placed: usize = self
-            .sites
-            .iter()
-            .map(|s| {
-                s.parts
-                    .iter()
-                    .filter(|p| modules.contains_key(&(s.layer, p.module.clone())))
-                    .count()
-            })
-            .sum();
-        if placed == 0 || placed < used {
-            return Err(Error::Config(format!(
-                "{name}: {} of its {used} modules match this model's layers",
-                placed
-            )));
-        }
-        let mut data = gpu.pinned(len.max(1))?;
-        let bytes = data.as_mut_slice::<u8>();
-        bytes.fill(0);
-        for (site, sd) in self.sites.iter().zip(&sites) {
-            for (pi, part) in site.parts.iter().enumerate() {
-                let (b_off, r_off, rp) = sd.parts[pi];
-                if rp == 0 {
-                    continue;
-                }
-                let mut f = modules
-                    .remove(&(site.layer, part.module.clone()))
-                    .expect("placed above");
-                if let Some(order) = &order {
-                    f.permute(part, site.col_heads, site.cols, order, false);
-                }
-                // A rows r_off..r_off + r of the stacked A; padding stays zero.
-                let a0 = sd.a + r_off * site.cols * 2;
-                bf16_bytes(
-                    &mut bytes[a0..a0 + f.r * site.cols * 2],
-                    f.a.iter().copied(),
-                );
-                // B [rows, rp], the last rp - r columns zero.
-                for row in 0..part.rows {
-                    let at = b_off + row * rp * 2;
-                    bf16_bytes(
-                        &mut bytes[at..at + f.r * 2],
-                        f.b[row * f.r..(row + 1) * f.r].iter().copied(),
-                    );
-                }
-            }
-        }
-        Ok(Adapter {
-            name: name.to_string(),
-            rank,
-            data,
-            len,
-            sites,
-        })
     }
 
     /// Copies adapter `id` into GPU slot `slot` (1-based) and points that

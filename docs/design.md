@@ -79,7 +79,7 @@ Hybrid models make rejection tricky, because checking a draft has already advanc
 
 ## LoRA adapters
 
-One server can host many fine-tunes of the same base model. Each adapter is converted once into the layout the kernels read and copied into a GPU slot when a request needs it. Adapters load and unload while the server runs, through vLLM's endpoints.
+One server can host many fine-tunes of the same base model. Each adapter is converted once into the layout the kernels read and copied into a GPU slot when a request needs it. Adapters load and unload while the server runs, through vLLM's endpoints. Reading and converting an adapter happens on a separate thread, so requests already running don't pause while it loads.
 
 Requests for different adapters, and for the base model, share batches. Each layer adds the adapter's low-rank update beside its own matrix multiply, on a second stream. Switching adapters only changes a table the kernels read, so steps with adapters still replay CUDA graphs.
 

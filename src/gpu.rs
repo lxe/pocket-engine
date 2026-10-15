@@ -78,6 +78,37 @@ impl Pinned {
     }
 }
 
+// SAFETY: pinned memory is plain host memory; whichever thread drops it frees
+// it with the context current (the engine's, or a Pinner's worker).
+unsafe impl Send for Pinned {}
+
+/// Allocates pinned memory from any thread, for work prepared off the engine
+/// thread (see [`Gpu::pinner`]).
+#[derive(Clone)]
+pub struct Pinner(cu::CUcontext);
+
+// SAFETY: a context handle may be made current on any thread.
+unsafe impl Send for Pinner {}
+unsafe impl Sync for Pinner {}
+
+impl Pinner {
+    pub fn pinned(&self, bytes: usize) -> Result<Pinned> {
+        // SAFETY: the context outlives the engine's work; making it current
+        // on this thread lets the allocation belong to it.
+        check(unsafe { cu::cuCtxSetCurrent(self.0) }, "cuCtxSetCurrent")?;
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: out-parameter allocation; ownership moves into Pinned.
+        check(
+            unsafe { cu::cuMemHostAlloc(&mut ptr, bytes.max(8), 0) },
+            "cuMemHostAlloc",
+        )?;
+        Ok(Pinned {
+            ptr: ptr.cast(),
+            bytes,
+        })
+    }
+}
+
 impl Drop for Pinned {
     fn drop(&mut self) {
         // SAFETY: the pointer came from cuMemHostAlloc and is freed once.
@@ -265,6 +296,7 @@ pub struct Gpu {
     pub arch: u32,
     /// Shared memory per SM, in bytes.
     pub smem_per_sm: usize,
+    ctx: cu::CUcontext,
     lt: lt::cublasLtHandle_t,
     lt_ws: Buf,
     lt_plans: RefCell<HashMap<PlanKey, LtPlan>>,
@@ -429,6 +461,7 @@ impl Gpu {
             Ok(Self {
                 sms: sms as usize,
                 smem_per_sm: smem_per_sm as usize,
+                ctx,
                 arch: (major * 10 + minor) as u32,
                 lt: lth,
                 lt_ws: Buf {
@@ -536,6 +569,11 @@ impl Gpu {
         let b = self.alloc(bytes)?;
         self.memset(b.ptr, bytes)?;
         Ok(b)
+    }
+
+    /// A handle that allocates pinned memory for this device from any thread.
+    pub fn pinner(&self) -> Pinner {
+        Pinner(self.ctx)
     }
 
     pub fn pinned(&self, bytes: usize) -> Result<Pinned> {

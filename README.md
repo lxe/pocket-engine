@@ -2,13 +2,14 @@
 
 An inference server for Qwen3.5 and Qwen3.8 models, written from scratch in Rust and CUDA, with an OpenAI-compatible chat API. Runs on NVIDIA GPUs and on AMD's MI325X.
 
-- **Starts in seconds.** It's a single Rust binary with no Python. A 9B model is serving 2 to 3 seconds after launch, where vLLM takes 1 to 5 minutes.
-- **Fast first token.** A short prompt gets its first token in 13.5 ms on an H100. vLLM takes 57.5 ms.
-- **Speculative decoding.** Qwen checkpoints include a small extra layer that predicts the next few tokens. pocket-engine drafts with it and checks every draft against the full model, so answers are identical to normal decoding, only faster. With it, one 9B request on an H100 runs at 293 tokens/s. vLLM, drafting the same way, reaches 253.
-- **Drafting from the prompt.** When an answer repeats text from the prompt, as in editing or extraction, those tokens can be drafted from the prompt itself. Such answers come out up to 4 times faster.
-- **Runs GGUF files directly.** The quantized files llama.cpp uses run on tensor cores without conversion. A 9B Q4_K_M model serves 2,372 tokens/s on an RTX 5090 with 64 requests at once.
-- **Made for Qwen's hybrid layers.** The prefix cache saves the linear-attention state, so a chat's next turn doesn't recompute its history. The attention kernels are tuned for Qwen's extra-wide heads.
-- **Also:** LoRA adapters, JSON output, log-probabilities and images, through the same API as vLLM.
+- **[Starts in 2 to 3 seconds.](docs/design.md#one-process-no-python)** No Python. vLLM takes 1 to 5 minutes.
+- **Fast first tokens.** 13.5 ms for a short prompt on an H100, against vLLM's 57.5 ms.
+- **[Speculative decoding](docs/design.md#speculative-decoding)** with Qwen's built-in prediction layer. Same answers as without it, 293 vs 253 tokens/s for one 9B request on an H100.
+- **[Drafting from the prompt.](docs/design.md#speculative-decoding)** Up to 4 times faster when answers quote or edit their input.
+- **[Prefix caching for hybrid models.](docs/design.md#prefix-cache)** Each turn of a chat reuses the last one's work.
+- **[GGUF on tensor cores.](docs/design.md#quantized-weights)** llama.cpp's files at 2,372 tokens/s for 9B on an RTX 5090.
+- **[Many LoRA adapters per server,](docs/design.md#lora-adapters)** loaded and unloaded at runtime.
+- **bf16, FP8, FP4 and GGUF weights;** JSON output, log-probabilities and images.
 
 Output tokens per second against vLLM 0.31.0 on the same GPU model. Each cell shows one request / 64 requests at once.
 

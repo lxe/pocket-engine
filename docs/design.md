@@ -66,14 +66,16 @@ So the cache keeps snapshots of the state. Each prompt saves at most two: one ju
 
 ## Speculative decoding
 
-Drafting proposes several tokens in one step and checks them in the next, so every accepted draft is a token for free.
+Speculative decoding guesses a few tokens ahead and has the full model check all the guesses in one step. Every guess the model accepts saves a step, and the answer is exactly what it would have been without guessing, for greedy and sampled requests alike.
 
 | Flag | Drafts come from |
 |---|---|
 | `--mtp N` | the checkpoint's own layer for predicting the token after next |
 | `--ngram` | earlier text in the same request |
 
-Output is exactly what the model would produce without drafting, for greedy and sampled requests alike. Hybrid models make rejection tricky, because checking a draft has already advanced the linear-attention state. The engine writes the state after each draft into a spare slot, so rolling back is a matter of picking the right slot. Drafting also tracks its own acceptance and steps aside when it stops paying.
+Prompt lookup pays off when an answer repeats text from its prompt, as in editing, extraction or quoting: the engine indexes the request's recent word sequences and proposes whatever followed the last time the current one appeared. Such answers come out up to four times faster, and ordinary chat is unaffected.
+
+Hybrid models make rejection tricky, because checking a draft has already advanced the linear-attention state. The engine writes the state after each draft into a spare slot, so rolling back is a matter of picking the right slot. Drafting also tracks its own acceptance and steps aside when it stops paying.
 
 ## LoRA adapters
 

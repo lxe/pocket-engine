@@ -413,6 +413,10 @@ impl Engine {
         Ok(e)
     }
 
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
     pub fn info(&self) -> Info {
         Info {
             device: self.gpu.name.clone(),

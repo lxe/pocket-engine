@@ -628,6 +628,19 @@ pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 impl Model {
+    /// The decoder layers' matrices (not the LM head), for `pocket-engine tune`.
+    pub fn linears(&self) -> Vec<&Linear> {
+        let mut v = Vec::new();
+        for l in &self.layers {
+            match &l.mixer {
+                Mixer::Gdn { w_in, w_out, .. } => v.extend([w_in, w_out]),
+                Mixer::Attn { w_qkv, w_o, .. } => v.extend([w_qkv, w_o]),
+            }
+            v.extend([&l.w_gu, &l.w_down]);
+        }
+        v
+    }
+
     /// Loads a Hugging Face directory or a GGUF file (or a directory holding one).
     pub fn load(gpu: &Gpu, path: &Path, load: Load) -> Result<Self> {
         let started = gpu.begin_uploads()?;

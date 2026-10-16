@@ -337,31 +337,50 @@ const QUANT_ROWS: [usize; 18] = [
 const OFF: usize = usize::MAX;
 
 /// Where GGUF matrices should change path, if thresholds other than the
-/// built-in ones measured faster. Times the file's most common quantized
-/// matrices on each path at each of `QUANT_ROWS` (cycling copies so the
-/// weights come from memory), then picks the thresholds whose choices sum to
-/// the least time.
-pub fn quant_rows(gpu: &Gpu, path: &std::path::Path, hidden: usize) -> Result<Option<QuantRows>> {
-    use crate::linear::{Input, Kind, Linear, Part, Quants};
-    use std::rc::Rc;
-    let g = crate::gguf::Gguf::open(path)?;
-    // The most common (type, shape) among the decoder's quantized matrices.
-    let mut groups: std::collections::HashMap<(u32, usize, usize), (usize, String)> =
-        Default::default();
-    for (name, t) in g.tensors() {
-        if name.starts_with("blk.") && t.dims.len() == 2 && t.ty.is_quantized() {
-            let e = groups
-                .entry((t.ty.0, t.dims[0], t.dims[1]))
-                .or_insert((0, name.to_string()));
-            e.0 += 1;
+/// built-in ones measured faster. Times the model's own quantized matrices,
+/// as it runs them (fused parts included) and cycling through the layers so
+/// the weights come from memory, on each path at each of `QUANT_ROWS`; then
+/// picks the thresholds whose choices sum to the least time without making
+/// any row count slower than the built-in ones do.
+pub fn quant_rows(
+    gpu: &Gpu,
+    linears: &[&crate::linear::Linear],
+    hidden: usize,
+) -> Result<Option<QuantRows>> {
+    use crate::linear::{Input, Kind, Quants};
+    // The model's matrices by shape and format.
+    let mut groups: BTreeMap<String, Vec<&crate::linear::Linear>> = BTreeMap::new();
+    for l in linears {
+        if l.parts
+            .iter()
+            .any(|p| matches!(p.kind, Kind::Quant(_) | Kind::Tiled(_)))
+        {
+            let key = format!(
+                "{} {:?}",
+                l.cols,
+                l.parts.iter().map(|p| (p.rows, p.kind)).collect::<Vec<_>>()
+            );
+            groups.entry(key).or_default().push(l);
         }
     }
-    let mut groups: Vec<_> = groups.into_iter().collect();
-    groups.sort_by_key(|(k, (n, _))| std::cmp::Reverse(n * k.1 * k.2));
-    groups.truncate(4);
     if groups.is_empty() {
         return Ok(None);
     }
+    let mut types: Vec<crate::gguf::GgmlType> = Vec::new();
+    for l in linears {
+        for p in &l.parts {
+            if let Kind::Quant(ty) | Kind::Tiled(ty) = p.kind
+                && !types.contains(&ty)
+            {
+                types.push(ty);
+            }
+        }
+    }
+    let largest = linears
+        .iter()
+        .flat_map(|l| l.parts.iter().map(|p| p.rows * l.cols))
+        .max()
+        .unwrap_or(0);
     // Paths, by thresholds that force each: bf16 tiles, int8 tiles, int8
     // large tiles, dequantized for cuBLAS.
     let q = |int8_rows, big_rows, dense_rows| QuantRows {
@@ -380,88 +399,81 @@ pub fn quant_rows(gpu: &Gpu, path: &std::path::Path, hidden: usize) -> Result<Op
     let mut defaults = Quants::default();
     defaults.hidden = hidden;
     defaults.int8_rows = crate::linear::int8_rows(gpu, hidden);
-    let mut time = vec![[0f64; 4]; QUANT_ROWS.len()];
-    for ((ty, k, n), (count, name)) in &groups {
-        let ty = crate::gguf::GgmlType(*ty);
-        let data = g.tensor(name).map(|t| t.1.len()).unwrap_or(0);
-        let copies = (512usize << 20).div_ceil(data.max(1)).clamp(2, 32);
-        let mut ls = Vec::new();
-        for _ in 0..copies {
-            let (buf, kind) = match crate::source::upload_tiled(gpu, &g, name)? {
-                Some(b) => (b, Kind::Tiled(ty)),
-                None => (
-                    crate::source::upload_tensor(gpu, &g, name)?,
-                    Kind::Quant(ty),
-                ),
-            };
-            ls.push(Linear {
-                parts: vec![Part {
-                    buf: Rc::new(buf),
-                    kind,
-                    scales: None,
-                    dense: None,
-                    rows: *n,
-                    off: 0,
-                }],
-                cols: *k,
-                int8: true,
-                lora: None,
-            });
-        }
+    for &ty in &types {
         defaults.get(gpu, ty)?;
-        let mut qs = Vec::new();
-        for p in &paths {
-            let mut qq = Quants::default();
-            qq.hidden = hidden;
-            qq.int8_rows = 1;
+    }
+    let mut qs = Vec::new();
+    for p in &paths {
+        let mut qq = Quants::default();
+        qq.hidden = hidden;
+        qq.int8_rows = 1;
+        for &ty in &types {
             qq.get(gpu, ty)?;
-            qq.set_rows(p);
-            qq.prepare(gpu, n * k)?;
-            qs.push(qq);
         }
-        let max = *QUANT_ROWS.last().unwrap();
-        let x: Vec<u8> = (0..max * k)
-            .flat_map(|i| {
-                half::bf16::from_f32(((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0)
-                    .to_le_bytes()
-            })
-            .collect();
-        let x = gpu.upload(&x)?;
-        let y = gpu.alloc(max * n * 2)?;
+        qq.set_rows(p);
+        qq.prepare(gpu, largest)?;
+        qs.push(qq);
+    }
+    let max = *QUANT_ROWS.last().unwrap();
+    let cols = linears.iter().map(|l| l.cols).max().unwrap_or(0);
+    let outs = linears.iter().map(|l| l.out()).max().unwrap_or(0);
+    let x: Vec<u8> = (0..max * cols)
+        .flat_map(|i| {
+            half::bf16::from_f32(((i * 2654435761usize) % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()
+        })
+        .collect();
+    let x = gpu.upload(&x)?;
+    let y = gpu.alloc(max * outs * 2)?;
+    let mut time = vec![[0f64; 4]; QUANT_ROWS.len()];
+    for ls in groups.values() {
+        // Every layer runs each matrix once a step; up to 16 copies are cycled.
+        let cycle = &ls[..ls.len().min(16)];
         for (ri, &rows) in QUANT_ROWS.iter().enumerate() {
             for (pi, qq) in qs.iter().enumerate() {
                 let f = |i: usize| {
-                    ls[i % ls.len()].forward(gpu, qq, Input::bf16(x.ptr), rows, y.ptr, *n, false)
+                    let l = cycle[i % cycle.len()];
+                    l.forward(gpu, qq, Input::bf16(x.ptr), rows, y.ptr, l.out(), false)
                 };
-                time[ri][pi] += *count as f64 * graph_us(gpu, ls.len(), &f)?;
+                time[ri][pi] += ls.len() as f64 * graph_us(gpu, cycle.len(), &f)?;
             }
         }
     }
-    // The cost of thresholds: the path each picks at each row count, as
-    // Linear::forward picks it, relative to the fastest path there.
+    // The path thresholds `r` pick at row count `rows`, as Linear::forward
+    // picks it.
+    let path = |r: &QuantRows, rows: usize| -> usize {
+        let int8 = (r.int8_rows.unwrap_or(OFF)..=r.int8_max.unwrap_or(0)).contains(&rows);
+        if int8 {
+            if rows >= r.big_rows.unwrap_or(OFF) {
+                2
+            } else {
+                1
+            }
+        } else if rows > r.dense_rows.unwrap_or(OFF) {
+            3
+        } else {
+            0
+        }
+    };
+    // Their cost: each row count's time relative to the fastest path there.
     let cost = |r: &QuantRows| -> f64 {
         QUANT_ROWS
             .iter()
             .enumerate()
             .map(|(ri, &rows)| {
-                let int8 = (r.int8_rows.unwrap_or(OFF)..=r.int8_max.unwrap_or(0)).contains(&rows);
-                let p = if int8 {
-                    if rows >= r.big_rows.unwrap_or(OFF) {
-                        2
-                    } else {
-                        1
-                    }
-                } else if rows > r.dense_rows.unwrap_or(OFF) {
-                    3
-                } else {
-                    0
-                };
                 let best = time[ri].iter().cloned().fold(f64::MAX, f64::min);
-                time[ri][p] / best
+                time[ri][path(r, rows)] / best
             })
             .sum()
     };
     let current = defaults.rows();
+    // No row count may get slower than the built-in thresholds make it: a
+    // gain at some batch sizes must not cost another.
+    let no_worse = |r: &QuantRows| {
+        QUANT_ROWS
+            .iter()
+            .enumerate()
+            .all(|(ri, &rows)| time[ri][path(r, rows)] <= time[ri][path(&current, rows)] * 1.02)
+    };
     let grid: Vec<usize> = QUANT_ROWS.iter().cloned().chain([OFF]).collect();
     let mut best = (cost(&current), current.clone());
     for &ir in &grid {
@@ -476,7 +488,7 @@ pub fn quant_rows(gpu: &Gpu, path: &std::path::Path, hidden: usize) -> Result<Op
                         dense_rows: Some(dr),
                     };
                     let c = cost(&r);
-                    if c < best.0 - 1e-9 {
+                    if c < best.0 - 1e-9 && no_worse(&r) {
                         best = (c, r);
                     }
                 }
@@ -484,7 +496,7 @@ pub fn quant_rows(gpu: &Gpu, path: &std::path::Path, hidden: usize) -> Result<Op
         }
     }
     let gain = cost(&current) / best.0;
-    let mut line = format!("GGUF paths ({} matrices):", groups.len());
+    let mut line = format!("GGUF paths ({} kinds of matrix):", groups.len());
     for (ri, &rows) in QUANT_ROWS.iter().enumerate() {
         let names = ["tiles", "int8", "int8 big", "dense"];
         let (pi, _) = time[ri]
@@ -563,6 +575,11 @@ pub fn run_model(cfg: EngineConfig) -> Result<Table> {
     t.gemm = gemms(&e.gpu, &uses)?;
     let info = e.info();
     let (hv, hk, hidden) = (info.cfg.lin_v_heads, info.cfg.lin_k_heads, info.cfg.hidden);
+    if e.model().gguf {
+        t.quant = quant_rows(&e.gpu, &e.model().linears(), hidden)?
+            .into_iter()
+            .collect();
+    }
     drop(e);
     // The rest on a fresh device, with the products tuned so far (GGUF's
     // dequantized path runs cuBLAS).
@@ -573,8 +590,5 @@ pub fn run_model(cfg: EngineConfig) -> Result<Table> {
     t.gdn_decode = decode_shape(&gpu, hv, hk, cfg.max_seqs)?
         .into_iter()
         .collect();
-    if let Some(p) = crate::source::gguf_path(&cfg.model) {
-        t.quant = quant_rows(&gpu, &p, hidden)?.into_iter().collect();
-    }
     Ok(t)
 }

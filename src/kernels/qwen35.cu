@@ -837,18 +837,28 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
         }
         cp_commit();
     };
-    if (NB == 2) load(t0, 0);
+    // The first NB - 1 chunks start loading; each iteration then waits for
+    // its own and refills the buffer the previous one used. One barrier per
+    // chunk both publishes the loaded inputs and the new state's columns and
+    // frees the previous chunk's buffer.
+#pragma unroll
+    for (int p = 0; p < NB - 1; p++) {
+        if (t0 + p * GC < t1) load(t0 + p * GC, p);
+        else cp_commit();
+    }
     for (int c0 = t0, it = 0; c0 < t1; c0 += GC, it++) {
-        const int n = min(GC, t1 - c0), b = NB == 2 ? it & 1 : 0;
-        if (NB == 2) {
-            if (c0 + GC < t1) load(c0 + GC, b ^ 1);
+        const int n = min(GC, t1 - c0), b = it % NB;
+        if (NB > 1) {
+            cp_wait<NB - 2>();
+            __syncthreads();
+            if (c0 + (NB - 1) * GC < t1) load(c0 + (NB - 1) * GC, (it + NB - 1) % NB);
             else cp_commit();
-            cp_wait<1>();
         } else {
+            if (it > 0) __syncthreads();
             load(c0, 0);
             cp_wait<0>();
+            __syncthreads();
         }
-        __syncthreads();
         const bf16* sW = (const bf16*)buf(b);
         bf16* sQ = (bf16*)sW + GC * GSTR;
         bf16* sKw = sQ + GC * GSTR;
@@ -948,15 +958,22 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
         if (snaps)
             for (int j = 0; j < 2; j++)
                 if (snaps[4 * s + 2 * j] == c0 + n - t0) store_state(snaps[4 * s + 2 * j + 1]);
-        __syncthreads();
+        // Every warp read the old columns before the barrier above.
         store_state_smem();
         zero_state = false;
-        __syncthreads();
     }
     store_state(slots[s]);
 }
 #ifdef __HIP_PLATFORM_AMD__
 #include "amd/gdn_chunk.cuh"
+#endif
+// On H100 and B200 two blocks of gdn_scan2 and gdn_scan4 fit an SM's shared
+// memory; at 128 registers a thread they also fit its register file, which
+// lets 27B's 192 blocks run in one wave.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
+#define GDN_SCAN_BLOCKS 2
+#else
+#define GDN_SCAN_BLOCKS 1
 #endif
 #define GDN_SCAN_ARGS                                                                                   \
     GDN_ARGS, const bf16 *__restrict__ Ui, const bf16 *__restrict__ Wi, const float *__restrict__ Nqi, \
@@ -965,14 +982,14 @@ __device__ __forceinline__ void gdn_scan_cols(GDN_ARGS, const bf16* __restrict__
 extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan1(GDN_SCAN_ARGS) {
     gdn_scan_cols<1>(GDN_PASS, Ui, Wi, Nqi, Nki, Pi, Gi, snaps);
 }
-extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan2(GDN_SCAN_ARGS) {
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM, GDN_SCAN_BLOCKS) gdn_scan2(GDN_SCAN_ARGS) {
 #ifdef __HIP_PLATFORM_AMD__
     gdn_scan_mfma<2>(GDN_PASS, Ui, Wi, Nqi, Nki, Pi, Gi, snaps);
 #else
     gdn_scan_cols<2>(GDN_PASS, Ui, Wi, Nqi, Nki, Pi, Gi, snaps);
 #endif
 }
-extern "C" __global__ void __launch_bounds__(2 * GDN_DIM) gdn_scan4(GDN_SCAN_ARGS) {
+extern "C" __global__ void __launch_bounds__(2 * GDN_DIM, GDN_SCAN_BLOCKS) gdn_scan4(GDN_SCAN_ARGS) {
 #ifdef __HIP_PLATFORM_AMD__
     gdn_scan_mfma<4>(GDN_PASS, Ui, Wi, Nqi, Nki, Pi, Gi, snaps);
 #else

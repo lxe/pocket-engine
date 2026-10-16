@@ -3,6 +3,7 @@
 //! an OpenAI-compatible server.
 
 pub mod engine;
+pub mod gdnbench;
 pub mod gguf;
 pub mod gpu;
 #[cfg(feature = "rocm")]
@@ -15,6 +16,9 @@ pub mod sched;
 pub mod server;
 pub mod source;
 pub mod tools;
+#[cfg(not(feature = "rocm"))]
+pub mod tune;
+pub mod tuning;
 pub mod vision;
 
 #[derive(Debug, thiserror::Error)]

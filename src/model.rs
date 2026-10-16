@@ -196,13 +196,21 @@ impl FaWs {
 /// gdn_decode's static shared memory: q, k, delta and outputs, the column
 /// sums of 8 warps, the reductions' slots, and per buffer its staged inputs
 /// and barrier.
-const GDN_DECODE_STATIC: usize =
+pub const GDN_DECODE_STATIC: usize =
     4 * GDN_DIM * 4 + 2 * 8 * GDN_DIM * 4 + (32 + 24) * 4 + 3 * (4 * GDN_DIM * 2 + 8 + 8);
 /// How gdn_decode runs: state buffers per block and blocks per SM, or None
 /// where two buffers do not fit (an f32 state on RTX 50-series), which
 /// leaves gdn_recurrent.
-pub fn gdn_decode_shape(state_bf16: bool, smem_per_sm: usize) -> Option<(usize, usize)> {
+pub fn gdn_decode_shape(state_bf16: bool, heads: usize, gpu: &Gpu) -> Option<(usize, usize)> {
+    let smem_per_sm = gpu.smem_per_sm;
     let bytes = if state_bf16 { 2 } else { 4 } * GDN_DIM * GDN_DIM;
+    // A tuned shape for the bf16 state, where it fits.
+    if let Some(t) = gpu.tuning.as_ref().and_then(|t| t.decode(heads))
+        && state_bf16
+        && t.per_sm * (t.nbuf * bytes + GDN_DECODE_STATIC + 1024) <= smem_per_sm
+    {
+        return Some((t.nbuf, t.per_sm));
+    }
     let block = |nbuf: usize| nbuf * bytes + GDN_DECODE_STATIC + 1024;
     let nbuf = (2..=3).rev().find(|&n| block(n) <= smem_per_sm)?;
     Some((nbuf, (smem_per_sm / block(nbuf)).clamp(1, 2)))
@@ -243,6 +251,11 @@ pub fn gdn_scan_smem(ns: usize) -> usize {
 /// are all resident at once. Two blocks sharing an SM take about as long as
 /// one block doing both shares, and each share reloads the chunk's inputs.
 pub fn gdn_split(s: usize, hv: usize, gpu: &Gpu) -> usize {
+    if let Some(n) = gpu.tuning.as_ref().and_then(|t| t.split(hv, s))
+        && [1, 2, 4].contains(&n)
+    {
+        return n;
+    }
     let resident = |ns: usize| gpu.sms * (gpu.smem_per_sm / (gdn_scan_smem(ns) + 1024)).max(1);
     [4, 2]
         .into_iter()
@@ -782,8 +795,9 @@ impl Model {
         };
         cfg.tiled_v = src.tiled_value_heads() && cfg.lin_v_heads != cfg.lin_k_heads;
         let mut quants = Quants::default();
+        quants.hidden = cfg.hidden;
         if load.int8 {
-            quants.int8_rows = crate::linear::int8_rows();
+            quants.int8_rows = crate::linear::int8_rows(gpu, cfg.hidden);
         }
         let (h, i) = (cfg.hidden, cfg.inter);
         let up = |v: &[f32]| gpu.upload(&f32_bytes(v));
@@ -998,7 +1012,7 @@ impl Model {
                 let most = [(false, 4), (true, 2)]
                     .into_iter()
                     .filter_map(|(bf16, size)| {
-                        gdn_decode_shape(bf16, gpu.smem_per_sm)
+                        gdn_decode_shape(bf16, cfg.lin_v_heads, gpu)
                             .map(|(nbuf, _)| nbuf * size * GDN_DIM * GDN_DIM)
                     })
                     .max();
@@ -2183,7 +2197,7 @@ impl Model {
                     // gdn_one's math for the first n sequences (see gdn_decode).
                     let decode = |n: usize| {
                         let tail = [a.fp8_args(|f| &f.core, t).as_slice(), &outs].concat();
-                        match gdn_decode_shape(st.state_bf16, gpu.smem_per_sm) {
+                        match gdn_decode_shape(st.state_bf16, hv, gpu) {
                             Some((nbuf, per_sm)) => {
                                 let bytes = if st.state_bf16 { 2 } else { 4 } * GDN_DIM * GDN_DIM;
                                 gpu.launch(

@@ -59,6 +59,11 @@ pub fn fp8_rows(mode: Fp8Mode, rows: usize) -> usize {
     }
 }
 
+/// `fp8_rows` for a product of any kind: bf16 rows run as they are.
+pub fn fp8_rows_of(mode: Option<Fp8Mode>, rows: usize) -> usize {
+    mode.map_or(rows, |m| fp8_rows(m, rows))
+}
+
 /// A layer's input: bf16 rows, and the same rows as FP8 with their scales
 /// when FP8 parts read them (0 otherwise).
 #[derive(Clone, Copy)]
@@ -143,8 +148,9 @@ fn gemv_rows() -> usize {
 /// Rows from which `--int8` takes the int8 path; below, weights dominate and
 /// bf16 is as fast.
 const INT8_ROWS: usize = 16;
-pub fn int8_rows() -> usize {
-    env_usize("POCKET_INT8_ROWS", INT8_ROWS).max(1)
+pub fn int8_rows(gpu: &Gpu, hidden: usize) -> usize {
+    let tuned = gpu.tuning.as_ref().and_then(|t| t.quant(hidden)?.int8_rows);
+    env_usize("POCKET_INT8_ROWS", tuned.unwrap_or(INT8_ROWS)).max(1)
 }
 fn split_tuning() -> (usize, usize) {
     (
@@ -178,6 +184,8 @@ pub struct Quants {
     dense_rows: usize,
     /// Rows from which int8 takes the 128 x 64 block kernels.
     big_rows: usize,
+    /// The model's width, which picks its tuned thresholds.
+    pub hidden: usize,
 }
 
 /// Widest input the int8 activation buffer holds.
@@ -198,7 +206,8 @@ const DENSE_ROWS: usize = 160;
 const SCRATCH_WEIGHTS: usize = 192 << 20;
 
 impl Quants {
-    fn tune(&mut self, arch: u32) {
+    fn tune(&mut self, gpu: &Gpu) {
+        let arch = gpu.arch;
         if arch == 94 {
             // AMD gfx942 (bench-linear on an MI325X, 9B's Q4_K and Q6_K
             // matrices): dequantizing to bf16 for hipBLASLt (or the skinny
@@ -214,9 +223,42 @@ impl Quants {
             return;
         }
         let dc = datacenter(arch);
-        self.int8_max = env_usize("POCKET_INT8_MAX_ROWS", if dc { 48 } else { 4096 });
-        self.big_rows = env_usize("POCKET_INT8_BIG_ROWS", 128);
-        self.dense_rows = env_usize("POCKET_DENSE_ROWS", if dc { 112 } else { DENSE_ROWS });
+        let t = gpu
+            .tuning
+            .as_ref()
+            .and_then(|t| t.quant(self.hidden).cloned())
+            .unwrap_or_default();
+        self.int8_max = env_usize(
+            "POCKET_INT8_MAX_ROWS",
+            t.int8_max.unwrap_or(if dc { 48 } else { 4096 }),
+        );
+        self.big_rows = env_usize("POCKET_INT8_BIG_ROWS", t.big_rows.unwrap_or(128));
+        self.dense_rows = env_usize(
+            "POCKET_DENSE_ROWS",
+            t.dense_rows.unwrap_or(if dc { 112 } else { DENSE_ROWS }),
+        );
+    }
+
+    /// Where matrices change path: from which rows int8 runs and up to
+    /// which, from which int8 takes the large tiles, and above which a
+    /// matrix is dequantized for cuBLAS.
+    pub fn rows(&self) -> crate::tuning::QuantRows {
+        crate::tuning::QuantRows {
+            hidden: self.hidden,
+            int8_rows: Some(self.int8_rows),
+            int8_max: Some(self.int8_max),
+            big_rows: Some(self.big_rows),
+            dense_rows: Some(self.dense_rows),
+        }
+    }
+
+    /// Sets the thresholds `r` gives, as `pocket-engine tune` compares them.
+    /// Call before `prepare`, which sizes the int8 buffer by `int8_max`.
+    pub fn set_rows(&mut self, r: &crate::tuning::QuantRows) {
+        self.int8_rows = r.int8_rows.unwrap_or(self.int8_rows);
+        self.int8_max = r.int8_max.unwrap_or(self.int8_max);
+        self.big_rows = r.big_rows.unwrap_or(self.big_rows);
+        self.dense_rows = r.dense_rows.unwrap_or(self.dense_rows);
     }
 
     pub fn get(&mut self, gpu: &Gpu, ty: GgmlType) -> Result<QuantKernels> {
@@ -242,7 +284,7 @@ impl Quants {
             self.workspace = Some(gpu.alloc(SPLIT_WORKSPACE)?);
             self.finish = Some(gpu.kernel("qmma_finish")?);
             self.sms = gpu.sms;
-            self.tune(gpu.arch);
+            self.tune(gpu);
         }
         let tiled = match ty.tile_chunk() {
             Some(_) => {
@@ -330,7 +372,7 @@ impl Quants {
             self.workspace = Some(gpu.alloc(SPLIT_WORKSPACE)?);
             self.finish = Some(gpu.kernel("qmma_finish")?);
             self.sms = gpu.sms;
-            self.tune(gpu.arch);
+            self.tune(gpu);
         }
         Ok(())
     }

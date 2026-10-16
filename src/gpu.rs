@@ -13,7 +13,7 @@ use cudarc::cublaslt::sys as lt;
 #[cfg(not(feature = "rocm"))]
 use cudarc::driver::sys as cu;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, CString, c_void};
 
 fn check(r: cu::CUresult, what: &'static str) -> Result<()> {
@@ -274,6 +274,48 @@ struct LtPlan {
     b: lt::cublasLtMatrixLayout_t,
     d: lt::cublasLtMatrixLayout_t,
     algo: lt::cublasLtMatmulAlgo_t,
+    /// Algorithms checked against this plan, and whether they run it.
+    #[cfg_attr(feature = "rocm", allow(dead_code))]
+    fits: Vec<(crate::tuning::Algo, bool)>,
+}
+
+/// A matrix-multiply shape as tuning tables key it: y[rows, ldy] = x[rows,
+/// k] . w[n, k]^T, its kind naming the input and output types ("bf16",
+/// "bf16 f32", "fp8 block128", "fp8 mx32 f32", ...).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GemmShape {
+    pub kind: String,
+    pub n: usize,
+    pub k: usize,
+    pub ldy: usize,
+}
+
+/// The kind of a product, as [`GemmShape`] names it.
+pub fn gemm_kind(fp8: Option<Fp8Mode>, f32_out: bool) -> String {
+    let base = match fp8 {
+        None => "bf16",
+        Some(Fp8Mode::Block128) => "fp8 block128",
+        Some(Fp8Mode::Mx32) => "fp8 mx32",
+    };
+    if f32_out {
+        format!("{base} f32")
+    } else {
+        base.to_string()
+    }
+}
+
+/// Where a model ran one shape (POCKET_RECORD_GEMMS=1): each layer's weights
+/// and FP8 weight scales, and the inputs and outputs of its largest call,
+/// which `pocket-engine tune` reuses to time algorithms on real buffers.
+#[derive(Clone, Debug, Default)]
+pub struct GemmUse {
+    pub weights: Vec<(u64, u64)>,
+    pub x: u64,
+    pub x_scale: u64,
+    pub y: u64,
+    pub fp8: Option<Fp8Mode>,
+    pub f32_out: bool,
+    pub rows: BTreeSet<usize>,
 }
 
 /// GPU time by kernel, from events around each launch (POCKET_PROFILE=1).
@@ -300,6 +342,13 @@ pub struct Gpu {
     lt: lt::cublasLtHandle_t,
     lt_ws: Buf,
     lt_plans: RefCell<HashMap<PlanKey, LtPlan>>,
+    /// Plans for tuned products, by shape, rows and scale pointers.
+    #[cfg_attr(feature = "rocm", allow(dead_code))]
+    lt_tuned: RefCell<HashMap<(GemmShape, usize, u64, u64), LtPlan>>,
+    /// Settings measured for this GPU (see `tuning`).
+    pub tuning: Option<crate::tuning::Table>,
+    /// POCKET_RECORD_GEMMS=1: the products run so far.
+    record: Option<RefCell<BTreeMap<GemmShape, GemmUse>>>,
     stream: cu::CUstream,
     /// A second stream for work that overlaps the main one between `fork`
     /// and `join`, and the events ordering the two.
@@ -458,6 +507,11 @@ impl Gpu {
             let lt_bytes = 64 << 20;
             let mut lw = 0;
             check(cu::cuMemAlloc_v2(&mut lw, lt_bytes), "cuMemAlloc")?;
+            #[cfg(not(feature = "rocm"))]
+            let tuning =
+                crate::tuning::Table::for_gpu(&name, sms as usize, lt::cublasLtGetVersion());
+            #[cfg(feature = "rocm")]
+            let tuning = None;
             Ok(Self {
                 sms: sms as usize,
                 smem_per_sm: smem_per_sm as usize,
@@ -469,6 +523,11 @@ impl Gpu {
                     bytes: lt_bytes,
                 },
                 lt_plans: RefCell::new(HashMap::new()),
+                lt_tuned: RefCell::new(HashMap::new()),
+                tuning,
+                record: std::env::var_os("POCKET_RECORD_GEMMS")
+                    .is_some_and(|v| v == "1")
+                    .then(|| RefCell::new(BTreeMap::new())),
                 stream,
                 side,
                 fork_ev,
@@ -975,6 +1034,21 @@ impl Gpu {
                 ],
             );
         }
+        self.note(None, out, inp, ldy, rows, f32_out, (w, 0), x, 0, y);
+        #[cfg(not(feature = "rocm"))]
+        if let Some(t) = &self.tuning {
+            let shape = GemmShape {
+                kind: gemm_kind(None, f32_out),
+                n: out,
+                k: inp,
+                ldy,
+            };
+            if let Some(a) = t.gemm_algo(&shape.kind, out, inp, ldy, rows)
+                && self.lt_run(&shape, rows, (w, 0), x, 0, y, &a)?
+            {
+                return Ok(());
+            }
+        }
         let (alpha, beta) = (1f32, 0f32);
         let c_type = if f32_out {
             cb::cudaDataType_t::CUDA_R_32F
@@ -1141,12 +1215,37 @@ impl Gpu {
         ldy: usize,
         f32_out: bool,
     ) -> Result<()> {
+        self.note(
+            Some(mode),
+            n,
+            k,
+            ldy,
+            rows,
+            f32_out,
+            (w, w_scale),
+            x,
+            x_scale,
+            y,
+        );
         let key = (w, x_scale, n, k, rows, ldy, f32_out);
         let mut plans = self.lt_plans.borrow_mut();
         let p = match plans.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(self.fp8_plan(mode, w_scale, x_scale, n, k, rows, ldy, f32_out)?)
+                let p = self.fp8_plan(mode, w_scale, x_scale, n, k, rows, ldy, f32_out)?;
+                #[cfg(not(feature = "rocm"))]
+                let p =
+                    {
+                        let mut p = p;
+                        if let Some(a) = self.tuning.as_ref().and_then(|t| {
+                            t.gemm_algo(&gemm_kind(Some(mode), f32_out), n, k, ldy, rows)
+                        }) && self.fits(&mut p, &a)
+                        {
+                            p.algo = lt::cublasLtMatmulAlgo_t { data: a };
+                        }
+                        p
+                    };
+                e.insert(p)
             }
         };
         let (alpha, beta) = (1f32, 0f32);
@@ -1308,7 +1407,334 @@ impl Gpu {
                 b,
                 d,
                 algo: res.algo,
+                fits: Vec::new(),
             })
+        }
+    }
+
+    /// Records a product for `pocket-engine tune` (POCKET_RECORD_GEMMS=1).
+    #[allow(clippy::too_many_arguments)]
+    fn note(
+        &self,
+        fp8: Option<Fp8Mode>,
+        n: usize,
+        k: usize,
+        ldy: usize,
+        rows: usize,
+        f32_out: bool,
+        w: (u64, u64),
+        x: u64,
+        x_scale: u64,
+        y: u64,
+    ) {
+        let Some(r) = &self.record else { return };
+        let mut r = r.borrow_mut();
+        let u = r
+            .entry(GemmShape {
+                kind: gemm_kind(fp8, f32_out),
+                n,
+                k,
+                ldy,
+            })
+            .or_default();
+        if !u.weights.contains(&w) && u.weights.len() < 64 {
+            u.weights.push(w);
+        }
+        if u.rows.last().is_none_or(|&m| rows >= m) {
+            (u.x, u.x_scale, u.y) = (x, x_scale, y);
+        }
+        u.fp8 = fp8;
+        u.f32_out = f32_out;
+        u.rows.insert(rows);
+    }
+
+    /// The products recorded so far (POCKET_RECORD_GEMMS=1).
+    pub fn recorded(&self) -> BTreeMap<GemmShape, GemmUse> {
+        self.record
+            .as_ref()
+            .map(|r| r.borrow().clone())
+            .unwrap_or_default()
+    }
+
+    /// Median time in microseconds of one call of `f(i)`, from `rounds`
+    /// rounds of `reps` calls timed by events on the main stream.
+    pub fn time_us(
+        &self,
+        reps: usize,
+        rounds: usize,
+        mut f: impl FnMut(usize) -> Result<()>,
+    ) -> Result<f64> {
+        let (mut a, mut b) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: events are created, used on this context's stream and destroyed here.
+        unsafe {
+            check(cu::cuEventCreate(&mut a, 0), "cuEventCreate")?;
+            check(cu::cuEventCreate(&mut b, 0), "cuEventCreate")?;
+        }
+        let mut times = Vec::with_capacity(rounds);
+        let mut run = || -> Result<()> {
+            for _ in 0..rounds.max(1) {
+                // SAFETY: as above.
+                unsafe { check(cu::cuEventRecord(a, self.stream), "cuEventRecord")? };
+                for i in 0..reps.max(1) {
+                    f(i)?;
+                }
+                let mut ms = 0f32;
+                // SAFETY: as above.
+                unsafe {
+                    check(cu::cuEventRecord(b, self.stream), "cuEventRecord")?;
+                    check(cu::cuEventSynchronize(b), "cuEventSynchronize")?;
+                    check(
+                        cu::cuEventElapsedTime_v2(&mut ms, a, b),
+                        "cuEventElapsedTime",
+                    )?;
+                }
+                times.push(ms as f64 * 1e3 / reps.max(1) as f64);
+            }
+            Ok(())
+        };
+        let r = run();
+        // SAFETY: as above.
+        unsafe {
+            cu::cuEventDestroy_v2(a);
+            cu::cuEventDestroy_v2(b);
+        }
+        r?;
+        times.sort_by(f64::total_cmp);
+        Ok(times[times.len() / 2])
+    }
+
+    /// A cuBLASLt plan for a bf16 product: y^T (n x rows) = W^T' . x^T, as
+    /// `gemm_ld` computes it.
+    #[cfg(not(feature = "rocm"))]
+    fn bf16_plan(
+        &self,
+        n: usize,
+        k: usize,
+        rows: usize,
+        ldy: usize,
+        f32_out: bool,
+    ) -> Result<LtPlan> {
+        use lt::cublasLtMatmulDescAttributes_t as A;
+        let ok = |r: lt::cublasStatus_t, what: &'static str| -> Result<()> {
+            if r == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                Ok(())
+            } else {
+                Err(Error::Cuda(what, format!("{r:?}")))
+            }
+        };
+        // SAFETY: descriptor and layout handles are created here and owned by the plan.
+        unsafe {
+            let mut desc = std::ptr::null_mut();
+            ok(
+                lt::cublasLtMatmulDescCreate(
+                    &mut desc,
+                    lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    lt::cudaDataType_t::CUDA_R_32F,
+                ),
+                "cublasLtMatmulDescCreate",
+            )?;
+            let (ta, tb) = (1i32, 0i32);
+            ok(
+                lt::cublasLtMatmulDescSetAttribute(
+                    desc,
+                    A::CUBLASLT_MATMUL_DESC_TRANSA,
+                    (&ta as *const i32).cast(),
+                    4,
+                ),
+                "cublasLtMatmulDescSetAttribute",
+            )?;
+            ok(
+                lt::cublasLtMatmulDescSetAttribute(
+                    desc,
+                    A::CUBLASLT_MATMUL_DESC_TRANSB,
+                    (&tb as *const i32).cast(),
+                    4,
+                ),
+                "cublasLtMatmulDescSetAttribute",
+            )?;
+            let layout = |ty: lt::cudaDataType_t, r: usize, c: usize, ld: usize| {
+                let mut l = std::ptr::null_mut();
+                ok(
+                    lt::cublasLtMatrixLayoutCreate(&mut l, ty, r as u64, c as u64, ld as i64),
+                    "cublasLtMatrixLayoutCreate",
+                )
+                .map(|_| l)
+            };
+            let bf = lt::cudaDataType_t::CUDA_R_16BF;
+            let d_ty = if f32_out {
+                lt::cudaDataType_t::CUDA_R_32F
+            } else {
+                bf
+            };
+            Ok(LtPlan {
+                desc,
+                a: layout(bf, k, n, k)?,
+                b: layout(bf, k, rows, k)?,
+                d: layout(d_ty, n, rows, ldy)?,
+                algo: std::mem::zeroed(),
+                fits: Vec::new(),
+            })
+        }
+    }
+
+    /// The plan for a product of a tuned shape at `rows` rows, made once.
+    #[cfg(not(feature = "rocm"))]
+    fn tuned_plan<'a>(
+        &self,
+        plans: &'a mut HashMap<(GemmShape, usize, u64, u64), LtPlan>,
+        shape: &GemmShape,
+        rows: usize,
+        w_scale: u64,
+        x_scale: u64,
+    ) -> Result<&'a mut LtPlan> {
+        let key = (shape.clone(), rows, w_scale, x_scale);
+        if !plans.contains_key(&key) {
+            let f32_out = shape.kind.ends_with(" f32");
+            let p = if shape.kind.starts_with("fp8 block128") {
+                self.fp8_plan(
+                    Fp8Mode::Block128,
+                    w_scale,
+                    x_scale,
+                    shape.n,
+                    shape.k,
+                    rows,
+                    shape.ldy,
+                    f32_out,
+                )?
+            } else if shape.kind.starts_with("fp8 mx32") {
+                self.fp8_plan(
+                    Fp8Mode::Mx32,
+                    w_scale,
+                    x_scale,
+                    shape.n,
+                    shape.k,
+                    rows,
+                    shape.ldy,
+                    f32_out,
+                )?
+            } else {
+                self.bf16_plan(shape.n, shape.k, rows, shape.ldy, f32_out)?
+            };
+            plans.insert(key.clone(), p);
+        }
+        Ok(plans.get_mut(&key).expect("inserted"))
+    }
+
+    /// Whether cuBLASLt runs `a` for this plan within the workspace.
+    #[cfg(not(feature = "rocm"))]
+    fn fits(&self, p: &mut LtPlan, a: &crate::tuning::Algo) -> bool {
+        if let Some(&(_, ok)) = p.fits.iter().find(|f| f.0 == *a) {
+            return ok;
+        }
+        let algo = lt::cublasLtMatmulAlgo_t { data: *a };
+        // SAFETY: the plan's handles are live; the result is written in place.
+        let ok = unsafe {
+            let mut res: lt::cublasLtMatmulHeuristicResult_t = std::mem::zeroed();
+            let r =
+                lt::cublasLtMatmulAlgoCheck(self.lt, p.desc, p.a, p.b, p.d, p.d, &algo, &mut res);
+            r == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+                && res.state == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+                && res.workspaceSize <= self.lt_ws.bytes
+        };
+        p.fits.push((*a, ok));
+        ok
+    }
+
+    /// Runs a product with cuBLASLt algorithm `a`. Returns false, running
+    /// nothing, when `a` cannot run it.
+    #[cfg(not(feature = "rocm"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn lt_run(
+        &self,
+        shape: &GemmShape,
+        rows: usize,
+        (w, w_scale): (u64, u64),
+        x: u64,
+        x_scale: u64,
+        y: u64,
+        a: &crate::tuning::Algo,
+    ) -> Result<bool> {
+        let mut plans = self.lt_tuned.borrow_mut();
+        let p = self.tuned_plan(&mut plans, shape, rows, w_scale, x_scale)?;
+        if !self.fits(p, a) {
+            return Ok(false);
+        }
+        let (alpha, beta) = (1f32, 0f32);
+        let algo = lt::cublasLtMatmulAlgo_t { data: *a };
+        // SAFETY: the plan matches the shape; the caller passes buffers of it.
+        let r = unsafe {
+            lt::cublasLtMatmul(
+                self.lt,
+                p.desc,
+                (&alpha as *const f32).cast(),
+                w as *const c_void,
+                p.a,
+                x as *const c_void,
+                p.b,
+                (&beta as *const f32).cast(),
+                y as *const c_void,
+                p.d,
+                y as *mut c_void,
+                p.d,
+                &algo,
+                self.lt_ws.ptr as *mut c_void,
+                self.lt_ws.bytes,
+                self.stream.cast(),
+            )
+        };
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(Error::Cuda("cublasLtMatmul", format!("{r:?}")));
+        }
+        Ok(true)
+    }
+
+    /// cuBLASLt's own candidates for a product at `rows` rows, best guess
+    /// first: up to `count` that fit the workspace.
+    #[cfg(not(feature = "rocm"))]
+    pub fn lt_algos(
+        &self,
+        shape: &GemmShape,
+        rows: usize,
+        w_scale: u64,
+        x_scale: u64,
+        count: usize,
+    ) -> Result<Vec<crate::tuning::Algo>> {
+        let mut plans = self.lt_tuned.borrow_mut();
+        let p = self.tuned_plan(&mut plans, shape, rows, w_scale, x_scale)?;
+        // SAFETY: the preference is created and destroyed here; results are written in place.
+        unsafe {
+            let mut pref = std::ptr::null_mut();
+            lt::cublasLtMatmulPreferenceCreate(&mut pref);
+            let ws = self.lt_ws.bytes;
+            lt::cublasLtMatmulPreferenceSetAttribute(
+                pref,
+                lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&ws as *const usize).cast(),
+                8,
+            );
+            let mut res: Vec<lt::cublasLtMatmulHeuristicResult_t> = vec![std::mem::zeroed(); count];
+            let mut found = 0;
+            let r = lt::cublasLtMatmulAlgoGetHeuristic(
+                self.lt,
+                p.desc,
+                p.a,
+                p.b,
+                p.d,
+                p.d,
+                pref,
+                count as i32,
+                res.as_mut_ptr(),
+                &mut found,
+            );
+            lt::cublasLtMatmulPreferenceDestroy(pref);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Ok(Vec::new());
+            }
+            Ok(res[..found as usize]
+                .iter()
+                .filter(|r| r.state == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS)
+                .map(|r| r.algo.data)
+                .collect())
         }
     }
 

@@ -297,6 +297,11 @@ impl Gguf {
         Ok(g)
     }
 
+    /// Every tensor's name and description.
+    pub fn tensors(&self) -> impl Iterator<Item = (&str, &TensorInfo)> {
+        self.tensors.iter().map(|(n, t)| (n.as_str(), t))
+    }
+
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.meta.get(key)
     }

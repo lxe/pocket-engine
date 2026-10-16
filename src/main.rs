@@ -158,6 +158,16 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Measure this GPU's settings for a model and add them to its tuning table.
+    ///
+    /// Merges into OUT, by default tuning/cuda/<gpu>-<sms>.json, which the
+    /// next build embeds once it is listed in src/tuning.rs.
+    Tune {
+        #[command(flatten)]
+        engine: EngineArgs,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Dump dequantized rows of a GGUF tensor.
     ///
     /// Dequantizes on the GPU and writes little-endian f32, for checking the
@@ -345,6 +355,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = engine_thread.join();
             served?;
         }
+        #[cfg(not(feature = "rocm"))]
+        Cmd::Tune { engine, out } => {
+            let t = pocket_engine::tune::run_model(engine.config())?;
+            let out = out.unwrap_or_else(|| {
+                PathBuf::from("tuning/cuda").join(pocket_engine::tuning::file_name(&t.gpu, t.sms))
+            });
+            let mut table = match std::fs::read_to_string(&out) {
+                Ok(s) => pocket_engine::tuning::Table::parse(&s)?,
+                Err(_) => pocket_engine::tuning::Table::new(&t.gpu, t.sms, t.cublaslt),
+            };
+            table.merge(t);
+            if let Some(d) = out.parent() {
+                std::fs::create_dir_all(d)?;
+            }
+            std::fs::write(&out, serde_json::to_string_pretty(&table)? + "\n")?;
+            eprintln!("wrote {}", out.display());
+        }
+        #[cfg(feature = "rocm")]
+        Cmd::Tune { .. } => return Err("tune runs on NVIDIA GPUs".into()),
         Cmd::Dequant {
             model,
             tensor,
@@ -593,189 +622,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             check,
             split,
         } => {
-            use pocket_engine::gpu::{Arg, Gpu};
+            use pocket_engine::gdnbench::{GdnRig, Which};
+            use pocket_engine::gpu::Gpu;
             let gpu = Gpu::new(0)?;
-            let (hv, hk, d) = (heads, k_heads, 128usize);
-            let c = 2 * hk * d + hv * d;
-            let pw = c + hv * d + 2 * hv;
-            let t = seqs * tokens;
-            let rnd = |n: usize, scale: f32| -> Vec<u8> {
-                (0..n)
-                    .flat_map(|i| {
-                        let x = ((i.wrapping_mul(2654435761) % 2001) as f32 / 1000.0 - 1.0) * scale;
-                        half::bf16::from_f32(x).to_le_bytes()
-                    })
-                    .collect()
-            };
-            let f32s =
-                |v: Vec<f32>| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            let (hv, d, t) = (heads, 128usize, seqs * tokens);
             let i32s =
                 |v: Vec<i32>| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-            let conv = gpu.upload(&rnd(t * c, 1.0))?;
-            let proj = gpu.upload(&rnd(t * pw, 1.0))?;
-            let neg_a = gpu.upload(&f32s(vec![-0.01; hv]))?;
-            let dt = gpu.upload(&f32s(vec![0.1; hv]))?;
-            let nw = gpu.upload(&f32s(vec![1.0; d]))?;
-            let state = gpu.alloc_zeroed(seqs * hv * d * d * 2)?;
-            let cu = gpu.upload(&i32s((0..=seqs).map(|i| (i * tokens) as i32).collect()))?;
-            let slots = gpu.upload(&i32s((0..seqs as i32).collect()))?;
-            let fresh = gpu.upload(&i32s(vec![0; seqs]))?;
-            let tok_seq = gpu.upload(&i32s((0..t).map(|i| (i / tokens) as i32).collect()))?;
-            let out = gpu.alloc(t * hv * d * 2)?;
-            let norm = gpu.kernel("gdn_norm")?;
-            let prep = gpu.kernel("gdn_prep")?;
-            gpu.set_smem(prep, pocket_engine::model::GDN_PREP_SMEM)?;
-            let kscan = gpu.kernel(&format!("gdn_scan{split}"))?;
-            gpu.set_smem(kscan, pocket_engine::model::gdn_scan_smem(split))?;
-            let scratch = [
-                gpu.alloc(t * hv * d * 2)?,
-                gpu.alloc(t * hv * d * 2)?,
-                gpu.alloc(t * hv * 4)?,
-                gpu.alloc(t * hv * 4)?,
-                gpu.alloc(t * hv * 32 * 2)?,
-                gpu.alloc(t * hv * 4)?,
-            ];
-            // Kernels by name: "chunk" (prep, scan, norm), "decode" (gdn_decode)
-            // or "recurrent" (gdn_recurrent). Phases: 1 the prep, 2 the scan or
-            // recurrence, 4 the norm.
-            // Where gdn_decode's buffers do not fit (AMD's 64 KB), "decode"
-            // runs gdn_recurrent, as the engine does.
-            let dshape = pocket_engine::model::gdn_decode_shape(true, gpu.smem_per_sm);
-            let (nbuf, per_sm) = dshape.unwrap_or((0, 0));
-            let kdecode = match dshape {
-                Some(_) => {
-                    let k = gpu.kernel("gdn_decode")?;
-                    gpu.set_smem(k, nbuf * 2 * d * d)?;
-                    Some(k)
-                }
-                None => None,
-            };
+            let rig = GdnRig::new(&gpu, heads, k_heads, seqs, tokens)?;
+            let (state, fresh, out) = (&rig.state, &rig.fresh, &rig.out);
+            // gdn_decode as the engine shapes it, where it runs at all.
+            let dshape = pocket_engine::model::gdn_decode_shape(true, heads, &gpu);
             let launch = |name: &str, fresh_ptr: u64, phases: u8| -> pocket_engine::Result<()> {
-                if name == "chunk" && phases & 1 != 0 {
-                    gpu.launch(
-                        prep,
-                        ((t.div_ceil(32) + seqs) as u32, hv as u32, 1),
-                        2 * d as u32,
-                        pocket_engine::model::GDN_PREP_SMEM as u32,
-                        &[
-                            Arg::P(conv.ptr),
-                            Arg::P(proj.ptr),
-                            Arg::I(pw as i32),
-                            Arg::I(c as i32),
-                            Arg::I(hk as i32),
-                            Arg::I(hv as i32),
-                            Arg::P(neg_a.ptr),
-                            Arg::P(dt.ptr),
-                            Arg::P(cu.ptr),
-                            Arg::I(seqs as i32),
-                            Arg::P(0),
-                            Arg::I(1),
-                            Arg::I(0),
-                            Arg::P(scratch[0].ptr),
-                            Arg::P(scratch[1].ptr),
-                            Arg::P(scratch[2].ptr),
-                            Arg::P(scratch[3].ptr),
-                            Arg::P(scratch[4].ptr),
-                            Arg::P(scratch[5].ptr),
-                        ],
-                    )?;
-                }
-                if phases & 2 != 0 {
-                    let (kern, smem, grid, extra) = match name {
-                        "chunk" => (
-                            kscan,
-                            pocket_engine::model::gdn_scan_smem(split) as u32,
-                            (seqs as u32, hv as u32, split as u32),
-                            vec![
-                                Arg::P(scratch[0].ptr),
-                                Arg::P(scratch[1].ptr),
-                                Arg::P(scratch[2].ptr),
-                                Arg::P(scratch[3].ptr),
-                                Arg::P(scratch[4].ptr),
-                                Arg::P(scratch[5].ptr),
-                                Arg::P(0),
-                            ],
-                        ),
-                        "decode" if kdecode.is_some() => (
-                            kdecode.expect("checked"),
-                            (nbuf * 2 * d * d) as u32,
-                            ((seqs * hv).min(gpu.sms * per_sm) as u32, 1, 1),
-                            vec![Arg::I(seqs as i32), Arg::I(nbuf as i32)],
-                        ),
-                        _ => (
-                            gpu.kernel("gdn_recurrent")?,
-                            0,
-                            (seqs as u32, hv as u32, 1),
-                            vec![],
-                        ),
-                    };
-                    let threads = if name == "decode" && kdecode.is_some() {
-                        256
-                    } else {
-                        2 * d as u32
-                    };
-                    gpu.launch(
-                        kern,
-                        grid,
-                        threads,
-                        smem,
-                        &[
-                            Arg::P(conv.ptr),
-                            Arg::P(proj.ptr),
-                            Arg::I(pw as i32),
-                            Arg::I(c as i32),
-                            Arg::I(hk as i32),
-                            Arg::I(hv as i32),
-                            Arg::P(neg_a.ptr),
-                            Arg::P(dt.ptr),
-                            Arg::P(nw.ptr),
-                            Arg::P(state.ptr),
-                            Arg::I(1),
-                            Arg::P(cu.ptr),
-                            Arg::P(slots.ptr),
-                            Arg::P(fresh_ptr),
-                            Arg::P(out.ptr),
-                            Arg::F(1e-6),
-                            Arg::I(0),
-                            Arg::P(0),
-                            Arg::P(0),
-                            Arg::I(0),
-                            Arg::I(0),
-                            Arg::P(0),
-                            Arg::I(1),
-                        ]
-                        .into_iter()
-                        .chain(extra)
-                        .collect::<Vec<_>>(),
-                    )?;
-                }
-                if name == "chunk" && phases & 4 != 0 {
-                    gpu.launch(
-                        norm,
-                        (t as u32, 1, 1),
-                        256,
-                        0,
-                        &[
-                            Arg::P(proj.ptr),
-                            Arg::I(pw as i32),
-                            Arg::I(c as i32),
-                            Arg::I(hv as i32),
-                            Arg::P(nw.ptr),
-                            Arg::P(out.ptr),
-                            Arg::I(t as i32),
-                            Arg::F(1e-6),
-                            Arg::P(cu.ptr),
-                            Arg::P(tok_seq.ptr),
-                            Arg::P(0),
-                            Arg::P(0),
-                            Arg::I(0),
-                            Arg::I(0),
-                            Arg::P(0),
-                            Arg::I(1),
-                        ],
-                    )?;
-                }
-                Ok(())
+                let which = match name {
+                    "chunk" => Which::Chunk,
+                    "decode" => Which::Decode,
+                    _ => Which::Recurrent,
+                };
+                rig.launch(&gpu, which, fresh_ptr, phases, split, dshape)
             };
             let which = if chunk { "chunk" } else { "decode" };
             if check {

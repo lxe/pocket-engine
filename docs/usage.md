@@ -72,6 +72,21 @@ Adapters can also come and go while the server runs:
 
 Requests accept the OpenAI sampling fields (`temperature`, `top_p`, `seed`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`) plus vLLM's `top_k`, `min_p` and `repetition_penalty`. The default temperature is 1.0. Prompts that share a beginning reuse its cache. Thinking is off unless a request sends vLLM's `"chat_template_kwargs": {"enable_thinking": true}` (vLLM's default is on).
 
+### Tool calling
+
+Tools work as in OpenAI's API and vLLM's `--enable-auto-tool-choice`. Send `tools`, and the model's chat template renders them, so prompts match transformers' `apply_chat_template`. Earlier calls go back as assistant messages with `tool_calls`, and their results as `"role": "tool"` messages.
+
+Calls come back in `choices[].message.tool_calls` with `finish_reason` `"tool_calls"`, and any text the model writes before them stays in `content`. Streams send each call whole, as one `tool_calls` delta. Qwen3.5 and Qwen3.8's XML call format and the Hermes JSON format are both read.
+
+| `tool_choice` | |
+|---|---|
+| `"auto"` (the default with tools) | The model decides |
+| `"none"` | The tools are left out of the prompt |
+| `"required"` | One or more calls, enforced by a grammar |
+| `{"type": "function", "function": {"name": ...}}` | One call to that function, enforced by a grammar |
+
+A forced call follows the tool's parameter schema, and `"parallel_tool_calls": false` keeps a forced turn to one call.
+
 ### Structured output and log-probabilities
 
 - `response_format`: `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}` for output that follows a JSON Schema. vLLM's `guided_json`, `guided_regex`, `guided_choice` and `guided_grammar` (Lark) work too. Grammars run on [llguidance](https://github.com/guidance-ai/llguidance).

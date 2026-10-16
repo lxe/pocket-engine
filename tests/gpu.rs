@@ -720,6 +720,132 @@ fn penalties_reduce_repetition() {
     );
 }
 
+/// A forced tool call comes back as `tool_calls`, whole and streamed, with
+/// arguments that follow the tool's schema.
+#[test]
+fn serves_forced_tool_calls() {
+    let Some(dir) = model() else { return };
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let (tx, info, health, _, _) = engine::spawn(config(dir.clone())).unwrap();
+    let tok = ChatTokenizer::load(&dir).unwrap();
+    let grammars = server::grammars(&tok, &info.cfg).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let bind = "127.0.0.1:18196";
+        tokio::spawn(server::serve(
+            tok,
+            grammars,
+            None,
+            tx,
+            info,
+            health,
+            None,
+            "test".into(),
+            bind,
+        ));
+        let client = reqwest::Client::new();
+        let url = format!("http://{bind}");
+        for _ in 0..100 {
+            if client.get(format!("{url}/health")).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let tools = serde_json::json!([
+            { "type": "function", "function": { "name": "get_weather", "description": "Current weather for a city.",
+                "parameters": { "type": "object", "required": ["city", "days"], "properties": {
+                    "city": { "type": "string" }, "days": { "type": "integer" } } } } },
+            { "type": "function", "function": { "name": "add", "description": "Adds two numbers.",
+                "parameters": { "type": "object", "required": ["a", "b"], "properties": {
+                    "a": { "type": "number" }, "b": { "type": "number" } } } } }]);
+        let body = serde_json::json!({ "model": "test", "max_tokens": 96, "temperature": 0,
+            "tools": tools, "tool_choice": { "type": "function", "function": { "name": "get_weather" } },
+            "messages": [{ "role": "user", "content": "What will the weather be in Paris over the next 3 days?" }] });
+        let whole: serde_json::Value = client
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let choice = &whole["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{whole}");
+        let calls = choice["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{whole}");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert!(args["city"].is_string() && args["days"].is_i64(), "{args}");
+        assert!(choice["message"]["content"].is_null(), "{whole}");
+
+        let mut stream_body = body.clone();
+        stream_body["stream"] = true.into();
+        let sse = client
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&stream_body)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let mut streamed = Vec::new();
+        let mut finish = None;
+        for line in sse.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            if line == "[DONE]" {
+                continue;
+            }
+            let chunk: serde_json::Value = serde_json::from_str(line).unwrap();
+            for c in chunk["choices"][0]["delta"]["tool_calls"].as_array().into_iter().flatten() {
+                assert_eq!(c["index"], streamed.len());
+                streamed.push(c["function"].clone());
+            }
+            if let Some(f) = chunk["choices"][0]["finish_reason"].as_str() {
+                finish = Some(f.to_string());
+            }
+        }
+        assert_eq!(finish.as_deref(), Some("tool_calls"));
+        assert_eq!(streamed, vec![calls[0]["function"].clone()], "streamed and whole calls agree");
+
+        // "required" may call any tool; the result goes back as a tool turn.
+        let mut required = body.clone();
+        required["tool_choice"] = "required".into();
+        required["messages"] = serde_json::json!([
+            { "role": "user", "content": "What is 2.5 plus 4?" }]);
+        let r: serde_json::Value = client
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&required)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let call = &r["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "add", "{r}");
+        let mut answer = body.clone();
+        answer["tool_choice"] = "auto".into();
+        answer["messages"] = serde_json::json!([
+            { "role": "user", "content": "What is 2.5 plus 4?" },
+            { "role": "assistant", "content": null, "tool_calls": [call] },
+            { "role": "tool", "tool_call_id": call["id"], "content": "6.5" }]);
+        let a: serde_json::Value = client
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&answer)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let text = a["choices"][0]["message"]["content"].as_str().unwrap_or_default();
+        assert!(text.contains("6.5"), "{a}");
+    });
+}
+
 /// The OpenAI-compatible server streams text and reports usage.
 #[test]
 fn serves_chat_completions() {

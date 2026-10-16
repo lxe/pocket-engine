@@ -15,13 +15,13 @@ memmap2 = "0.9.11"
 half = "2.7.1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 clap = { version = "4", features = ["derive"] }
 axum = "0.8.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
 futures-util = "0.3"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
-minijinja = { version = "2", features = ["json", "loop_controls"] }
+minijinja = { version = "2", features = ["json", "loop_controls", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 base64 = "0.22"

@@ -6,7 +6,7 @@
 cargo test
 ```
 
-This covers the scheduler, configs and memory layout, and runs in seconds.
+This covers the scheduler, configs and memory layout, and runs in seconds. It also checks that tool conversations render as transformers renders them, against `tests/fixtures/tools.templates.json`; `scripts/tool_template_reference.py` rewrites that file, with transformers installed.
 
 ## On a GPU
 
@@ -23,7 +23,8 @@ On AMD, use `--features rocm` in place of `--features cuda` and drop `CUDA_COMPU
 - batching and the prefix cache change outputs only by rounding;
 - speculative decoding gives the same tokens as decoding without it;
 - sampling and penalties behave as specified;
-- the HTTP API streams and reports usage.
+- the HTTP API streams and reports usage;
+- a forced tool call follows the tool's schema and comes back as `tool_calls`.
 
 ## Testing an option
 

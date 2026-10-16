@@ -116,69 +116,33 @@ impl ChatTokenizer {
     /// tokenizes the result. Returns the token ids, with one image
     /// placeholder per image, and the images' URLs in order.
     pub fn chat(&self, messages: &[Value]) -> Result<(Vec<u32>, Vec<String>)> {
-        self.chat_with(messages, false)
+        self.chat_with(messages, false, None)
     }
 
-    /// `chat`, with the template's thinking switched on or off.
-    pub fn chat_with(&self, messages: &[Value], thinking: bool) -> Result<(Vec<u32>, Vec<String>)> {
-        let mut norm = Vec::with_capacity(messages.len());
-        let mut images = Vec::new();
-        for m in messages {
-            let role = m["role"].as_str().unwrap_or_default();
-            if !matches!(role, "system" | "user" | "assistant") {
-                return Err(Error::Request(format!("unsupported role {role:?}")));
-            }
-            let content = match &m["content"] {
-                Value::String(s) => json!(s),
-                Value::Array(parts) => {
-                    let mut out = Vec::with_capacity(parts.len());
-                    for p in parts {
-                        match p["type"].as_str() {
-                            Some("text") => out.push(json!({ "type": "text", "text": p["text"].as_str().unwrap_or_default() })),
-                            Some("image_url") => {
-                                let url = p["image_url"]["url"].as_str().or(p["image_url"].as_str());
-                                images.push(url.ok_or_else(|| Error::Request("image_url needs a url".into()))?.to_string());
-                                out.push(json!({ "type": "image" }));
-                            }
-                            other => return Err(Error::Request(format!("unsupported content part {other:?}"))),
-                        }
-                    }
-                    Value::Array(out)
-                }
-                Value::Null => json!(""),
-                _ => {
-                    return Err(Error::Request(
-                        "message content must be text or parts".into(),
-                    ));
-                }
-            };
-            norm.push(json!({ "role": role, "content": content }));
-        }
-        if norm.is_empty() {
-            return Err(Error::Request("messages are empty".into()));
-        }
-        let mut env = minijinja::Environment::new();
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_function(
-            "raise_exception",
-            |message: String| -> std::result::Result<String, minijinja::Error> {
-                Err(minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    message,
-                ))
-            },
-        );
-        env.add_template("chat", &self.template)
-            .map_err(|e| Error::Config(e.to_string()))?;
-        let text = env
-            .get_template("chat")
-            .map_err(|e| Error::Config(e.to_string()))?
-            .render(minijinja::context! {
-                messages => norm, add_generation_prompt => true, enable_thinking => thinking,
-                tools => false, add_vision_id => false
-            })
-            .map_err(|e| Error::Request(e.to_string()))?;
+    /// `chat`, with the template's thinking switched on or off and the tools
+    /// the model may call.
+    pub fn chat_with(
+        &self,
+        messages: &[Value],
+        thinking: bool,
+        tools: Option<&[Value]>,
+    ) -> Result<(Vec<u32>, Vec<String>)> {
+        let (text, images) = render(&self.template, messages, thinking, tools)?;
         Ok((self.encode(&text)?, images))
+    }
+
+    /// The id of a tag that the vocabulary holds as one added token.
+    pub fn tag_token(&self, tag: &str) -> Option<u32> {
+        let id = self.tok.token_to_id(tag)?;
+        self.tok
+            .get_added_tokens_decoder()
+            .contains_key(&id)
+            .then_some(id)
+    }
+
+    /// The call format the chat template teaches.
+    pub fn tool_format(&self) -> crate::tools::Format {
+        crate::tools::Format::of_template(&self.template)
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -193,6 +157,101 @@ impl ChatTokenizer {
     pub fn decode(&self, ids: &[u32]) -> String {
         self.tok.decode(ids, true).unwrap_or_default()
     }
+}
+
+/// Renders messages and tools with a chat template, as transformers does:
+/// the same whitespace control and `tojson`, and Python's `str` for the
+/// template's `string` filter. Messages pass through whole apart from their
+/// content, whose images become placeholders, and the arguments of
+/// assistant tool calls, parsed from their JSON strings as vLLM does. Returns
+/// the text and the images' URLs in order.
+pub fn render(
+    template: &str,
+    messages: &[Value],
+    thinking: bool,
+    tools: Option<&[Value]>,
+) -> Result<(String, Vec<String>)> {
+    let mut norm = Vec::with_capacity(messages.len());
+    let mut images = Vec::new();
+    for m in messages {
+        let role = m["role"].as_str().unwrap_or_default();
+        if !matches!(role, "system" | "user" | "assistant" | "tool") {
+            return Err(Error::Request(format!("unsupported role {role:?}")));
+        }
+        let content = match &m["content"] {
+            Value::String(s) => json!(s),
+            Value::Array(parts) => {
+                let mut out = Vec::with_capacity(parts.len());
+                for p in parts {
+                    match p["type"].as_str() {
+                        Some("text") => out.push(json!({ "type": "text", "text": p["text"].as_str().unwrap_or_default() })),
+                        Some("image_url") => {
+                            let url = p["image_url"]["url"].as_str().or(p["image_url"].as_str());
+                            images.push(url.ok_or_else(|| Error::Request("image_url needs a url".into()))?.to_string());
+                            out.push(json!({ "type": "image" }));
+                        }
+                        other => return Err(Error::Request(format!("unsupported content part {other:?}"))),
+                    }
+                }
+                Value::Array(out)
+            }
+            Value::Null => json!(""),
+            _ => {
+                return Err(Error::Request(
+                    "message content must be text or parts".into(),
+                ));
+            }
+        };
+        let mut msg = m.as_object().cloned().unwrap_or_default();
+        msg.insert("content".into(), content);
+        if let Some(Value::Array(calls)) = msg.get_mut("tool_calls") {
+            for c in calls {
+                let args = &mut c["function"]["arguments"];
+                if let Some(parsed) = args.as_str().and_then(|a| serde_json::from_str(a).ok()) {
+                    *args = parsed;
+                }
+            }
+        }
+        norm.push(Value::Object(msg));
+    }
+    if norm.is_empty() {
+        return Err(Error::Request("messages are empty".into()));
+    }
+    let mut env = minijinja::Environment::new();
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_function(
+        "raise_exception",
+        |message: String| -> std::result::Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                message,
+            ))
+        },
+    );
+    env.add_filter("tojson", |v: minijinja::Value| crate::tools::py_json(&v));
+    env.add_filter("string", |v: minijinja::Value| match v.kind() {
+        minijinja::value::ValueKind::Bool => {
+            (if v.is_true() { "True" } else { "False" }).to_string()
+        }
+        minijinja::value::ValueKind::None | minijinja::value::ValueKind::Undefined => {
+            "None".to_string()
+        }
+        _ => v.to_string(),
+    });
+    env.add_template("chat", template)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let text = env
+        .get_template("chat")
+        .map_err(|e| Error::Config(e.to_string()))?
+        .render(minijinja::context! {
+            messages => norm, add_generation_prompt => true, enable_thinking => thinking,
+            tools => tools.map(|t| Value::Array(t.to_vec())).unwrap_or(Value::Bool(false)),
+            add_vision_id => false
+        })
+        .map_err(|e| Error::Request(e.to_string()))?;
+    Ok((text, images))
 }
 
 /// The bytes of a `data:` URL (base64 only), or None for other URLs.
@@ -323,6 +382,14 @@ struct ChatRequest {
     guided_choice: Option<Vec<String>>,
     #[serde(default)]
     guided_grammar: Option<String>,
+    /// Functions the model may call, `{"type": "function", "function":
+    /// {"name", "description", "parameters"}}`, and whether it must.
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
+    #[serde(default)]
+    parallel_tool_calls: Option<bool>,
     /// vLLM's template arguments; only `enable_thinking` (default false) is read.
     #[serde(default)]
     chat_template_kwargs: Option<serde_json::Map<String, Value>>,
@@ -553,7 +620,33 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         Ok(l) => l,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
-    let constraint = match req.grammar() {
+    let thinking = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|k| k.get("enable_thinking"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tools = match crate::tools::Tools::from_request(
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+        req.parallel_tool_calls,
+    ) {
+        Ok(t) => t,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    // A forced call is a grammar of the template's call format.
+    let forced = tools
+        .as_ref()
+        .and_then(|t| t.grammar(app.tok.tool_format(), thinking, &|s| app.tok.tag_token(s)));
+    let grammar = match (req.grammar(), forced) {
+        (Ok(Some(_)), Some(_)) => Err(
+            "tool_choice required or a named function cannot be combined with response_format or guided decoding"
+                .to_string(),
+        ),
+        (Ok(None), Some(lark)) => Ok(Some(llguidance::api::TopLevelGrammar::from_lark(lark))),
+        (g, _) => g,
+    };
+    let constraint = match grammar {
         Ok(None) => None,
         Ok(Some(g)) => {
             let m = llguidance::Matcher::new(app.grammars.create_parser(g));
@@ -567,13 +660,8 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         }
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
-    let thinking = req
-        .chat_template_kwargs
-        .as_ref()
-        .and_then(|k| k.get("enable_thinking"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let (ids, urls) = match app.tok.chat_with(&req.messages, thinking) {
+    let listed = tools.as_ref().map(|t| t.list.as_slice());
+    let (ids, urls) = match app.tok.chat_with(&req.messages, thinking, listed) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, e.to_string()),
     };
@@ -619,7 +707,8 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         .or(req.max_tokens)
         .unwrap_or(app.info.max_context);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let out = Output::new(served, stops, prompt.len());
+    let mut out = Output::new(served, stops, prompt.len());
+    out.tools = tools.map(|t| (t, crate::tools::Scanner::new(thinking)));
     let request = Request {
         prompt,
         max_new,
@@ -666,6 +755,8 @@ struct Output {
     stops: Vec<String>,
     tokens: usize,
     prompt_tokens: usize,
+    /// The request's tools and the calls read out of the text so far.
+    tools: Option<(crate::tools::Tools, crate::tools::Scanner)>,
 }
 
 impl Output {
@@ -683,6 +774,31 @@ impl Output {
             sent: 0,
             stops,
             tokens: 0,
+            tools: None,
+        }
+    }
+
+    /// Released text as content and calls; `end` when no more follows.
+    fn pieces(&mut self, text: &str, end: bool) -> Vec<crate::tools::Piece> {
+        use crate::tools::Piece;
+        match &mut self.tools {
+            None if text.is_empty() => Vec::new(),
+            None => vec![Piece::Text(text.to_string())],
+            Some((t, s)) => {
+                let mut p = s.feed(text, t);
+                if end {
+                    p.extend(s.finish(t));
+                }
+                p
+            }
+        }
+    }
+
+    /// The finish reason, "tool_calls" when a turn that stopped made calls.
+    fn finish(&self, finish: &'static str) -> &'static str {
+        match &self.tools {
+            Some((_, s)) if s.calls > 0 && finish == "stop" => "tool_calls",
+            _ => finish,
         }
     }
 
@@ -775,6 +891,15 @@ async fn whole_response(
     id: String,
 ) -> Response {
     let mut content = String::new();
+    let mut calls: Vec<Value> = Vec::new();
+    let mut take = |pieces: Vec<crate::tools::Piece>| {
+        for p in pieces {
+            match p {
+                crate::tools::Piece::Text(t) => content.push_str(&t),
+                crate::tools::Piece::Call(c) => calls.push(c.to_json(&crate::tools::call_id())),
+            }
+        }
+    };
     let mut lp_content: Vec<Value> = Vec::new();
     let (finish, prompt_tokens, completion_tokens) = loop {
         match rx.recv().await {
@@ -784,9 +909,9 @@ async fn whole_response(
                     lp_content.push(logprob_entry(&app, t, &lp));
                 }
                 let (text, stopped) = out.push(&app.tok, t);
-                content.push_str(&text);
+                take(out.pieces(&text, stopped));
                 if stopped {
-                    break ("stop", out.prompt_tokens, out.tokens);
+                    break (out.finish("stop"), out.prompt_tokens, out.tokens);
                 }
             }
             Some(Event::Done {
@@ -795,9 +920,9 @@ async fn whole_response(
                 completion_tokens,
             }) => {
                 let (text, stopped) = out.end(&app.tok);
-                content.push_str(&text);
+                take(out.pieces(&text, true));
                 let finish = if stopped { "stop" } else { finish_name(finish) };
-                break (finish, prompt_tokens, completion_tokens);
+                break (out.finish(finish), prompt_tokens, completion_tokens);
             }
             Some(Event::Error(e)) => return err(StatusCode::BAD_REQUEST, e),
             None => {
@@ -809,10 +934,17 @@ async fn whole_response(
         }
     };
     drop(rx);
+    let mut message = json!({ "role": "assistant", "content": content });
+    if !calls.is_empty() {
+        if content.trim().is_empty() {
+            message["content"] = Value::Null;
+        }
+        message["tool_calls"] = Value::Array(calls);
+    }
     Json(json!({
         "id": id, "object": "chat.completion", "created": now(), "model": out.model,
         "choices": [{ "index": 0, "finish_reason": finish,
-            "message": { "role": "assistant", "content": content },
+            "message": message,
             "logprobs": if lp_content.is_empty() { Value::Null } else { json!({ "content": lp_content }) } }],
         "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens }
@@ -861,6 +993,24 @@ fn stream_response(
         Run,
         End,
     }
+    // Released text as a content delta and tool-call deltas, each call whole
+    // in one delta under its index.
+    fn split(out: &mut Output, text: &str, end: bool) -> (String, Vec<Value>) {
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let before = out.tools.as_ref().map_or(0, |(_, s)| s.calls);
+        for p in out.pieces(text, end) {
+            match p {
+                crate::tools::Piece::Text(t) => content.push_str(&t),
+                crate::tools::Piece::Call(c) => {
+                    let mut d = c.to_json(&crate::tools::call_id());
+                    d["index"] = json!(before + calls.len());
+                    calls.push(d);
+                }
+            }
+        }
+        (content, calls)
+    }
     let s = stream::unfold(
         (Some(rx), out, Phase::Start, app, id),
         move |(mut rx, mut out, phase, app, id)| async move {
@@ -884,9 +1034,10 @@ fn stream_response(
                     Some(Event::Token(t)) => {
                         let lp = out.pending.take().map(|lp| logprob_entry(&app, t, &lp));
                         let (text, stopped) = out.push(&app.tok, t);
+                        let (text, calls) = split(&mut out, &text, stopped);
                         if let Some(lp) = lp {
                             // Every token with log-probabilities gets a chunk, its
-                            // text held back if it may start a stop string.
+                            // text held back if it may start a stop string or a call.
                             events.push(chunk_lp(
                                 &out.model,
                                 &id,
@@ -897,12 +1048,15 @@ fn stream_response(
                         } else if !text.is_empty() {
                             events.push(chunk(&out.model, &id, json!({ "content": text }), None));
                         }
+                        for c in calls {
+                            events.push(chunk(&out.model, &id, json!({ "tool_calls": [c] }), None));
+                        }
                         if stopped {
                             rx = None; // cancels the request in the engine
                             events.extend(closing(
                                 &out.model,
                                 &id,
-                                "stop",
+                                out.finish("stop"),
                                 out.prompt_tokens,
                                 out.tokens,
                             ));
@@ -917,14 +1071,18 @@ fn stream_response(
                         completion_tokens,
                     }) => {
                         let (text, stopped) = out.end(&app.tok);
+                        let (text, calls) = split(&mut out, &text, true);
                         if !text.is_empty() {
                             events.push(chunk(&out.model, &id, json!({ "content": text }), None));
+                        }
+                        for c in calls {
+                            events.push(chunk(&out.model, &id, json!({ "tool_calls": [c] }), None));
                         }
                         let finish = if stopped { "stop" } else { finish_name(finish) };
                         events.extend(closing(
                             &out.model,
                             &id,
-                            finish,
+                            out.finish(finish),
                             prompt_tokens,
                             completion_tokens,
                         ));
@@ -1218,6 +1376,85 @@ mod tests {
                 .into(),
         )
         .unwrap()
+    }
+
+    fn fixture() -> (Value, Vec<(String, String)>) {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let f: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("tools.templates.json")).unwrap(),
+        )
+        .unwrap();
+        let templates = ["qwen3.5", "qwen3.8"]
+            .iter()
+            .map(|t| {
+                let text =
+                    std::fs::read_to_string(dir.join(format!("templates/{t}.jinja"))).unwrap();
+                (t.to_string(), text)
+            })
+            .collect();
+        (f, templates)
+    }
+
+    /// Tool conversations render as transformers renders them.
+    #[test]
+    fn tool_conversations_render_like_transformers() {
+        let (f, templates) = fixture();
+        for (name, template) in &templates {
+            for thinking in [false, true] {
+                let key = format!("{name} thinking={thinking}");
+                for (case, want) in f["cases"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(f["renders"][&key].as_array().unwrap())
+                {
+                    let (got, _) = render(
+                        template,
+                        case["messages"].as_array().unwrap(),
+                        thinking,
+                        case["tools"].as_array().map(Vec::as_slice),
+                    )
+                    .unwrap();
+                    assert_eq!(got, want.as_str().unwrap(), "{key}: {}", case["name"]);
+                }
+            }
+        }
+    }
+
+    /// The calls an assistant turn renders to parse back to the same calls.
+    #[test]
+    fn rendered_calls_parse_back() {
+        let (f, templates) = fixture();
+        let case = &f["cases"][2];
+        let msgs = case["messages"].as_array().unwrap();
+        let tools = crate::tools::Tools::from_request(
+            case["tools"].as_array().map(Vec::as_slice),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        for (name, template) in &templates {
+            let (prefix, _) = render(template, &msgs[..1], false, Some(&tools.list)).unwrap();
+            let (full, _) = render(template, &msgs[..3], false, Some(&tools.list)).unwrap();
+            let turn = full.strip_prefix(prefix.as_str()).unwrap();
+            let turn = &turn[..turn.find("<|im_end|>").unwrap()];
+            let (content, calls) = crate::tools::parse(turn, &tools, false);
+            assert_eq!(
+                content,
+                msgs[1]["content"].as_str().map(String::from),
+                "{name}"
+            );
+            let sent = msgs[1]["tool_calls"].as_array().unwrap();
+            assert_eq!(calls.len(), sent.len(), "{name}");
+            for (c, s) in calls.iter().zip(sent) {
+                assert_eq!(c.name, s["function"]["name"].as_str().unwrap());
+                let parsed: Value = serde_json::from_str(&c.arguments).unwrap();
+                let original: Value =
+                    serde_json::from_str(s["function"]["arguments"].as_str().unwrap()).unwrap();
+                assert_eq!(parsed, original, "{name}");
+            }
+        }
     }
 
     #[test]

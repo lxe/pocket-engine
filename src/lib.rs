@@ -14,6 +14,7 @@ pub mod model;
 pub mod sched;
 pub mod server;
 pub mod source;
+pub mod tools;
 pub mod vision;
 
 #[derive(Debug, thiserror::Error)]

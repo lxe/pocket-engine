@@ -785,13 +785,6 @@
       "int8_max": 32,
       "big_rows": 48,
       "dense_rows": 96
-    },
-    {
-      "hidden": 5120,
-      "int8_rows": 5,
-      "int8_max": 32,
-      "big_rows": 48,
-      "dense_rows": 64
     }
   ],
   "gdn_split": [

@@ -843,6 +843,23 @@ fn serves_forced_tool_calls() {
             .unwrap();
         let text = a["choices"][0]["message"]["content"].as_str().unwrap_or_default();
         assert!(text.contains("6.5"), "{a}");
+
+        // "none" keeps the tools in the prompt but reads no calls.
+        let mut none = required.clone();
+        none["tool_choice"] = "none".into();
+        none["max_tokens"] = 4.into();
+        let n: serde_json::Value = client
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&none)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(n["usage"]["prompt_tokens"], r["usage"]["prompt_tokens"], "{n}");
+        assert!(n["choices"][0]["message"]["tool_calls"].is_null(), "{n}");
+        assert!(n["choices"][0]["message"]["content"].is_string(), "{n}");
     });
 }
 

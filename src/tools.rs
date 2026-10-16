@@ -78,11 +78,14 @@ pub struct Tools {
     pub forced: Option<Option<String>>,
     /// Whether one turn may make several calls.
     pub parallel: bool,
+    /// Whether calls are read out of the output: not with `tool_choice`
+    /// "none", whose prompt still lists the tools, as vLLM's does.
+    pub calls: bool,
 }
 
 impl Tools {
     /// From a request's `tools`, `tool_choice` and `parallel_tool_calls`.
-    /// None when there are no tools or `tool_choice` is "none".
+    /// None when there are no tools.
     pub fn from_request(
         tools: Option<&[Value]>,
         choice: Option<&Value>,
@@ -102,11 +105,15 @@ impl Tools {
                 return Err(format!("tool {} appears twice", name.unwrap_or_default()));
             }
         }
+        let mut calls = true;
         let forced = match choice {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => match s.as_str() {
                 "auto" => None,
-                "none" => return Ok(None),
+                "none" => {
+                    calls = false;
+                    None
+                }
                 "required" => Some(None),
                 _ => return Err(format!("unsupported tool_choice {s:?}")),
             },
@@ -135,6 +142,7 @@ impl Tools {
             list: list.to_vec(),
             forced,
             parallel: parallel.unwrap_or(true),
+            calls,
         }))
     }
 
@@ -617,7 +625,8 @@ mod tests {
     fn tool_choice_is_validated() {
         let tools = [json!({ "type": "function", "function": { "name": "f" } })];
         let get = |c: Value| Tools::from_request(Some(&tools), Some(&c), None);
-        assert!(get(json!("none")).unwrap().is_none());
+        let none = get(json!("none")).unwrap().unwrap();
+        assert!(!none.calls && none.forced.is_none());
         assert_eq!(get(json!("required")).unwrap().unwrap().forced, Some(None));
         assert_eq!(
             get(json!({ "type": "function", "function": { "name": "f" } }))

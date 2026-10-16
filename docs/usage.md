@@ -81,7 +81,7 @@ Calls come back in `choices[].message.tool_calls` with `finish_reason` `"tool_ca
 | `tool_choice` | |
 |---|---|
 | `"auto"` (the default with tools) | The model decides |
-| `"none"` | The tools are left out of the prompt |
+| `"none"` | The prompt still lists the tools, as in vLLM, but calls stay in `content` as text |
 | `"required"` | One or more calls, enforced by a grammar |
 | `{"type": "function", "function": {"name": ...}}` | One call to that function, enforced by a grammar |
 

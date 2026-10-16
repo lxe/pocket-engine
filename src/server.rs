@@ -708,7 +708,9 @@ async fn chat(State(app): State<Arc<App>>, Json(req): Json<ChatRequest>) -> Resp
         .unwrap_or(app.info.max_context);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut out = Output::new(served, stops, prompt.len());
-    out.tools = tools.map(|t| (t, crate::tools::Scanner::new(thinking)));
+    out.tools = tools
+        .filter(|t| t.calls)
+        .map(|t| (t, crate::tools::Scanner::new(thinking)));
     let request = Request {
         prompt,
         max_new,

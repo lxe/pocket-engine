@@ -1,0 +1,342 @@
+{
+ "what": "Decode tok/s with each GPU's tuning table against tables off (POCKET_TUNING=0), scripts/load.py closed loop at 1, 16 and 64 requests in flight (16, 96 and 256 requests), two alternating rounds each, means. Change in percent.",
+ "conditions": "RunPod pods on CUDA 13.0 (cuBLASLt 13.0), 2026-10-16; the 5090 is the development workstation (cuBLASLt 13.8) with a desktop on the same GPU. GGUF rows on H100 and H200 come from the retune with thresholds measured on the model's own matrices (round 3); the first GGUF thresholds cost 11-15% at 16 in flight and were replaced. The PRO 6000 table keeps built-in GGUF thresholds, so its GGUF rows are not listed. Run-to-run noise is about 1-2% (more on the 5090 and on the H100's 27B Q4_K_M at 64, whose default runs differed by 30%).",
+ "gpus": {
+  "NVIDIA GeForce RTX 5090": {
+   "Qwen3.5-9B": {
+    "change_pct": {
+     "c1": 1.6,
+     "c16": 1.2,
+     "c64": 5.9
+    },
+    "default": [
+     86.6,
+     956.2,
+     1888.3
+    ],
+    "tuned": [
+     88.0,
+     967.3,
+     1999.2
+    ],
+    "round": "second only; the first default runs were cold"
+   },
+   "Qwen3.5-9B-Q4_K_M.gguf": {
+    "change_pct": {
+     "c1": 0.9,
+     "c16": -0.5,
+     "c64": 1.9
+    },
+    "default": [
+     188.0,
+     1705.9,
+     2651.7
+    ],
+    "tuned": [
+     189.6,
+     1697.9,
+     2702.9
+    ],
+    "round": "second only; the first default runs were cold"
+   },
+   "Qwen3.8-27B-Q4_K_M.gguf": {
+    "change_pct": {
+     "c1": -0.5,
+     "c16": -0.1,
+     "c64": 3.3
+    },
+    "default": [
+     55.7,
+     338.6,
+     426.2
+    ],
+    "tuned": [
+     55.4,
+     338.4,
+     440.4
+    ],
+    "round": "second only; the first default runs were cold"
+   }
+  },
+  "NVIDIA H100 80GB HBM3": {
+   "qwen3.5-9b": {
+    "change_pct": {
+     "c1": 0.8,
+     "c16": 0.9,
+     "c64": 2.1
+    },
+    "default": [
+     142.6,
+     1582.4,
+     3862.6
+    ],
+    "tuned": [
+     143.7,
+     1596.0,
+     3943.2
+    ]
+   },
+   "qwen3.8-27b": {
+    "change_pct": {
+     "c1": 2.6,
+     "c16": 2.5,
+     "c64": 1.5
+    },
+    "default": [
+     46.6,
+     536.4,
+     1127.2
+    ],
+    "tuned": [
+     47.8,
+     550.0,
+     1143.8
+    ]
+   },
+   "qwen3.8-27b --fp8": {
+    "change_pct": {
+     "c1": 0.4,
+     "c16": 0.6,
+     "c64": 2.1
+    },
+    "default": [
+     68.8,
+     718.9,
+     1509.0
+    ],
+    "tuned": [
+     69.1,
+     723.5,
+     1540.9
+    ]
+   },
+   "Qwen3.5-9B-Q4_K_M.gguf": {
+    "change_pct": {
+     "c1": -0.3,
+     "c16": 2.7,
+     "c64": 1.8
+    },
+    "default": [
+     162.3,
+     1397.8,
+     2668.1
+    ],
+    "tuned": [
+     161.8,
+     1435.6,
+     2715.6
+    ]
+   },
+   "Qwen3.8-27B-Q4_K_M.gguf": {
+    "change_pct": {
+     "c1": -0.8,
+     "c16": 1.7,
+     "c64": -22.9
+    },
+    "default": [
+     61.1,
+     405.6,
+     661.5
+    ],
+    "tuned": [
+     60.6,
+     412.5,
+     510.1
+    ],
+    "adopted": false,
+    "note": "default runs at 64 in flight differed by 30% (773 and 549 tok/s), so neither direction is measured; the H100 table keeps built-in GGUF thresholds for this width"
+   }
+  },
+  "NVIDIA H200": {
+   "qwen3.5-9b": {
+    "change_pct": {
+     "c1": 1.1,
+     "c16": 2.8,
+     "c64": 1.4
+    },
+    "default": [
+     189.2,
+     2014.6,
+     4564.6
+    ],
+    "tuned": [
+     191.4,
+     2072.0,
+     4626.8
+    ]
+   },
+   "qwen3.8-27b": {
+    "change_pct": {
+     "c1": 0.2,
+     "c16": 1.6,
+     "c64": 1.2
+    },
+    "default": [
+     64.9,
+     691.5,
+     1336.0
+    ],
+    "tuned": [
+     65.0,
+     702.3,
+     1352.2
+    ]
+   },
+   "qwen3.8-27b --fp8": {
+    "change_pct": {
+     "c1": 0.4,
+     "c16": -0.1,
+     "c64": 0.9
+    },
+    "default": [
+     84.3,
+     847.2,
+     1682.3
+    ],
+    "tuned": [
+     84.6,
+     846.0,
+     1698.0
+    ]
+   },
+   "Qwen3.5-9B-Q4_K_M.gguf": {
+    "change_pct": {
+     "c1": -1.2,
+     "c16": 0.8,
+     "c64": 2.8
+    },
+    "default": [
+     184.8,
+     1614.2,
+     3047.7
+    ],
+    "tuned": [
+     182.6,
+     1627.3,
+     3131.5
+    ]
+   },
+   "Qwen3.8-27B-Q4_K_M.gguf": {
+    "change_pct": {
+     "c1": -0.3,
+     "c16": 2.4,
+     "c64": 1.8
+    },
+    "default": [
+     71.3,
+     466.6,
+     878.5
+    ],
+    "tuned": [
+     71.1,
+     477.9,
+     894.3
+    ]
+   }
+  },
+  "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": {
+   "qwen3.5-0.8b": {
+    "change_pct": {
+     "c1": 5.2,
+     "c16": 0.1,
+     "c64": 2.0
+    },
+    "default": [
+     597.0,
+     6310.5,
+     5655.9
+    ],
+    "tuned": [
+     628.0,
+     6319.4,
+     5771.1
+    ]
+   },
+   "qwen3.5-2b": {
+    "change_pct": {
+     "c1": 2.2,
+     "c16": 1.7,
+     "c64": -0.5
+    },
+    "default": [
+     322.9,
+     3595.3,
+     7676.8
+    ],
+    "tuned": [
+     330.1,
+     3655.1,
+     7640.6
+    ]
+   },
+   "qwen3.5-4b": {
+    "change_pct": {
+     "c1": 2.1,
+     "c16": 1.2,
+     "c64": -0.1
+    },
+    "default": [
+     152.9,
+     1583.7,
+     3188.1
+    ],
+    "tuned": [
+     156.1,
+     1602.4,
+     3184.8
+    ]
+   },
+   "qwen3.5-9b": {
+    "change_pct": {
+     "c1": 2.7,
+     "c16": -0.4,
+     "c64": -1.3
+    },
+    "default": [
+     88.5,
+     983.5,
+     2131.8
+    ],
+    "tuned": [
+     90.9,
+     979.4,
+     2104.4
+    ]
+   },
+   "qwen3.8-27b": {
+    "change_pct": {
+     "c1": 0.5,
+     "c16": 1.2,
+     "c64": -0.0
+    },
+    "default": [
+     27.5,
+     299.3,
+     523.8
+    ],
+    "tuned": [
+     27.6,
+     302.8,
+     523.7
+    ]
+   },
+   "qwen3.8-27b --fp8": {
+    "change_pct": {
+     "c1": -0.3,
+     "c16": 2.3,
+     "c64": -1.6
+    },
+    "default": [
+     33.7,
+     388.0,
+     760.5
+    ],
+    "tuned": [
+     33.6,
+     397.0,
+     748.2
+    ]
+   }
+  }
+ }
+}

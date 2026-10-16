@@ -94,6 +94,19 @@ A forced call follows the tool's parameter schema, and `"parallel_tool_calls": f
 
 Neither turns on speculative decoding for the request. On an RTX 5090 with 9B Q4_K_M, JSON output costs 4 to 12% of throughput and log-probabilities 2 to 4%.
 
+## Tuning
+
+The server reads the table in `tuning/cuda/` for its GPU at startup, if there is one ([how tuning works](design.md#tuning-per-gpu)). To tune another GPU, run the models it will serve:
+
+```sh
+pocket-engine tune --model models/Qwen3.5-9B
+pocket-engine tune --model models/Qwen3.8-27B --fp8
+```
+
+Each run takes a minute or two and merges into `tuning/cuda/<gpu>-<sms>.json`; add the file to the list in `src/tuning.rs` to build it in. `POCKET_TUNING=FILE` uses a table without rebuilding, and `POCKET_TUNING=0` turns tables off.
+
+Tables exist for the RTX 5090, H100 80GB, H200 and RTX PRO 6000 Workstation Edition. The rented GPUs' tables come from CUDA 13.0's cuBLAS; with another cuBLAS version the server keeps cuBLAS's own algorithms and uses the rest of the table.
+
 ## Options
 
 | Option | Default | |

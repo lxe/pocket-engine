@@ -117,6 +117,19 @@ What costs time on an MI325X (details in the [receipt](receipts/mi325x.json)):
 | A load waiting on a branch | ~0.3 µs | Issue loads first |
 | A device-wide fence | 83 µs | No hand-offs between blocks |
 
+## Tuning per GPU
+
+Some choices depend more on the GPU than on the model, so they are measured on the GPU itself. `pocket-engine tune` loads a model, records every matrix product it runs, and times the alternatives on that GPU with the model's own weights, replayed from CUDA graphs as decoding runs them. The results go into `tuning/cuda/`, one table per GPU, which the server reads at startup.
+
+| Setting | Alternatives |
+|---|---|
+| Matrix products | cuBLASLt's own candidates against cuBLAS's default, per shape and range of rows |
+| Linear-attention prompts | how many blocks share each head's columns |
+| Linear-attention decoding | state buffers per block and blocks per SM |
+| GGUF matrices | the batch sizes at which they switch between paths |
+
+A setting replaces the built-in choice only where it is faster everywhere in its range, at least 3% faster on average, gives the same output, and holds up when timed a second time. Everything else keeps the built-in rule. Each table also records the cuBLAS version its algorithms came from; with another version the server uses cuBLAS's own choices.
+
 ## Loading
 
 Weights are read in parallel straight into pinned memory while the GPU copies the previous buffer; memory-mapped reads were about five times slower. The tokenizer and the structured-output tables load at the same time. A 9B model is ready to serve in under 2 seconds.

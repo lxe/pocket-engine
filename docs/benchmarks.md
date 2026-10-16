@@ -30,6 +30,23 @@ Qwen3.8-27B (too large for an RTX 5090 in bf16):
 
 The B200 rows predate its own prompt attention and decode kernels: see [B200 kernels](#b200-kernels).
 
+## Tuning tables
+
+Decode throughput with each GPU's [tuning table](design.md#tuning-per-gpu) against tables off, at 1, 16 and 64 requests in flight ([receipt](receipts/tuning.json)):
+
+| GPU | Model | 1 | 16 | 64 |
+|---|---|---:|---:|---:|
+| RTX 5090 | 9B | +1.6% | +1.2% | +5.9% |
+| H100 | 27B | +2.6% | +2.5% | +1.5% |
+| H100 | 27B FP8 | +0.4% | +0.6% | +2.1% |
+| H100 | 9B Q4_K_M | −0.3% | +2.7% | +1.8% |
+| H200 | 9B | +1.1% | +2.8% | +1.4% |
+| H200 | 27B Q4_K_M | −0.3% | +2.4% | +1.8% |
+| RTX PRO 6000 | 0.8B | +5.2% | +0.1% | +2.0% |
+| RTX PRO 6000 | 9B | +2.7% | −0.4% | −1.3% |
+
+Run-to-run noise is 1 to 2%. The gains are small because the built-in choices were already tuned on these GPUs. Single kernels gain more: on an H100, the prompt scan with several sequences in a step runs 16 to 45% faster with its tuned split.
+
 ## B200 kernels
 
 On a B200, prompt attention runs on tcgen05 tensor cores with tensor memory, as FlashAttention 4 does. The two heads of a pair run as one 256-row matrix multiply across two SMs, each staging half of every key and value tile; the heads that share keys and values form one cluster that loads each tile once. The linear-attention decode keeps the next heads' states and inputs loading while one computes. Measured on pods of the same kind ([receipt](receipts/b200-kernels.json)):

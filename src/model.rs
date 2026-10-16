@@ -238,13 +238,16 @@ pub fn gdn_scan_smem(ns: usize) -> usize {
         + 2 * 32 * vs * 2
         + 128 * vs * 2
 }
-/// Value-column shares of gdn_scan for a step of `s` sequences: the most
-/// (up to 4) whose blocks are all resident at once.
+/// Value-column shares of gdn_scan for a step of `s` sequences: the most (up
+/// to 4) that give every block an SM of its own, else the most whose blocks
+/// are all resident at once. Two blocks sharing an SM take about as long as
+/// one block doing both shares, and each share reloads the chunk's inputs.
 pub fn gdn_split(s: usize, hv: usize, gpu: &Gpu) -> usize {
     let resident = |ns: usize| gpu.sms * (gpu.smem_per_sm / (gdn_scan_smem(ns) + 1024)).max(1);
     [4, 2]
         .into_iter()
-        .find(|&ns| s * hv * ns <= resident(ns))
+        .find(|&ns| s * hv * ns <= gpu.sms)
+        .or_else(|| [4, 2].into_iter().find(|&ns| s * hv * ns <= resident(ns)))
         // A whole state's columns (gdn_scan1) need more than AMD's 64 KB.
         .unwrap_or(if cfg!(feature = "rocm") { 2 } else { 1 })
 }

@@ -15,7 +15,24 @@ pub type Algo = [u64; 8];
 type GemmIndex = HashMap<(String, usize, usize, usize), Vec<(usize, usize, Algo)>>;
 
 /// Tables built into the binary: (file name, contents).
-const BUILT_IN: &[(&str, &str)] = &[];
+const BUILT_IN: &[(&str, &str)] = &[
+    (
+        "nvidia-geforce-rtx-5090-170.json",
+        include_str!("../tuning/cuda/nvidia-geforce-rtx-5090-170.json"),
+    ),
+    (
+        "nvidia-h100-80gb-hbm3-132.json",
+        include_str!("../tuning/cuda/nvidia-h100-80gb-hbm3-132.json"),
+    ),
+    (
+        "nvidia-h200-132.json",
+        include_str!("../tuning/cuda/nvidia-h200-132.json"),
+    ),
+    (
+        "nvidia-rtx-pro-6000-blackwell-workstation-edition-188.json",
+        include_str!("../tuning/cuda/nvidia-rtx-pro-6000-blackwell-workstation-edition-188.json"),
+    ),
+];
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Table {
@@ -254,6 +271,15 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_in_tables_parse_and_match_their_names() {
+        for (name, text) in BUILT_IN {
+            let t = Table::parse(text).unwrap();
+            assert_eq!(file_name(&t.gpu, t.sms), *name);
+            assert!(t.gemm.iter().all(|g| algo_from_hex(&g.algo).is_some()));
+        }
+    }
 
     #[test]
     fn algorithms_round_trip_through_hex() {
